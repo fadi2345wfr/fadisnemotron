@@ -323,6 +323,8 @@ pub fn tool_title(tool: &ToolView) -> String {
         "write_file" => format!("Geschrieben: {}", path()),
         "run_command" if pending => format!("Möchte ausführen: {}", text("command")),
         "run_command" => format!("Befehl: {}", text("command")),
+        "browser_action" if pending => format!("Möchte Browser-Aktion: {}", text("action")),
+        "browser_action" => format!("Browser: {}", text("action")),
         other => format!("Werkzeug „{other}“"),
     }
 }
@@ -336,6 +338,7 @@ fn tool_icon(name: &str) -> &'static str {
         "edit_file" => "✏",
         "write_file" => "📝",
         "run_command" => "▶",
+        "browser_action" => "🌐",
         _ => "🔧",
     }
 }
@@ -391,7 +394,7 @@ fn tool_card(ui: &mut egui::Ui, tool: &ToolView, actions: &mut Vec<UiAction>) {
                 let title = tool_title(tool);
                 let strong = matches!(
                     canonical_tool_name(&tool.call.name),
-                    "edit_file" | "write_file" | "run_command"
+                    "edit_file" | "write_file" | "run_command" | "browser_action"
                 );
                 let text = if strong {
                     RichText::new(title.clone()).strong()

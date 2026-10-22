@@ -109,6 +109,8 @@ pub fn canonical_tool_name(name: &str) -> &str {
         "grep" | "Grep" | "search_files" | "search_code" => "search",
         "glob" | "Glob" | "find" | "find_file" => "find_files",
         "ls" | "LS" | "list" | "list_directory" | "list_files" => "list_dir",
+        "browser" | "Browser" | "web" | "browse" | "open_url" | "web_search"
+        | "browser_action" => "browser_action",
         other => other,
     }
 }
@@ -116,7 +118,7 @@ pub fn canonical_tool_name(name: &str) -> &str {
 pub fn tool_kind(name: &str) -> ToolKind {
     match canonical_tool_name(name) {
         "write_file" | "edit_file" => ToolKind::Edit,
-        "run_command" => ToolKind::Command,
+        "run_command" | "browser_action" => ToolKind::Command,
         _ => ToolKind::Read,
     }
 }
@@ -342,6 +344,27 @@ pub fn definitions() -> Value {
                     "required": ["command"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "browser_action",
+                "description": "Control the browser and macOS like a human: search the web, open URLs, click elements, extract page content, type text, or copy/paste from the clipboard.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "Action to perform: 'search' (web search), 'open' (open URL in browser and read page text), 'click' (click link/element via selector or text), 'type' (type text into active window), 'copy' (copy text to macOS clipboard, or read if text omitted)."
+                        },
+                        "url": { "type": "string", "description": "URL to open or navigate to (e.g. 'https://github.com')." },
+                        "query": { "type": "string", "description": "Search query for 'search' action." },
+                        "selector": { "type": "string", "description": "Element or link text for 'click' action." },
+                        "text": { "type": "string", "description": "Text to type or copy to clipboard." }
+                    },
+                    "required": ["action"]
+                }
+            }
         }
     ])
 }
@@ -466,6 +489,20 @@ struct CommandArgs {
     command: String,
     #[serde(default, alias = "timeout", deserialize_with = "lenient_u64")]
     timeout_secs: Option<u64>,
+}
+
+#[derive(Default, Deserialize)]
+struct BrowserArgs {
+    #[serde(default, alias = "cmd", alias = "type")]
+    action: Option<String>,
+    #[serde(default, alias = "link", alias = "website")]
+    url: Option<String>,
+    #[serde(default, alias = "search_query", alias = "q")]
+    query: Option<String>,
+    #[serde(default, alias = "target", alias = "element")]
+    selector: Option<String>,
+    #[serde(default, alias = "content", alias = "input")]
+    text: Option<String>,
 }
 
 fn lenient_number(value: Option<Value>) -> Result<Option<u64>, String> {
@@ -679,8 +716,9 @@ impl Workspace {
             "edit_file" => from_args(args).map(|a: EditArgs| self.apply(self.plan_edit(&a))),
             "write_file" => from_args(args).map(|a: WriteArgs| self.apply(self.plan_write(&a))),
             "run_command" => from_args(args).map(|a: CommandArgs| self.run_command(a, cancel)),
+            "browser_action" => from_args(args).map(|a: BrowserArgs| self.browser_action(a)),
             other => Err(format!(
-                "unknown tool '{other}'. Available: list_dir, find_files, read_file, search, edit_file, write_file, run_command."
+                "unknown tool '{other}'. Available: list_dir, find_files, read_file, search, edit_file, write_file, run_command, browser_action."
             )),
         };
         result.unwrap_or_else(ToolOutput::err)
@@ -1228,6 +1266,123 @@ impl Workspace {
                 }
             }
             Err(e) => ToolOutput::err(format!("could not start the command: {e}")),
+        }
+    }
+
+    fn browser_action(&self, args: BrowserArgs) -> ToolOutput {
+        let action = args
+            .action
+            .as_deref()
+            .unwrap_or("open")
+            .trim()
+            .to_lowercase();
+        match action.as_str() {
+            "search" | "web_search" => {
+                let query = args.query.or(args.text).unwrap_or_default();
+                let q = query.trim();
+                if q.is_empty() {
+                    return ToolOutput::err("search query is empty");
+                }
+                let mut encoded = String::with_capacity(q.len() * 3);
+                for b in q.bytes() {
+                    match b {
+                        b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                            encoded.push(b as char);
+                        }
+                        b' ' => encoded.push('+'),
+                        _ => {
+                            use std::fmt::Write as _;
+                            let _ = write!(encoded, "%{b:02X}");
+                        }
+                    }
+                }
+                let _ = Command::new("open")
+                    .arg(format!("https://duckduckgo.com/?q={encoded}"))
+                    .spawn();
+                let cmd = format!(
+                    "curl -sL --max-time 10 -A 'Mozilla/5.0' 'https://lite.duckduckgo.com/lite/' --data 'q={encoded}' | grep -A 2 -B 1 'result-snippet' | sed -e 's/<[^>]*>//g' | head -n 30"
+                );
+                let fetched = Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                if fetched.is_empty() {
+                    ToolOutput::ok(format!("Opened browser search for: {q}"))
+                } else {
+                    ToolOutput::ok(format!(
+                        "Web search results for '{q}' (opened in browser):\n\n{fetched}"
+                    ))
+                }
+            }
+            "open" | "navigate" => {
+                let url = args.url.or(args.text).unwrap_or_default();
+                let u = url.trim();
+                if u.is_empty() {
+                    return ToolOutput::err("url is empty");
+                }
+                let valid_url = if !u.starts_with("http://") && !u.starts_with("https://") {
+                    format!("https://{u}")
+                } else {
+                    u.to_string()
+                };
+                let _ = Command::new("open").arg(&valid_url).spawn();
+                let cmd = format!(
+                    "curl -sL --max-time 10 -A 'Mozilla/5.0' '{valid_url}' | sed -e 's/<[^>]*>/ /g' | tr -s ' \t\r\n' ' ' | head -c 4000"
+                );
+                let fetched = Command::new("sh")
+                    .arg("-c")
+                    .arg(&cmd)
+                    .output()
+                    .ok()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                    .unwrap_or_default();
+                ToolOutput::ok(format!(
+                    "Opened {valid_url} in browser.\n\nExtracted page content:\n{fetched}"
+                ))
+            }
+            "copy" | "clipboard" => {
+                let text = args.text.unwrap_or_default();
+                if text.is_empty() {
+                    if let Ok(out) = Command::new("pbpaste").output() {
+                        let content = String::from_utf8_lossy(&out.stdout).to_string();
+                        ToolOutput::ok(format!("Clipboard content:\n{content}"))
+                    } else {
+                        ToolOutput::err("could not read clipboard")
+                    }
+                } else {
+                    use std::io::Write as _;
+                    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+                        if let Some(mut stdin) = child.stdin.take() {
+                            let _ = stdin.write_all(text.as_bytes());
+                        }
+                        let _ = child.wait();
+                        ToolOutput::ok(format!("Copied {} characters to clipboard.", text.len()))
+                    } else {
+                        ToolOutput::err("could not copy to clipboard")
+                    }
+                }
+            }
+            "click" => {
+                let target = args.selector.or(args.text).unwrap_or_default();
+                let script = format!(
+                    "tell application \"System Events\" to click (first UI element of front window of (first process whose frontmost is true) where name contains \"{target}\")"
+                );
+                let _ = Command::new("osascript").arg("-e").arg(&script).output();
+                ToolOutput::ok(format!("Executed click action for '{target}'."))
+            }
+            "type" => {
+                let text = args.text.unwrap_or_default();
+                let escaped = text.replace('"', "\\\"");
+                let script = format!("tell application \"System Events\" to keystroke \"{escaped}\"");
+                let _ = Command::new("osascript").arg("-e").arg(&script).output();
+                ToolOutput::ok(format!("Typed {} characters into active window.", text.len()))
+            }
+            other => ToolOutput::err(format!(
+                "unknown browser action '{other}'. Supported: search, open, click, type, copy."
+            )),
         }
     }
 }
@@ -2401,5 +2556,18 @@ mod tests {
         let cut = truncate_middle(&text, 1000);
         assert!(cut.starts_with("0\n1\n") && cut.trim_end().ends_with("9999"));
         assert!(cut.contains("characters left out"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn browser_action_alias_and_clipboard() {
+        let p = TempProject::new("browser");
+        assert_eq!(tool_kind("browser"), ToolKind::Command);
+        assert_eq!(tool_kind("browser_action"), ToolKind::Command);
+        let out = p.run(
+            "browser",
+            json!({"action": "copy", "text": "Nemotron Browser Test"}),
+        );
+        assert!(out.ok && out.text.contains("Copied"), "{}", out.text);
     }
 }
