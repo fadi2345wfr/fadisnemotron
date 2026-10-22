@@ -55,6 +55,7 @@
     <string name="tool_waiting">wartet auf Freigabe</string>
     <string name="tool_declined">abgelehnt</string>
     <string name="tool_not_run">nicht ausgeführt</string>
+    <string name="tool_interrupted">beim Stopp abgebrochen – kann teilweise gelaufen sein</string>
     <string name="tool_planned">geplant</string>
     <string name="approve_question">Nemotron möchte das tun. Erlauben?</string>
     <string name="approve_warning">⚠ Achtung: Dieser Befehl %1$s. Er wird deshalb immer erst nachgefragt.</string>

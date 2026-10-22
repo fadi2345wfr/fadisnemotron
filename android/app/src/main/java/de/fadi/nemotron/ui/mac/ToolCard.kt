@@ -105,6 +105,7 @@ private fun StateIcon(tool: Tool) {
         ToolState.AwaitingApproval -> Triple(R.drawable.ic_pause, colors.primary, R.string.tool_waiting)
         ToolState.Declined -> Triple(R.drawable.ic_close, colors.onSurfaceVariant, R.string.tool_declined)
         ToolState.NotRun -> Triple(R.drawable.ic_remove, colors.onSurfaceVariant, R.string.tool_not_run)
+        ToolState.Interrupted -> Triple(R.drawable.ic_stop, status.warning, R.string.tool_interrupted)
         ToolState.Planned, ToolState.Running -> Triple(R.drawable.ic_circle_outline, colors.onSurfaceVariant, R.string.tool_planned)
     }
     Icon(painterResource(icon), contentDescription = stringResource(label), tint = tint, modifier = Modifier.size(18.dp))

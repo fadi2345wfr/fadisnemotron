@@ -86,6 +86,8 @@ enum class ToolState {
     @SerialName("done") Done,
     @SerialName("declined") Declined,
     @SerialName("not_run") NotRun,
+    /** Was running when the user pressed Stop; may have partly run. */
+    @SerialName("interrupted") Interrupted,
 }
 
 /** What Nemotron may do on the Mac without asking. */

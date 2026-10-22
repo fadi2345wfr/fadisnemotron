@@ -107,7 +107,7 @@ class RemoteModelsTest {
 
     @Test
     fun `tool states and decisions use the protocol names`() {
-        val names = listOf("planned", "awaiting_approval", "running", "done", "declined", "not_run")
+        val names = listOf("planned", "awaiting_approval", "running", "done", "declined", "not_run", "interrupted")
         val states = names.map { remoteJson.decodeFromString<Tool>("""{"state": "$it"}""").state }
         assertEquals(ToolState.entries.toList(), states)
         assertEquals("\"allow_for_run\"", remoteJson.encodeToString(Decision.AllowForRun))
