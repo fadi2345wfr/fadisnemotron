@@ -42,6 +42,8 @@
 	<string>Nemotron sieht deine Downloads durch und räumt sie auf, wenn du ihn darum bittest.</string>
 	<key>NSRemovableVolumesUsageDescription</key>
 	<string>Nemotron arbeitet mit Dateien auf USB-Sticks und externen Laufwerken, wenn du ihn darum bittest.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Fadis Nemotron steuert auf deinen Wunsch die Maus, Tastatur und Fenster wie ein echter Mensch am PC.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Fadis Nemotron – Desktop-Agent für NVIDIA Nemotron 3.5 Super VL</string>
 </dict>

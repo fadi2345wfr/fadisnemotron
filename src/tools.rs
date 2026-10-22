@@ -112,6 +112,9 @@ pub fn canonical_tool_name(name: &str) -> &str {
         "browser" | "Browser" | "web" | "browse" | "open_url" | "web_search" | "browser_action" => {
             "browser_action"
         }
+        "mouse" | "click" | "screen" | "screenshot" | "computer" | "computer_action" => {
+            "computer_action"
+        }
         other => other,
     }
 }
@@ -119,7 +122,7 @@ pub fn canonical_tool_name(name: &str) -> &str {
 pub fn tool_kind(name: &str) -> ToolKind {
     match canonical_tool_name(name) {
         "write_file" | "edit_file" => ToolKind::Edit,
-        "run_command" | "browser_action" => ToolKind::Command,
+        "run_command" | "browser_action" | "computer_action" => ToolKind::Command,
         _ => ToolKind::Read,
     }
 }
@@ -366,6 +369,29 @@ pub fn definitions() -> Value {
                     "required": ["action"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "computer_action",
+                "description": "Control the entire computer screen and mouse like a real human: click buttons, double-click, drag, type on keyboard, take screenshots, get screen resolution, or move the mouse to any (x, y) coordinates on macOS.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "description": "Action: 'screenshot' (take screenshot and save to file), 'click' (left click at x, y), 'double_click' (double click at x, y), 'right_click' (right click at x, y), 'move' (move cursor to x, y), 'drag' (drag from x, y to end_x, end_y), 'type' (type text), 'key' (press key/shortcut like 'enter', 'tab', 'escape', 'cmd+c'), 'screen_info' (get screen width/height and cursor position)."
+                        },
+                        "x": { "type": "number", "description": "X coordinate on screen in pixels (e.g. 500)." },
+                        "y": { "type": "number", "description": "Y coordinate on screen in pixels (e.g. 300)." },
+                        "end_x": { "type": "number", "description": "End X coordinate for 'drag' action." },
+                        "end_y": { "type": "number", "description": "End Y coordinate for 'drag' action." },
+                        "text": { "type": "string", "description": "Text to type or key/shortcut to press (e.g. 'enter', 'cmd+v')." },
+                        "path": { "type": "string", "description": "Optional file path to save screenshot." }
+                    },
+                    "required": ["action"]
+                }
+            }
         }
     ])
 }
@@ -504,6 +530,24 @@ struct BrowserArgs {
     selector: Option<String>,
     #[serde(default, alias = "content", alias = "input")]
     text: Option<String>,
+}
+
+#[derive(Default, Deserialize)]
+struct ComputerArgs {
+    #[serde(default, alias = "cmd", alias = "type")]
+    action: Option<String>,
+    #[serde(default)]
+    x: Option<f64>,
+    #[serde(default)]
+    y: Option<f64>,
+    #[serde(default)]
+    end_x: Option<f64>,
+    #[serde(default)]
+    end_y: Option<f64>,
+    #[serde(default, alias = "content", alias = "input", alias = "keys")]
+    text: Option<String>,
+    #[serde(default, alias = "file_path", alias = "filePath")]
+    path: Option<String>,
 }
 
 fn lenient_number(value: Option<Value>) -> Result<Option<u64>, String> {
@@ -718,8 +762,9 @@ impl Workspace {
             "write_file" => from_args(args).map(|a: WriteArgs| self.apply(self.plan_write(&a))),
             "run_command" => from_args(args).map(|a: CommandArgs| self.run_command(a, cancel)),
             "browser_action" => from_args(args).map(|a: BrowserArgs| self.browser_action(a)),
+            "computer_action" => from_args(args).map(|a: ComputerArgs| self.computer_action(a)),
             other => Err(format!(
-                "unknown tool '{other}'. Available: list_dir, find_files, read_file, search, edit_file, write_file, run_command, browser_action."
+                "unknown tool '{other}'. Available: list_dir, find_files, read_file, search, edit_file, write_file, run_command, browser_action, computer_action."
             )),
         };
         result.unwrap_or_else(ToolOutput::err)
@@ -1387,6 +1432,230 @@ impl Workspace {
             }
             other => ToolOutput::err(format!(
                 "unknown browser action '{other}'. Supported: search, open, click, type, copy."
+            )),
+        }
+    }
+
+    fn computer_action(&self, args: ComputerArgs) -> ToolOutput {
+        let action = args
+            .action
+            .as_deref()
+            .unwrap_or("screen_info")
+            .trim()
+            .to_lowercase();
+        match action.as_str() {
+            "screenshot" => {
+                let target_path = args
+                    .path
+                    .as_deref()
+                    .map(|p| {
+                        self.resolve(p)
+                            .map(|pb| pb.to_string_lossy().to_string())
+                            .unwrap_or_else(|_| p.to_string())
+                    })
+                    .unwrap_or_else(|| {
+                        let id = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis())
+                            .unwrap_or(0);
+                        format!("/tmp/nemotron_screenshot_{id}.png")
+                    });
+                let status = Command::new("screencapture")
+                    .arg("-x")
+                    .arg(&target_path)
+                    .status();
+                match status {
+                    Ok(s) if s.success() => {
+                        let size = std::fs::metadata(&target_path).map(|m| m.len()).unwrap_or(0);
+                        ToolOutput::ok(format!(
+                            "Screenshot captured successfully: {target_path} ({size} bytes). Look at this image to see UI elements and their positions."
+                        ))
+                    }
+                    Ok(s) => ToolOutput::err(format!("screencapture failed with status: {s}")),
+                    Err(e) => ToolOutput::err(format!("could not execute screencapture: {e}")),
+                }
+            }
+            "screen_info" => {
+                let py = r#"
+import ctypes
+try:
+    CG = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices')
+    class CGPoint(ctypes.Structure):
+        _fields_ = [('x', ctypes.c_double), ('y', ctypes.c_double)]
+    CG.CGEventCreate.restype = ctypes.c_void_p
+    CG.CGEventGetLocation.restype = CGPoint
+    CG.CGEventGetLocation.argtypes = [ctypes.c_void_p]
+    w = CG.CGDisplayPixelsWide(CG.CGMainDisplayID())
+    h = CG.CGDisplayPixelsHigh(CG.CGMainDisplayID())
+    ev = CG.CGEventCreate(None)
+    pt = CG.CGEventGetLocation(ev) if ev else CGPoint(0,0)
+    print(f"{w}|{h}|{pt.x:.1f}|{pt.y:.1f}")
+except Exception as e:
+    print(f"error:{e}")
+"#;
+                match Command::new("python3").arg("-c").arg(py).output() {
+                    Ok(out) => {
+                        let s = String::from_utf8_lossy(&out.stdout);
+                        let parts: Vec<&str> = s.trim().split('|').collect();
+                        if parts.len() == 4 {
+                            ToolOutput::ok(format!(
+                                "Display resolution: {}x{} pixels. Current mouse cursor position: x={}, y={}",
+                                parts[0], parts[1], parts[2], parts[3]
+                            ))
+                        } else {
+                            ToolOutput::ok(format!("Screen info: {}", s.trim()))
+                        }
+                    }
+                    Err(e) => ToolOutput::err(format!("could not read screen info: {e}")),
+                }
+            }
+            "click" | "double_click" | "right_click" | "move" | "drag" => {
+                let x = args.x.unwrap_or(0.0);
+                let y = args.y.unwrap_or(0.0);
+                let end_x = args.end_x.unwrap_or(x);
+                let end_y = args.end_y.unwrap_or(y);
+                let is_double = action == "double_click";
+                let is_right = action == "right_click";
+                let is_move = action == "move";
+                let is_drag = action == "drag";
+
+                let py = format!(
+                    r#"
+import ctypes, time
+try:
+    CG = ctypes.cdll.LoadLibrary('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices')
+    class CGPoint(ctypes.Structure):
+        _fields_ = [('x', ctypes.c_double), ('y', ctypes.c_double)]
+    CG.CGEventCreateMouseEvent.restype = ctypes.c_void_p
+    CG.CGEventCreateMouseEvent.argtypes = [ctypes.c_void_p, ctypes.c_uint32, CGPoint, ctypes.c_uint32]
+    CG.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
+    CG.CFRelease.argtypes = [ctypes.c_void_p]
+
+    x, y = {x}, {y}
+    end_x, end_y = {end_x}, {end_y}
+    is_move = {is_move}
+    is_drag = {is_drag}
+    is_right = {is_right}
+    is_double = {is_double}
+
+    if is_move:
+        ev = CG.CGEventCreateMouseEvent(None, 5, CGPoint(x, y), 0)
+        CG.CGEventPost(0, ev)
+        CG.CFRelease(ev)
+        print(f"Moved mouse to ({{x}}, {{y}})")
+    elif is_drag:
+        d = CG.CGEventCreateMouseEvent(None, 1, CGPoint(x, y), 0)
+        CG.CGEventPost(0, d)
+        CG.CFRelease(d)
+        time.sleep(0.05)
+        m = CG.CGEventCreateMouseEvent(None, 6, CGPoint(end_x, end_y), 0)
+        CG.CGEventPost(0, m)
+        CG.CFRelease(m)
+        time.sleep(0.05)
+        u = CG.CGEventCreateMouseEvent(None, 2, CGPoint(end_x, end_y), 0)
+        CG.CGEventPost(0, u)
+        CG.CFRelease(u)
+        print(f"Dragged mouse from ({{x}}, {{y}}) to ({{end_x}}, {{end_y}})")
+    else:
+        down_type = 3 if is_right else 1
+        up_type = 4 if is_right else 2
+        btn = 1 if is_right else 0
+        d = CG.CGEventCreateMouseEvent(None, down_type, CGPoint(x, y), btn)
+        u = CG.CGEventCreateMouseEvent(None, up_type, CGPoint(x, y), btn)
+        CG.CGEventPost(0, d)
+        CG.CGEventPost(0, u)
+        CG.CFRelease(d)
+        CG.CFRelease(u)
+        if is_double:
+            time.sleep(0.05)
+            d2 = CG.CGEventCreateMouseEvent(None, down_type, CGPoint(x, y), btn)
+            u2 = CG.CGEventCreateMouseEvent(None, up_type, CGPoint(x, y), btn)
+            CG.CGEventPost(0, d2)
+            CG.CGEventPost(0, u2)
+            CG.CFRelease(d2)
+            CG.CFRelease(u2)
+            print(f"Double clicked at ({{x}}, {{y}})")
+        elif is_right:
+            print(f"Right clicked at ({{x}}, {{y}})")
+        else:
+            print(f"Clicked at ({{x}}, {{y}})")
+except Exception as e:
+    print(f"error:{{e}}")
+"#
+                );
+                match Command::new("python3").arg("-c").arg(&py).output() {
+                    Ok(out) => {
+                        let msg = String::from_utf8_lossy(&out.stdout);
+                        let clean = msg.trim();
+                        if clean.starts_with("error:") {
+                            ToolOutput::err(clean.to_string())
+                        } else {
+                            ToolOutput::ok(clean.to_string())
+                        }
+                    }
+                    Err(e) => ToolOutput::err(format!("could not execute mouse action: {e}")),
+                }
+            }
+            "type" => {
+                let text = args.text.unwrap_or_default();
+                let escaped = text.replace('"', "\\\"");
+                let script =
+                    format!("tell application \"System Events\" to keystroke \"{escaped}\"");
+                let _ = Command::new("osascript").arg("-e").arg(&script).output();
+                ToolOutput::ok(format!(
+                    "Typed {} characters into active window on screen.",
+                    text.len()
+                ))
+            }
+            "key" => {
+                let key_name = args.text.unwrap_or_default().trim().to_lowercase();
+                let script = match key_name.as_str() {
+                    "enter" | "return" => {
+                        "tell application \"System Events\" to key code 36".to_string()
+                    }
+                    "tab" => "tell application \"System Events\" to key code 48".to_string(),
+                    "escape" | "esc" => {
+                        "tell application \"System Events\" to key code 53".to_string()
+                    }
+                    "space" => "tell application \"System Events\" to key code 49".to_string(),
+                    "up" => "tell application \"System Events\" to key code 126".to_string(),
+                    "down" => "tell application \"System Events\" to key code 125".to_string(),
+                    "left" => "tell application \"System Events\" to key code 123".to_string(),
+                    "right" => "tell application \"System Events\" to key code 124".to_string(),
+                    "backspace" | "delete" => {
+                        "tell application \"System Events\" to key code 51".to_string()
+                    }
+                    "cmd+c" => {
+                        "tell application \"System Events\" to keystroke \"c\" using command down"
+                            .to_string()
+                    }
+                    "cmd+v" => {
+                        "tell application \"System Events\" to keystroke \"v\" using command down"
+                            .to_string()
+                    }
+                    "cmd+a" => {
+                        "tell application \"System Events\" to keystroke \"a\" using command down"
+                            .to_string()
+                    }
+                    "cmd+z" => {
+                        "tell application \"System Events\" to keystroke \"z\" using command down"
+                            .to_string()
+                    }
+                    "cmd+w" => {
+                        "tell application \"System Events\" to keystroke \"w\" using command down"
+                            .to_string()
+                    }
+                    "cmd+q" => {
+                        "tell application \"System Events\" to keystroke \"q\" using command down"
+                            .to_string()
+                    }
+                    other => format!("tell application \"System Events\" to keystroke \"{other}\""),
+                };
+                let _ = Command::new("osascript").arg("-e").arg(&script).output();
+                ToolOutput::ok(format!("Pressed key/shortcut: '{key_name}'."))
+            }
+            other => ToolOutput::err(format!(
+                "unknown computer action '{other}'. Supported: screenshot, screen_info, click, double_click, right_click, move, drag, type, key."
             )),
         }
     }
@@ -2574,5 +2843,16 @@ mod tests {
             json!({"action": "copy", "text": "Nemotron Browser Test"}),
         );
         assert!(out.ok && out.text.contains("Copied"), "{}", out.text);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn computer_action_alias_and_screen_info() {
+        let p = TempProject::new("computer");
+        assert_eq!(tool_kind("computer"), ToolKind::Command);
+        assert_eq!(tool_kind("computer_action"), ToolKind::Command);
+        assert_eq!(tool_kind("mouse"), ToolKind::Command);
+        let out = p.run("computer_action", json!({"action": "screen_info"}));
+        assert!(out.ok, "{}", out.text);
     }
 }

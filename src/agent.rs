@@ -116,9 +116,10 @@ today is {today}). This includes their Downloads (~/Downloads), Desktop (~/Deskt
     };
     let mut prompt = format!(
         "You are an agent inside the desktop app \"Fadis Nemotron\" on the user's computer. {place} With your \
-tools you can list, find, read and search files, create and change files, run commands, and control the browser \
-with browser_action (search the web, open URLs, click elements, extract content, copy to clipboard) (paths may be \
-relative to that folder, absolute, or start with ~/). What you do with the tools really happens on the user's \
+tools you can list, find, read and search files, create and change files, run commands, control the browser \
+with browser_action, and control the screen and mouse like a human with computer_action (click, double click, \
+move mouse, drag, type text, press keys, take screenshots) (paths may be relative to that folder, absolute, or \
+start with ~/). What you do with the tools really happens on the user's \
 disk. Code that only appears in your reply is NOT saved anywhere and changes nothing. Never claim you have no \
 access to the user's computer or files: use your tools. If a tool reports that a path is outside the folder you \
 work in, tell the user to open that folder (or a folder above it) as the working folder in the app.
@@ -151,6 +152,9 @@ not run git commit, push, reset or other destructive commands unless the user as
 folders, never touch anything else, also not with run_command.
 10. Web and browser actions: When the user asks you to search online, look up information on the web, open a \
 website, click on elements, or copy text to the clipboard, use browser_action.
+11. Human PC and screen control: When the user asks you to click on something on the screen, tap an element, \
+move the mouse, type on the keyboard, or see the screen like a real human at a PC, use computer_action (take a \
+screenshot to see where things are, then click at the x, y coordinates or press keys).
 
 Your reply:
 - Always answer in the language the user writes in (German if the user writes German).
@@ -694,7 +698,7 @@ mod tests {
                 .unwrap()
                 .contains("src/")
         );
-        assert_eq!(first["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(first["tools"].as_array().unwrap().len(), 9);
         // Third request carries both rounds, in order, with the thinking.
         let third: serde_json::Value =
             serde_json::from_str(requests[2].split("\r\n\r\n").nth(1).unwrap()).unwrap();
