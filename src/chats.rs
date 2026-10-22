@@ -135,10 +135,16 @@ impl ChatStore {
                     Source::Data { mime, bytes } => {
                         let file = format!("{index}-{n}-{}", safe_file_name(&att.name));
                         let path = files.join(&file);
-                        // Attachments never change, so each is written once.
-                        if !path.exists() {
+                        // Attachments never change, so each is written once. A file
+                        // of the wrong size is what a failed write left: write again.
+                        if std::fs::metadata(&path).map(|m| m.len()).ok()
+                            != Some(bytes.len() as u64)
+                        {
                             std::fs::create_dir_all(&files)?;
-                            crate::config::write_private(&path, bytes)?;
+                            // Complete or not there at all, never half a file.
+                            let part = files.join(format!("{file}.part"));
+                            crate::config::write_private(&part, bytes)?;
+                            std::fs::rename(&part, &path)?;
                         }
                         SavedAttachment {
                             name: att.name.clone(),
@@ -189,6 +195,8 @@ impl ChatStore {
                 .map_err(std::io::Error::other)?
                 .as_bytes(),
         )?;
+        // On disk before it replaces the old file: a power cut leaves a whole chat.
+        std::fs::File::open(&tmp).and_then(|f| f.sync_all())?;
         std::fs::rename(&tmp, &path)?;
         Ok(ChatSummary {
             id: header.id,
@@ -229,7 +237,9 @@ impl ChatStore {
                             Some(att)
                         }
                         (None, Some(file), Some(mime)) => {
-                            let bytes = std::fs::read(files.join(safe_file_name(&file))).ok()?;
+                            // Only the name: a stored value must not lead out of the folder.
+                            let name = Path::new(&file).file_name()?;
+                            let bytes = std::fs::read(files.join(name)).ok()?;
                             Some(Attachment::from_bytes(&s.name, s.kind, &mime, bytes))
                         }
                         _ => None,
@@ -313,10 +323,25 @@ fn safe_file_name(name: &str) -> String {
         .collect();
     let cleaned = cleaned.trim_start_matches('.').to_owned();
     if cleaned.is_empty() {
-        "anhang".to_owned()
-    } else {
-        cleaned
+        return "anhang".to_owned();
     }
+    // File names are limited to 255 bytes; stay well under it, keep the ending.
+    const MAX_BYTES: usize = 100;
+    if cleaned.len() <= MAX_BYTES {
+        return cleaned;
+    }
+    let (stem, ext) = match cleaned.rsplit_once('.') {
+        Some((stem, ext)) if ext.len() <= 10 => (stem, format!(".{ext}")),
+        _ => (cleaned.as_str(), String::new()),
+    };
+    let mut short = String::new();
+    for c in stem.chars() {
+        if short.len() + c.len_utf8() + ext.len() > MAX_BYTES {
+            break;
+        }
+        short.push(c);
+    }
+    short + &ext
 }
 
 #[cfg(test)]
@@ -401,6 +426,53 @@ mod tests {
         assert_eq!(list[0].title, "Was ist auf dem Foto?");
         store.delete(&id).unwrap();
         assert!(store.list().is_empty() && !dir.join(&id).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_half_written_attachment_is_written_again_and_long_names_work() {
+        let (store, dir) = store("repair");
+        let id = ChatStore::new_id();
+        let long = format!("{}.jpg", "ä".repeat(130));
+        let photo =
+            Attachment::from_bytes(&long, AttachmentKind::Image, "image/jpeg", vec![7; 5000]);
+        let chat = Chat {
+            id: id.clone(),
+            title: "Lange Namen".into(),
+            created: 1,
+            messages: vec![(
+                Msg {
+                    text: "Foto".into(),
+                },
+                vec![photo],
+            )],
+        };
+        store.save(&chat).unwrap();
+        let loaded: Chat<Msg> = store.load(&id).unwrap();
+        assert_eq!(loaded.messages[0].1[0].name, long);
+        assert!(
+            matches!(&loaded.messages[0].1[0].source, Source::Data { bytes, .. } if bytes.len() == 5000)
+        );
+        assert!(safe_file_name(&long).len() <= 100 && safe_file_name(&long).ends_with(".jpg"));
+        // A failed write left a short file behind: the next save repairs it.
+        let file = std::fs::read_dir(dir.join(&id))
+            .unwrap()
+            .flatten()
+            .next()
+            .unwrap()
+            .path();
+        std::fs::write(&file, [7; 100]).unwrap();
+        store.save(&chat).unwrap();
+        let loaded: Chat<Msg> = store.load(&id).unwrap();
+        assert!(
+            matches!(&loaded.messages[0].1[0].source, Source::Data { bytes, .. } if bytes.len() == 5000)
+        );
+        assert!(
+            std::fs::read_dir(dir.join(&id))
+                .unwrap()
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().ends_with(".part"))
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

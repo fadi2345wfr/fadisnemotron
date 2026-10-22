@@ -5,18 +5,25 @@
 //! commands go to the app through a channel and are answered there, and the
 //! app publishes a JSON snapshot of what it shows, which long-poll requests
 //! wait on.
+//!
+//! The HTTP part is written for this one job instead of using a library, so
+//! that anyone on the network can be turned away cheaply: the request head is
+//! size- and time-limited, the key is checked before any body is read, bodies
+//! must announce their length, and the memory they may use is capped.
 
-use std::io::Read as _;
-use std::net::{IpAddr, Ipv4Addr};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use serde_json::{Value, json};
 
 use crate::agent::Decision;
+use crate::attachments::{self, Attachment, AttachmentKind};
 use crate::tools::ApprovalMode;
 
 pub const DEFAULT_PORT: u16 = 7878;
@@ -24,10 +31,20 @@ pub const PROTOCOL: u32 = 2;
 /// Format of the QR code; independent of the protocol version.
 const PAIRING_FORMAT: u32 = 1;
 const MAX_BODY_BYTES: usize = 20 * 1024 * 1024;
-/// Photos and videos come as raw bytes; the phone shrinks videos first.
-const MAX_UPLOAD_BYTES: usize = 200 * 1024 * 1024;
+/// Photos arrive already scaled down by the phone.
+const MAX_IMAGE_UPLOAD_BYTES: usize = 30 * 1024 * 1024;
+/// Bodies being received at the same moment may hold this much memory.
+const MAX_BODY_BYTES_IN_FLIGHT: usize = 300 * 1024 * 1024;
 const MAX_WAIT_SECS: u64 = 30;
 const MAX_CONCURRENT: usize = 32;
+/// The request line and headers together.
+const MAX_HEAD_BYTES: usize = 16 * 1024;
+const MAX_HEADERS: usize = 64;
+/// Time a client gets to send the request head.
+const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
+/// Time without a single byte while a body comes in.
+const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a request waits for the app to handle a command.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 
@@ -36,15 +53,15 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 pub enum Command {
     Send {
         text: String,
-        images: Vec<(String, Vec<u8>)>,
+        /// Photos sent inline (protocol version 1), already prepared.
+        attachments: Vec<Attachment>,
         /// Ids from earlier uploads.
         uploads: Vec<String>,
     },
-    /// A photo or video, as raw bytes; the app answers with an id for `Send`.
+    /// A photo or video that was received and prepared; the app keeps it
+    /// until a `Send` names it.
     Upload {
-        name: String,
-        content_type: String,
-        bytes: Vec<u8>,
+        attachment: Attachment,
     },
     Stop,
     Decide {
@@ -77,6 +94,8 @@ pub type Reply = Result<Value, (u16, String)>;
 pub struct Request {
     pub command: Command,
     reply: Sender<Reply>,
+    /// After this the phone has been told "no answer", so the command must not run.
+    deadline: Instant,
 }
 
 impl Request {
@@ -97,30 +116,85 @@ struct Shared {
     changed: Condvar,
     stopping: AtomicBool,
     in_flight: AtomicUsize,
+    body_bytes: AtomicUsize,
+    /// Photos are scaled to this size when they arrive.
+    max_image_dim: AtomicU32,
     last_seen: Mutex<Option<(Instant, String)>>,
+}
+
+/// A place among the requests being served; freed even if the thread panics.
+struct Slot(Arc<Shared>);
+
+impl Slot {
+    fn take(shared: &Arc<Shared>) -> Option<Self> {
+        if shared.in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT {
+            shared.in_flight.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self(shared.clone()))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Memory promised to a body that is about to be read.
+struct Reservation<'a> {
+    counter: &'a AtomicUsize,
+    bytes: usize,
+}
+
+impl<'a> Reservation<'a> {
+    fn take(counter: &'a AtomicUsize, bytes: usize) -> Option<Self> {
+        if counter.fetch_add(bytes, Ordering::SeqCst) + bytes > MAX_BODY_BYTES_IN_FLIGHT {
+            counter.fetch_sub(bytes, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self { counter, bytes })
+    }
+}
+
+impl Drop for Reservation<'_> {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(self.bytes, Ordering::SeqCst);
+    }
 }
 
 pub struct RemoteServer {
     shared: Arc<Shared>,
-    server: Arc<tiny_http::Server>,
     commands: Mutex<Receiver<Request>>,
+    accept: Option<JoinHandle<()>>,
     port: u16,
 }
 
 impl RemoteServer {
-    /// Listens on all interfaces. `wake` is called whenever a command waits
-    /// for the app (e.g. to request a repaint of a hidden window).
+    /// Listens on all interfaces. `wake` is called whenever the phone asks
+    /// for something (e.g. to request a repaint of a hidden window).
     pub fn start(
         port: u16,
         token: String,
         name: String,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self, String> {
-        let server = tiny_http::Server::http((Ipv4Addr::UNSPECIFIED, port)).map_err(|e| {
+        let bind = || TcpListener::bind((Ipv4Addr::UNSPECIFIED, port));
+        // A server that was just stopped may still hold the port for a moment.
+        let mut listener = bind();
+        for _ in 0..50 {
+            if listener
+                .as_ref()
+                .is_err_and(|e| e.kind() == std::io::ErrorKind::AddrInUse)
+            {
+                std::thread::sleep(Duration::from_millis(20));
+                listener = bind();
+            }
+        }
+        let listener = listener.map_err(|e| {
             format!("Port {port} lässt sich nicht öffnen ({e}). Läuft die App schon zweimal, oder nutzt ein anderes Programm den Port?")
         })?;
-        let port = server.server_addr().to_ip().map_or(port, |a| a.port());
-        let server = Arc::new(server);
+        let port = listener.local_addr().map_or(port, |a| a.port());
         let shared = Arc::new(Shared {
             token,
             name,
@@ -131,22 +205,23 @@ impl RemoteServer {
             changed: Condvar::new(),
             stopping: AtomicBool::new(false),
             in_flight: AtomicUsize::new(0),
+            body_bytes: AtomicUsize::new(0),
+            max_image_dim: AtomicU32::new(crate::config::DEFAULT_MAX_IMAGE_DIM),
             last_seen: Mutex::new(None),
         });
         let (tx, commands) = mpsc::channel();
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
-        {
-            let server = server.clone();
+        let accept = {
             let shared = shared.clone();
             std::thread::Builder::new()
                 .name("fernzugriff".into())
-                .spawn(move || accept_loop(&server, &shared, &tx, &wake))
-                .map_err(|e| format!("Fernzugriff konnte nicht starten: {e}"))?;
-        }
+                .spawn(move || accept_loop(&listener, &shared, &tx, &wake))
+                .map_err(|e| format!("Fernzugriff konnte nicht starten: {e}"))?
+        };
         Ok(Self {
             shared,
-            server,
             commands: Mutex::new(commands),
+            accept: Some(accept),
             port,
         })
     }
@@ -155,13 +230,16 @@ impl RemoteServer {
         self.port
     }
 
-    /// The next command from the phone, if any.
+    /// The next command from the phone, if any. Commands the phone was
+    /// already told "no answer" for are dropped.
     pub fn next_command(&self) -> Option<Request> {
-        self.commands
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .try_recv()
-            .ok()
+        let commands = self.commands.lock().unwrap_or_else(|e| e.into_inner());
+        while let Ok(request) = commands.try_recv() {
+            if request.deadline > Instant::now() {
+                return Some(request);
+            }
+        }
+        None
     }
 
     /// Replaces the state the phone sees and wakes waiting long-polls.
@@ -187,117 +265,437 @@ impl RemoteServer {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
+
+    /// True if the phone asked something within the last `within`.
+    pub fn recently_seen(&self, within: Duration) -> bool {
+        self.last_seen()
+            .is_some_and(|(when, _)| when.elapsed() < within)
+    }
+
+    /// Photos from the phone are scaled to this size.
+    pub fn set_max_image_dim(&self, dim: u32) {
+        self.shared.max_image_dim.store(dim, Ordering::Relaxed);
+    }
 }
 
 impl Drop for RemoteServer {
     fn drop(&mut self) {
-        self.shared.stopping.store(true, Ordering::Relaxed);
+        self.shared.stopping.store(true, Ordering::SeqCst);
         self.shared.changed.notify_all();
-        self.server.unblock();
+        // Wake the accept loop and wait for it, so the port is free again when
+        // this returns: a new key or port restarts the server right away.
+        let _ = TcpStream::connect_timeout(
+            &SocketAddr::from((Ipv4Addr::LOCALHOST, self.port)),
+            Duration::from_millis(500),
+        );
+        if let Some(accept) = self.accept.take() {
+            let _ = accept.join();
+        }
     }
 }
 
 fn accept_loop(
-    server: &tiny_http::Server,
+    listener: &TcpListener,
     shared: &Arc<Shared>,
     commands: &Sender<Request>,
     wake: &Arc<dyn Fn() + Send + Sync>,
 ) {
-    for request in server.incoming_requests() {
-        if shared.stopping.load(Ordering::Relaxed) {
-            break;
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(accepted) => accepted,
+            Err(_) if shared.stopping.load(Ordering::SeqCst) => return,
+            Err(_) => {
+                // Out of file descriptors, a reset connection: try again soon.
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+        if shared.stopping.load(Ordering::SeqCst) {
+            return;
         }
-        if shared.in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_CONCURRENT {
-            shared.in_flight.fetch_sub(1, Ordering::SeqCst);
-            let _ = request.respond(json_response(
-                503,
-                &json!({"error": "Zu viele gleichzeitige Anfragen."}),
-            ));
+        let Some(slot) = Slot::take(shared) else {
+            let (status, body) = error(503, "Zu viele gleichzeitige Anfragen.");
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(1)));
+            write_json(&stream, status, &body);
             continue;
-        }
-        let worker_shared = shared.clone();
+        };
         let commands = commands.clone();
         let wake = wake.clone();
-        // One thread per request: long-polls must not hold up commands.
-        let spawned = std::thread::Builder::new()
+        // One thread per request: long-polls must not hold up commands. If the
+        // thread cannot start, the closure (and with it the slot) is dropped.
+        let _ = std::thread::Builder::new()
             .name("fernzugriff-anfrage".into())
             .spawn(move || {
-                let mut request = request;
-                let (status, body) = route(&mut request, &worker_shared, &commands, &*wake);
-                let _ = request.respond(json_response(status, &body));
-                worker_shared.in_flight.fetch_sub(1, Ordering::SeqCst);
+                serve(stream, peer.ip(), &slot.0, &commands, &*wake);
+                drop(slot);
             });
-        if spawned.is_err() {
-            // The request was dropped with the closure, which closes the connection.
-            shared.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Reads with a limit on the whole head, then with a limit on silence.
+struct TimedReader {
+    stream: TcpStream,
+    /// `Some`: everything must be done by then. `None`: only silence counts.
+    deadline: Option<Instant>,
+}
+
+impl Read for TimedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let wait = match self.deadline {
+            Some(deadline) => deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::TimedOut))?,
+            None => BODY_IDLE_TIMEOUT,
+        };
+        self.stream.set_read_timeout(Some(wait))?;
+        self.stream.read(buf)
+    }
+}
+
+type Reader = BufReader<TimedReader>;
+
+struct Head {
+    method: String,
+    target: String,
+    /// Names in lower case.
+    headers: Vec<(String, String)>,
+}
+
+impl Head {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// The announced body length. A POST must announce one.
+    fn content_length(&self) -> Result<usize, (u16, Value)> {
+        if self.header("transfer-encoding").is_some() {
+            return Err(error(
+                411,
+                "Die Länge der Anfrage muss angegeben werden (kein Transfer-Encoding).",
+            ));
+        }
+        match self.header("content-length") {
+            None if self.method == "POST" => Err(error(411, "Content-Length fehlt.")),
+            None => Ok(0),
+            Some(v) => v
+                .trim()
+                .parse()
+                .map_err(|_| error(400, "Content-Length ist keine Zahl.")),
         }
     }
 }
 
+fn read_head(reader: &mut Reader) -> Result<Head, (u16, Value)> {
+    let bad = || error(400, "Ungültige Anfrage.");
+    let mut total = 0;
+    let mut lines: Vec<String> = Vec::new();
+    loop {
+        let mut line = Vec::new();
+        let left = (MAX_HEAD_BYTES + 1 - total) as u64;
+        match reader.by_ref().take(left).read_until(b'\n', &mut line) {
+            Ok(0) => return Err(bad()),
+            Ok(n) => total += n,
+            Err(e) if e.kind() == std::io::ErrorKind::TimedOut => {
+                return Err(error(408, "Die Anfrage kam zu langsam."));
+            }
+            Err(_) => return Err(bad()),
+        }
+        if !line.ends_with(b"\n") {
+            return Err(error(431, "Die Kopfzeilen sind zu groß."));
+        }
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end_matches(['\r', '\n']);
+        if text.is_empty() {
+            if lines.is_empty() {
+                continue; // a blank line before the request line is allowed
+            }
+            break;
+        }
+        lines.push(text.to_owned());
+        if lines.len() > MAX_HEADERS + 1 {
+            return Err(error(431, "Zu viele Kopfzeilen."));
+        }
+    }
+    let mut parts = lines[0].split(' ');
+    let (Some(method), Some(target), Some(version), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err(bad());
+    };
+    if !version.starts_with("HTTP/1.") || !target.starts_with('/') {
+        return Err(bad());
+    }
+    let headers = lines[1..]
+        .iter()
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_owned()))
+        .collect();
+    Ok(Head {
+        method: method.to_ascii_uppercase(),
+        target: target.to_owned(),
+        headers,
+    })
+}
+
+/// Answers one connection; every connection carries one request.
+fn serve(
+    stream: TcpStream,
+    peer: IpAddr,
+    shared: &Arc<Shared>,
+    commands: &Sender<Request>,
+    wake: &(dyn Fn() + Send + Sync),
+) {
+    let _ = stream.set_write_timeout(Some(WRITE_TIMEOUT));
+    let _ = stream.set_nodelay(true);
+    let Ok(read_half) = stream.try_clone() else {
+        return;
+    };
+    let mut reader = BufReader::with_capacity(
+        16 * 1024,
+        TimedReader {
+            stream: read_half,
+            deadline: Some(Instant::now() + HEAD_TIMEOUT),
+        },
+    );
+    let (status, body) = match read_head(&mut reader) {
+        Ok(head) => route(&head, &mut reader, &stream, peer, shared, commands, wake),
+        Err(answer) => answer,
+    };
+    write_json(&stream, status, &body);
+    // Tell the client the answer is complete; it then closes its side too.
+    let _ = stream.shutdown(Shutdown::Write);
+    // An answer sent before the body was read (401, 413) must not be lost to
+    // a connection reset: take in a little of what is still coming, bounded.
+    reader.get_mut().deadline = Some(Instant::now() + Duration::from_secs(1));
+    let _ = std::io::copy(&mut reader.by_ref().take(64 * 1024), &mut std::io::sink());
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+fn write_json(mut stream: &TcpStream, status: u16, body: &Value) {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        404 => "Not Found",
+        408 => "Request Timeout",
+        409 => "Conflict",
+        411 => "Length Required",
+        413 => "Content Too Large",
+        431 => "Request Header Fields Too Large",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Error",
+    };
+    let body = body.to_string();
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream
+        .write_all(head.as_bytes())
+        .and_then(|()| stream.write_all(body.as_bytes()))
+        .and_then(|()| stream.flush());
+}
+
 fn route(
-    request: &mut tiny_http::Request,
-    shared: &Shared,
+    head: &Head,
+    reader: &mut Reader,
+    stream: &TcpStream,
+    peer: IpAddr,
+    shared: &Arc<Shared>,
     commands: &Sender<Request>,
     wake: &(dyn Fn() + Send + Sync),
 ) -> (u16, Value) {
-    if !authorized(request, &shared.token) {
+    // The key comes first: nobody without it gets a body read, let alone parsed.
+    if !authorized(head, &shared.token) {
         return error(
             401,
             "Falscher oder fehlender Schlüssel. Koppel das Handy neu (QR-Code in der Mac-App).",
         );
     }
-    if let Some(peer) = request.remote_addr() {
-        *shared.last_seen.lock().unwrap_or_else(|e| e.into_inner()) =
-            Some((Instant::now(), peer.ip().to_string()));
-    }
-    let url = request.url().to_owned();
-    let (path, query) = url.split_once('?').unwrap_or((url.as_str(), ""));
-    let method = request.method().as_str().to_ascii_uppercase();
+    *shared.last_seen.lock().unwrap_or_else(|e| e.into_inner()) =
+        Some((Instant::now(), peer.to_string()));
+    let (path, query) = head
+        .target
+        .split_once('?')
+        .unwrap_or((head.target.as_str(), ""));
 
-    match (method.as_str(), path) {
+    match (head.method.as_str(), path) {
         ("GET", "/api/v1/ping") => (
             200,
             json!({"ok": true, "app": "Fadis Nemotron", "version": env!("CARGO_PKG_VERSION"), "protocol": PROTOCOL, "name": shared.name}),
         ),
-        ("GET", "/api/v1/state") => (200, wait_for_state(shared, query)),
+        ("GET", "/api/v1/state") => {
+            // Lets a window that was idle build a fresh snapshot.
+            wake();
+            (200, wait_for_state(shared, query))
+        }
         ("GET", "/api/v1/diff") => match query_param(query, "path") {
             Some(path) => ask_app(commands, wake, Command::Diff { path }),
             None => error(400, "path fehlt"),
         },
         ("POST", "/api/v1/upload") => {
-            let name = query_param(query, "name").unwrap_or_else(|| "anhang".to_owned());
-            let content_type = request
-                .headers()
-                .iter()
-                .find(|h| h.field.equiv("Content-Type"))
-                .map(|h| h.value.as_str().to_owned())
-                .unwrap_or_default();
-            match read_body(request, MAX_UPLOAD_BYTES) {
-                Ok(bytes) if bytes.is_empty() => error(400, "Leerer Upload."),
-                Ok(bytes) => ask_app(
-                    commands,
-                    wake,
-                    Command::Upload {
-                        name,
-                        content_type,
-                        bytes,
-                    },
-                ),
+            let name: String = query_param(query, "name")
+                .unwrap_or_else(|| "anhang".to_owned())
+                .chars()
+                .take(120)
+                .collect();
+            let content_type = head.header("content-type").unwrap_or("").to_owned();
+            let len = match head.content_length() {
+                Ok(n) => n,
+                Err(e) => return e,
+            };
+            let Some(kind) = upload_kind(&name, &content_type) else {
+                return error(
+                    400,
+                    &format!(
+                        "{name}: nur Fotos und Videos (MP4, MOV, WebM) können angehängt werden."
+                    ),
+                );
+            };
+            let max = match kind {
+                AttachmentKind::Image => MAX_IMAGE_UPLOAD_BYTES,
+                AttachmentKind::Video => attachments::MAX_VIDEO_BYTES,
+            };
+            if len == 0 {
+                return error(400, "Leerer Upload.");
+            }
+            let bytes = match read_body(head, reader, stream, len, max, &shared.body_bytes) {
+                Ok(b) => b,
+                Err(e) => return e,
+            };
+            let max_dim = shared.max_image_dim.load(Ordering::Relaxed);
+            // Scaling a photo takes a moment: done here, not on the app's thread.
+            match prepare_upload(&name, &content_type, kind, bytes, max_dim) {
+                Ok(attachment) => ask_app(commands, wake, Command::Upload { attachment }),
                 Err(e) => e,
             }
         }
         ("POST", endpoint) => {
-            let body = match read_json(request) {
+            let len = match head.content_length() {
+                Ok(n) => n,
+                Err(e) => return e,
+            };
+            let bytes = match read_body(
+                head,
+                reader,
+                stream,
+                len,
+                MAX_BODY_BYTES,
+                &shared.body_bytes,
+            ) {
                 Ok(b) => b,
                 Err(e) => return e,
             };
-            let command = match parse_command(endpoint, &body) {
+            let body = if bytes.iter().all(u8::is_ascii_whitespace) {
+                json!({})
+            } else {
+                match serde_json::from_slice(&bytes) {
+                    Ok(v) => v,
+                    Err(e) => return error(400, &format!("Ungültiges JSON: {e}")),
+                }
+            };
+            let max_dim = shared.max_image_dim.load(Ordering::Relaxed);
+            let command = match parse_command(endpoint, &body, max_dim) {
                 Ok(c) => c,
                 Err(e) => return e,
             };
             ask_app(commands, wake, command)
         }
         _ => error(404, "Unbekannter Endpunkt."),
+    }
+}
+
+/// Reads exactly `len` bytes, if that is within `max` and the memory budget.
+fn read_body(
+    head: &Head,
+    reader: &mut Reader,
+    stream: &TcpStream,
+    len: usize,
+    max: usize,
+    budget: &AtomicUsize,
+) -> Result<Vec<u8>, (u16, Value)> {
+    if len > max {
+        return Err(error(
+            413,
+            &format!(
+                "Die Anfrage ist zu groß (höchstens {} MB).",
+                max / (1024 * 1024)
+            ),
+        ));
+    }
+    let Some(_reserved) = Reservation::take(budget, len) else {
+        return Err(error(
+            503,
+            "Der Mac nimmt gerade viele Daten an. Bitte kurz warten und noch einmal senden.",
+        ));
+    };
+    // curl and some libraries wait for this before they send a large body.
+    if head
+        .header("expect")
+        .is_some_and(|v| v.eq_ignore_ascii_case("100-continue"))
+    {
+        let _ = (&*stream).write_all(b"HTTP/1.1 100 Continue\r\n\r\n");
+    }
+    reader.get_mut().deadline = None;
+    let mut bytes = Vec::with_capacity(len);
+    reader
+        .by_ref()
+        .take(len as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|e| error(400, &format!("Anfrage konnte nicht gelesen werden: {e}")))?;
+    if bytes.len() != len {
+        return Err(error(400, "Die Anfrage ist unvollständig angekommen."));
+    }
+    Ok(bytes)
+}
+
+/// Photo or video, judged by the file name and then the content type.
+fn upload_kind(name: &str, content_type: &str) -> Option<AttachmentKind> {
+    let ext = std::path::Path::new(name)
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    attachments::kind_for_extension(&ext).or_else(|| {
+        let content_type = content_type.to_ascii_lowercase();
+        if content_type.starts_with("image/") {
+            Some(AttachmentKind::Image)
+        } else if content_type.starts_with("video/") {
+            Some(AttachmentKind::Video)
+        } else {
+            None
+        }
+    })
+}
+
+fn prepare_upload(
+    name: &str,
+    content_type: &str,
+    kind: AttachmentKind,
+    bytes: Vec<u8>,
+    max_image_dim: u32,
+) -> Result<Attachment, (u16, Value)> {
+    match kind {
+        AttachmentKind::Image => {
+            attachments::image_attachment(name, &bytes, max_image_dim).map_err(|e| error(400, &e))
+        }
+        AttachmentKind::Video => {
+            let ext = std::path::Path::new(name)
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+                .unwrap_or_default();
+            let ext = match (ext.as_str(), content_type.to_ascii_lowercase().as_str()) {
+                ("mov" | "webm" | "mp4" | "m4v", _) => ext,
+                (_, "video/quicktime") => "mov".to_owned(),
+                (_, "video/webm") => "webm".to_owned(),
+                _ => "mp4".to_owned(),
+            };
+            attachments::video_attachment(name, &ext, bytes).map_err(|e| error(400, &e))
+        }
     }
 }
 
@@ -334,7 +732,12 @@ fn ask_app(
     command: Command,
 ) -> (u16, Value) {
     let (reply, answer) = mpsc::channel();
-    if commands.send(Request { command, reply }).is_err() {
+    let request = Request {
+        command,
+        reply,
+        deadline: Instant::now() + COMMAND_TIMEOUT,
+    };
+    if commands.send(request).is_err() {
         return error(503, "Die Mac-App beendet gerade den Fernzugriff.");
     }
     wake();
@@ -345,7 +748,11 @@ fn ask_app(
     }
 }
 
-fn parse_command(endpoint: &str, body: &Value) -> Result<Command, (u16, Value)> {
+fn parse_command(
+    endpoint: &str,
+    body: &Value,
+    max_image_dim: u32,
+) -> Result<Command, (u16, Value)> {
     let text = |key: &str| body.get(key).and_then(Value::as_str).map(str::to_owned);
     match endpoint {
         "/api/v1/send" => {
@@ -368,7 +775,10 @@ fn parse_command(endpoint: &str, body: &Value) -> Result<Command, (u16, Value)> 
                     .map_err(|_| {
                         error(400, &format!("Bild {} ist kein gültiges Base64.", i + 1))
                     })?;
-                images.push((name, bytes));
+                images.push(
+                    attachments::image_attachment(&name, &bytes, max_image_dim)
+                        .map_err(|e| error(400, &e))?,
+                );
             }
             let uploads: Vec<String> = body
                 .get("uploads")
@@ -384,7 +794,7 @@ fn parse_command(endpoint: &str, body: &Value) -> Result<Command, (u16, Value)> 
             }
             Ok(Command::Send {
                 text,
-                images,
+                attachments: images,
                 uploads,
             })
         }
@@ -432,45 +842,9 @@ fn parse_command(endpoint: &str, body: &Value) -> Result<Command, (u16, Value)> 
     }
 }
 
-fn read_body(request: &mut tiny_http::Request, max: usize) -> Result<Vec<u8>, (u16, Value)> {
-    let too_big = || {
-        error(
-            413,
-            &format!(
-                "Die Anfrage ist zu groß (höchstens {} MB).",
-                max / (1024 * 1024)
-            ),
-        )
-    };
-    if request.body_length().is_some_and(|n| n > max) {
-        return Err(too_big());
-    }
-    let mut bytes = Vec::new();
-    request
-        .as_reader()
-        .take(max as u64 + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| error(400, &format!("Anfrage konnte nicht gelesen werden: {e}")))?;
-    if bytes.len() > max {
-        return Err(too_big());
-    }
-    Ok(bytes)
-}
-
-fn read_json(request: &mut tiny_http::Request) -> Result<Value, (u16, Value)> {
-    let bytes = read_body(request, MAX_BODY_BYTES)?;
-    if bytes.iter().all(u8::is_ascii_whitespace) {
-        return Ok(json!({}));
-    }
-    serde_json::from_slice(&bytes).map_err(|e| error(400, &format!("Ungültiges JSON: {e}")))
-}
-
-fn authorized(request: &tiny_http::Request, token: &str) -> bool {
-    let presented = request
-        .headers()
-        .iter()
-        .find(|h| h.field.equiv("Authorization"))
-        .map(|h| h.value.as_str())
+fn authorized(head: &Head, token: &str) -> bool {
+    let presented = head
+        .header("authorization")
         .and_then(|v| v.strip_prefix("Bearer "))
         .unwrap_or("");
     !token.is_empty() && constant_time_eq(presented.trim().as_bytes(), token.as_bytes())
@@ -516,14 +890,6 @@ fn percent_decode(s: &str) -> String {
 
 fn error(status: u16, message: &str) -> (u16, Value) {
     (status, json!({ "error": message }))
-}
-
-fn json_response(status: u16, body: &Value) -> tiny_http::Response<std::io::Cursor<Vec<u8>>> {
-    let header = tiny_http::Header::from_bytes("Content-Type", "application/json; charset=utf-8")
-        .expect("valid header");
-    tiny_http::Response::from_string(body.to_string())
-        .with_status_code(status)
-        .with_header(header)
 }
 
 /// A new random key for pairing: 32 URL-safe characters.
@@ -660,6 +1026,27 @@ mod tests {
         }
     }
 
+    /// A real (tiny) picture: photos are decoded when they arrive.
+    fn tiny_png() -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        image::RgbImage::new(4, 4)
+            .write_to(&mut out, image::ImageFormat::Png)
+            .unwrap();
+        out.into_inner()
+    }
+
+    /// Sends raw bytes and reads whatever comes back, like a hostile client.
+    fn raw(port: u16, request: &[u8]) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let _ = stream.write_all(request);
+        let mut out = Vec::new();
+        let _ = stream.read_to_end(&mut out);
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
     fn start() -> (RemoteServer, Client) {
         let server = RemoteServer::start(0, "geheim123".into(), "Testmac".into(), || {}).unwrap();
         let client = Client::new(server.port());
@@ -678,12 +1065,12 @@ mod tests {
                     let reply = match &req.command {
                         Command::Send {
                             text,
-                            images,
+                            attachments,
                             uploads,
                         } => {
                             seen.lock().unwrap().push(format!(
                                 "send:{text}:{}:{}",
-                                images.len(),
+                                attachments.len(),
                                 uploads.join(",")
                             ));
                             if text == "besetzt" {
@@ -692,15 +1079,13 @@ mod tests {
                                 Ok(json!({"ok": true}))
                             }
                         }
-                        Command::Upload {
-                            name,
-                            content_type,
-                            bytes,
-                        } => {
-                            seen.lock()
-                                .unwrap()
-                                .push(format!("upload:{name}:{content_type}:{}", bytes.len()));
-                            Ok(json!({"id": "up-1", "kind": "video", "size": bytes.len()}))
+                        Command::Upload { attachment } => {
+                            seen.lock().unwrap().push(format!(
+                                "upload:{}:{}",
+                                attachment.name,
+                                attachment.size_label()
+                            ));
+                            Ok(json!({"id": "up-1", "kind": "video", "size": 0}))
                         }
                         other => {
                             seen.lock().unwrap().push(format!("{other:?}"));
@@ -773,7 +1158,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let helper = answer_commands(server.clone(), seen.clone());
 
-        let image = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
+        let image = base64::engine::general_purpose::STANDARD.encode(tiny_png());
         let (status, _) = client.post(
             "/api/v1/send",
             "geheim123",
@@ -875,13 +1260,162 @@ mod tests {
         assert_eq!(seen[4], "Stop");
         assert_eq!(
             seen[5],
-            format!("upload:Mein Clip.mp4:video/mp4:{}", video.len())
+            format!(
+                "upload:Mein Clip.mp4:{}",
+                attachments::format_size(video.len())
+            )
         );
         assert_eq!(seen[6], "send:Was passiert?:0:up-1");
         assert!(seen[7].contains("OpenChat") && seen[7].contains("c-1"));
         assert!(seen[8].contains("DeleteChat") && seen[8].contains("c-2"));
         assert_eq!(seen.len(), 9, "bad requests must not reach the app");
         assert!(server.last_seen().is_some_and(|(_, ip)| ip == "127.0.0.1"));
+    }
+
+    fn ping_works(client: &Client) -> bool {
+        client.get("/api/v1/ping", Some("geheim123")).0 == 200
+    }
+
+    #[test]
+    fn strangers_cannot_crash_or_clog_the_server() {
+        let (server, client) = start();
+        let port = server.port();
+        // A body of absurd size announced without the key: answered, not read.
+        for length in ["1125899906842624", "18446744073709551615", "1000000000"] {
+            let answer = raw(
+                port,
+                format!("POST /api/v1/send HTTP/1.1\r\nContent-Length: {length}\r\n\r\n")
+                    .as_bytes(),
+            );
+            assert!(answer.starts_with("HTTP/1.1 401"), "{length}: {answer}");
+        }
+        assert!(ping_works(&client));
+
+        // The same with the key: refused as too big, before anything is read.
+        let answer = raw(
+            port,
+            b"POST /api/v1/send HTTP/1.1\r\nAuthorization: Bearer geheim123\r\nContent-Length: 1125899906842624\r\n\r\n",
+        );
+        assert!(answer.starts_with("HTTP/1.1 413"), "{answer}");
+
+        // Idle connections that announced a huge body do not hold slots for long.
+        let held: Vec<TcpStream> = (0..40)
+            .map(|_| {
+                let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+                s.write_all(b"POST /api/v1/send HTTP/1.1\r\nContent-Length: 1000000000\r\n\r\n")
+                    .unwrap();
+                s
+            })
+            .collect();
+        std::thread::sleep(Duration::from_millis(2_500));
+        assert!(ping_works(&client), "the server stayed blocked");
+        drop(held);
+
+        // A header line without end, and too many headers.
+        let mut flood = b"GET /api/v1/ping HTTP/1.1\r\nX-A: ".to_vec();
+        flood.extend(std::iter::repeat_n(b'A', 200_000));
+        assert!(raw(port, &flood).starts_with("HTTP/1.1 431"));
+        let mut many = b"GET /api/v1/ping HTTP/1.1\r\n".to_vec();
+        for i in 0..100 {
+            many.extend(format!("X-{i}: 1\r\n").as_bytes());
+        }
+        many.extend(b"\r\n");
+        assert!(raw(port, &many).starts_with("HTTP/1.1 431"));
+        // Not HTTP at all.
+        assert!(raw(port, b"\x16\x03\x01\x02\x00\r\n\r\n").starts_with("HTTP/1.1 400"));
+        assert!(ping_works(&client));
+    }
+
+    #[test]
+    fn bodies_must_announce_their_length_and_stay_in_bounds() {
+        let (server, client) = start();
+        let port = server.port();
+        let auth = "Authorization: Bearer geheim123\r\n";
+        let no_length = format!("POST /api/v1/stop HTTP/1.1\r\n{auth}\r\n");
+        assert!(raw(port, no_length.as_bytes()).starts_with("HTTP/1.1 411"));
+        let chunked = format!(
+            "POST /api/v1/stop HTTP/1.1\r\n{auth}Transfer-Encoding: chunked\r\n\r\n0\r\n\r\n"
+        );
+        assert!(raw(port, chunked.as_bytes()).starts_with("HTTP/1.1 411"));
+        let not_a_number =
+            format!("POST /api/v1/stop HTTP/1.1\r\n{auth}Content-Length: zehn\r\n\r\n");
+        assert!(raw(port, not_a_number.as_bytes()).starts_with("HTTP/1.1 400"));
+
+        // Uploads: kind and size are judged from the head, before the body.
+        let big_video = format!(
+            "POST /api/v1/upload?name=film.mp4 HTTP/1.1\r\n{auth}Content-Length: {}\r\n\r\n",
+            attachments::MAX_VIDEO_BYTES + 1
+        );
+        assert!(raw(port, big_video.as_bytes()).starts_with("HTTP/1.1 413"));
+        let big_photo = format!(
+            "POST /api/v1/upload?name=foto.jpg HTTP/1.1\r\n{auth}Content-Length: {}\r\n\r\n",
+            MAX_IMAGE_UPLOAD_BYTES + 1
+        );
+        assert!(raw(port, big_photo.as_bytes()).starts_with("HTTP/1.1 413"));
+        let text_file = format!(
+            "POST /api/v1/upload?name=notiz.txt HTTP/1.1\r\n{auth}Content-Type: text/plain\r\nContent-Length: 5\r\n\r\nhallo"
+        );
+        assert!(raw(port, text_file.as_bytes()).starts_with("HTTP/1.1 400"));
+
+        // Bodies that are being received share a memory budget.
+        let announce = format!(
+            "POST /api/v1/upload?name=film.mp4 HTTP/1.1\r\n{auth}Content-Length: {}\r\n\r\n",
+            attachments::MAX_VIDEO_BYTES
+        );
+        let mut waiting = Vec::new();
+        for _ in 0..3 {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(announce.as_bytes()).unwrap();
+            waiting.push(s);
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        let answer = raw(port, announce.as_bytes());
+        assert!(answer.starts_with("HTTP/1.1 503"), "{answer}");
+        drop(waiting);
+        assert!(ping_works(&client));
+    }
+
+    #[test]
+    fn a_stopped_server_gives_its_port_back_at_once() {
+        let (server, _) = start();
+        let mut port = server.port();
+        drop(server);
+        for _ in 0..20 {
+            let again = RemoteServer::start(port, "geheim123".into(), "Testmac".into(), || {})
+                .expect("the port is free right after the server stopped");
+            port = again.port();
+            assert_eq!(port, again.port());
+        }
+    }
+
+    #[test]
+    fn photos_are_prepared_where_they_arrive() {
+        let (server, client) = start();
+        let server = Arc::new(server);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let helper = answer_commands(server.clone(), seen.clone());
+        let mut res = client
+            .agent
+            .post(format!("{}/api/v1/upload?name=foto.png", client.base))
+            .header("Authorization", "Bearer geheim123")
+            .header("Content-Type", "image/png")
+            .send(tiny_png())
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 200);
+        let _ = res.body_mut().read_to_string();
+        // Not a picture: refused here, never handed to the app.
+        let res = client
+            .agent
+            .post(format!("{}/api/v1/upload?name=kaputt.jpg", client.base))
+            .header("Authorization", "Bearer geheim123")
+            .header("Content-Type", "image/jpeg")
+            .send(b"das ist kein Bild".as_slice())
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 400);
+        helper.join().unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert!(seen[0].starts_with("upload:foto.png:"));
     }
 
     #[test]

@@ -22,7 +22,9 @@ Die Mac-App zeigt einen QR-Code mit diesem JSON:
 
 ## Fehler
 
-Fehler haben einen passenden Status (`400`, `401`, `404`, `409`, `413`, `503`) und den Body `{"error": "Text für den Nutzer"}`.
+Fehler haben einen passenden Status (`400`, `401`, `404`, `408`, `409`, `411`, `413`, `431`, `500`, `503`) und den Body `{"error": "Text für den Nutzer"}`.
+
+Jede Verbindung trägt genau eine Anfrage (`Connection: close`). Anfragen mit Body (`POST`) müssen `Content-Length` angeben, `Transfer-Encoding` gibt es nicht (`411`). Der Schlüssel wird geprüft, bevor ein Body gelesen wird. Kopfzeilen dürfen zusammen 16 KB nicht überschreiten (`431`), der Kopf muss innerhalb von 10 Sekunden ankommen (`408`).
 
 ## Endpunkte
 
@@ -96,14 +98,14 @@ Liefert den ganzen sichtbaren Zustand. Ist `after` gleich der aktuellen Version,
 
 ### `POST /api/v1/upload?name=<dateiname>`
 
-Lädt ein Foto oder Video hoch, **als rohe Bytes im Body** (kein JSON, kein Base64), z. B. mit `Content-Type: video/mp4` oder `image/jpeg`. Höchstens 200 MB.
+Lädt ein Foto oder Video hoch, **als rohe Bytes im Body** (kein JSON, kein Base64), z. B. mit `Content-Type: video/mp4` oder `image/jpeg`. `Content-Length` ist Pflicht. Höchstens 30 MB für Fotos und 100 MB für Videos; ist die angekündigte Länge größer, antwortet der Mac sofort mit `413`, ohne den Body zu lesen. Nimmt der Mac gerade schon sehr viele Daten an, antwortet er mit `503` (kurz warten, noch einmal senden).
 
 ```json
 {"id": "up-7f3a9c", "kind": "video", "size": 14680064}
 ```
 
 - Die Art erkennt der Mac an der Dateiendung von `name` (Bilder: png, jpg, jpeg, gif, webp, bmp; Videos: mp4, m4v, mov, webm), sonst am `Content-Type` (`image/…`, `video/…`). Unbekannt: `400`.
-- Bilder werden wie in der Mac-App verkleinert (längste Seite 1536 px). Videos werden unverändert übernommen; über 100 MB: `413`. Das Handy verkleinert Videos deshalb vorher (720p, MP4/H.264).
+- Bilder werden wie in der Mac-App verkleinert (längste Seite 1536 px); ist die Datei kein lesbares Bild: `400`. Videos werden unverändert übernommen. Das Handy verkleinert Videos deshalb vorher (720p, MP4/H.264).
 - Ein Upload bleibt 30 Minuten gültig und wird mit dem nächsten `send`, der ihn nennt, verbraucht.
 
 ### `POST /api/v1/send`
@@ -128,7 +130,7 @@ Stoppt die laufende Antwort (wie der Stop-Knopf).
 
 ### `POST /api/v1/new_chat`
 
-Legt einen neuen, leeren Chat an und öffnet ihn (auf Mac und Handy). `409`, wenn gerade eine Antwort läuft.
+Legt einen neuen, leeren Chat an und öffnet ihn (auf Mac und Handy). `409`, wenn gerade eine Antwort läuft; `500`, wenn der bisherige Chat nicht gespeichert werden konnte (er bleibt dann offen).
 
 ### `POST /api/v1/open_chat`
 
@@ -144,7 +146,7 @@ Legt einen neuen, leeren Chat an und öffnet ihn (auf Mac und Handy). `409`, wen
 {"id": "c-1792605781-b7c1e0"}
 ```
 
-Löscht einen Chat endgültig. Ist es der offene Chat, öffnet der Mac den neuesten übrigen (oder einen neuen, leeren). `404` bei unbekannter `id`, `409`, wenn gerade eine Antwort läuft.
+Löscht einen Chat endgültig. Ist es der offene Chat, öffnet der Mac den neuesten übrigen (oder einen neuen, leeren). `404` bei unbekannter `id`, `409`, wenn der offene Chat gelöscht werden soll, während gerade eine Antwort läuft. Andere Chats lassen sich auch während einer Antwort löschen.
 
 ### `POST /api/v1/retry`
 

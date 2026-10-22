@@ -30,6 +30,10 @@ const INTERRUPTED: &str = "Stopped by the user while running; it may have partly
 const OLD_TOOL_OUTPUT_CHARS: usize = 2_000;
 /// Uploads from the phone wait this long for the message that uses them.
 const UPLOAD_TTL: Duration = Duration::from_secs(30 * 60);
+/// Uploads waiting for their message may hold this much memory together.
+const MAX_STORED_UPLOAD_BYTES: usize = 400 * 1024 * 1024;
+/// A phone that asked something within this time counts as connected.
+const PHONE_RECENTLY: Duration = Duration::from_secs(90);
 /// The phone gets at most this many chats in its list.
 const MAX_LISTED_CHATS: usize = 200;
 
@@ -573,9 +577,10 @@ impl NemotronApp {
         let _ = std::process::Command::new(opener).arg(path).spawn();
     }
 
-    fn new_chat(&mut self, ctx: &egui::Context) {
+    /// Starts an empty chat. If the open one cannot be saved it stays open.
+    fn new_chat(&mut self, ctx: &egui::Context) -> Result<(), String> {
         self.stop();
-        self.save_chat();
+        self.try_save_chat()?;
         for att in &self.pending {
             ctx.forget_image(&att.preview_uri());
         }
@@ -584,6 +589,7 @@ impl NemotronApp {
         self.show_chat(Vec::new(), ctx);
         self.chat_id = ChatStore::new_id();
         self.chat_created = chats::now();
+        Ok(())
     }
 
     // --------------------------------------------------------------- chats
@@ -610,13 +616,19 @@ impl NemotronApp {
         )
     }
 
-    /// Writes the open chat to disk; a chat without messages is not saved.
+    /// Writes the open chat to disk as well as possible; the notice says if it fails.
     fn save_chat(&mut self) {
+        let _ = self.try_save_chat();
+    }
+
+    /// Writes the open chat to disk; a chat without messages is not saved.
+    /// On failure the notice says why, and the chat must not be thrown away.
+    fn try_save_chat(&mut self) -> Result<(), String> {
         let Some(store) = &self.chat_store else {
-            return;
+            return Ok(());
         };
         if self.messages.is_empty() {
-            return;
+            return Ok(());
         }
         let chat = Chat {
             id: self.chat_id.clone(),
@@ -631,13 +643,19 @@ impl NemotronApp {
         match store.save(&chat) {
             Ok(summary) => {
                 self.chats.retain(|c| c.id != summary.id);
-                self.chats.insert(0, summary);
+                self.chats.push(summary);
+                // An unchanged chat keeps its old time, so it must not jump to the top.
+                self.chats
+                    .sort_by(|a, b| b.updated.cmp(&a.updated).then_with(|| b.id.cmp(&a.id)));
+                Ok(())
             }
             Err(e) => {
+                let text = format!("Chat konnte nicht gespeichert werden: {e}");
                 self.notice = Some(Notice {
-                    text: format!("Chat konnte nicht gespeichert werden: {e}"),
+                    text: text.clone(),
                     error: true,
                 });
+                Err(text)
             }
         }
     }
@@ -655,7 +673,8 @@ impl NemotronApp {
             return Err(not_found());
         }
         let chat: Chat<Message> = store.load(id).map_err(|e| (500, e))?;
-        self.save_chat();
+        // The open chat is only left once it is safe.
+        self.try_save_chat().map_err(|e| (500, e))?;
         let messages = chat
             .messages
             .into_iter()
@@ -692,10 +711,10 @@ impl NemotronApp {
         self.chats.retain(|c| c.id != id);
         if current {
             // Nothing left to save: then open the newest other chat, or a new one.
-            self.messages.clear();
+            self.show_chat(Vec::new(), ctx);
             match self.chats.first().map(|c| c.id.clone()) {
                 Some(next) if self.open_chat(&next, ctx).is_ok() => {}
-                _ => self.new_chat(ctx),
+                _ => self.new_chat(ctx).map_err(|e| (500, e))?,
             }
         }
         Ok(())
@@ -719,53 +738,25 @@ impl NemotronApp {
         Value::Array(list)
     }
 
-    /// A photo or video from the phone, prepared like a local attachment.
-    fn take_upload(&mut self, name: &str, content_type: &str, bytes: Vec<u8>) -> Reply {
-        self.uploads.retain(|(_, at, _)| at.elapsed() < UPLOAD_TTL);
-        let ext = Path::new(name)
-            .extension()
-            .map(|e| e.to_string_lossy().to_lowercase())
-            .unwrap_or_default();
-        let kind = attachments::kind_for_extension(&ext).or_else(|| {
-            if content_type.starts_with("image/") {
-                Some(AttachmentKind::Image)
-            } else if content_type.starts_with("video/") {
-                Some(AttachmentKind::Video)
-            } else {
-                None
-            }
-        });
-        let size = bytes.len();
-        let att = match kind {
-            Some(AttachmentKind::Image) => {
-                attachments::image_attachment(name, &bytes, self.settings.max_image_dim)
-                    .map_err(|e| (400, e))?
-            }
-            Some(AttachmentKind::Video) => {
-                let ext = match (ext.as_str(), content_type) {
-                    ("mov" | "webm" | "mp4" | "m4v", _) => ext.clone(),
-                    (_, "video/quicktime") => "mov".to_owned(),
-                    (_, "video/webm") => "webm".to_owned(),
-                    _ => "mp4".to_owned(),
-                };
-                attachments::video_attachment(name, &ext, bytes).map_err(|e| {
-                    let status = if size > attachments::MAX_VIDEO_BYTES {
-                        413
-                    } else {
-                        400
-                    };
-                    (status, e)
-                })?
-            }
-            None => {
-                return Err((
-                    400,
-                    format!(
-                        "{name}: nur Fotos und Videos (MP4, MOV, WebM) können angehängt werden."
-                    ),
-                ));
-            }
+    /// Keeps a photo or video from the phone until a message uses it. The
+    /// server already checked and prepared it.
+    fn take_upload(&mut self, attachment: Attachment) -> Reply {
+        let size = match &attachment.source {
+            attachments::Source::Data { bytes, .. } => bytes.len(),
+            attachments::Source::Url(_) => 0,
         };
+        let kind = match attachment.kind {
+            AttachmentKind::Image => "image",
+            AttachmentKind::Video => "video",
+        };
+        self.prune_uploads();
+        // Oldest go first when the phone sends more than fits.
+        let stored = |uploads: &[(String, Instant, Attachment)]| -> usize {
+            uploads.iter().map(|(_, _, a)| attachment_bytes(a)).sum()
+        };
+        while !self.uploads.is_empty() && stored(&self.uploads) + size > MAX_STORED_UPLOAD_BYTES {
+            self.uploads.remove(0);
+        }
         let mut random = [0u8; 4];
         let _ = getrandom::fill(&mut random);
         let id = format!(
@@ -775,12 +766,13 @@ impl NemotronApp {
                 .map(|b| format!("{b:02x}"))
                 .collect::<String>()
         );
-        let kind = match att.kind {
-            AttachmentKind::Image => "image",
-            AttachmentKind::Video => "video",
-        };
-        self.uploads.push((id.clone(), Instant::now(), att));
+        self.uploads.push((id.clone(), Instant::now(), attachment));
         Ok(json!({"id": id, "kind": kind, "size": size}))
+    }
+
+    /// Drops uploads no message used within [`UPLOAD_TTL`].
+    fn prune_uploads(&mut self) {
+        self.uploads.retain(|(_, at, _)| at.elapsed() < UPLOAD_TTL);
     }
 
     // ------------------------------------------------------------- sending
@@ -1135,7 +1127,8 @@ impl NemotronApp {
             self.open_settings();
         }
         if new_chat {
-            self.new_chat(ctx);
+            // A failed save leaves the chat open and says why in the notice.
+            let _ = self.new_chat(ctx);
         }
         if open_project {
             self.pick_workspace(ctx);
@@ -1213,6 +1206,10 @@ impl NemotronApp {
 
     /// Runs what the phone asked for and publishes the new state.
     fn handle_remote(&mut self, ctx: &egui::Context) {
+        if let Some(server) = &self.remote {
+            server.set_max_image_dim(self.settings.max_image_dim);
+        }
+        self.prune_uploads();
         let mut handled = false;
         while let Some(request) = self.remote.as_ref().and_then(RemoteServer::next_command) {
             let mut request = request;
@@ -1232,16 +1229,12 @@ impl NemotronApp {
         let busy = busy_error;
         let ok = Ok(json!({ "ok": true }));
         match command {
-            Command::Upload {
-                name,
-                content_type,
-                bytes,
-            } => self.take_upload(name, content_type, std::mem::take(bytes)),
+            Command::Upload { attachment } => self.take_upload(attachment.clone()),
             Command::OpenChat { id } => self.open_chat(id, ctx).map(|()| json!({ "ok": true })),
             Command::DeleteChat { id } => self.delete_chat(id, ctx).map(|()| json!({ "ok": true })),
             Command::Send {
                 text,
-                images,
+                attachments: inline,
                 uploads,
             } => {
                 if self.active.is_some() {
@@ -1253,7 +1246,7 @@ impl NemotronApp {
                         "Am Mac ist noch kein NVIDIA-API-Schlüssel eingetragen.".into(),
                     ));
                 }
-                self.uploads.retain(|(_, at, _)| at.elapsed() < UPLOAD_TTL);
+                self.prune_uploads();
                 if let Some(missing) = uploads
                     .iter()
                     .find(|id| !self.uploads.iter().any(|(u, _, _)| u == *id))
@@ -1263,13 +1256,7 @@ impl NemotronApp {
                         format!("Anhang {missing} ist abgelaufen – bitte erneut senden."),
                     ));
                 }
-                let mut attachments = Vec::with_capacity(images.len() + uploads.len());
-                for (name, bytes) in images.iter() {
-                    let att =
-                        attachments::image_attachment(name, bytes, self.settings.max_image_dim)
-                            .map_err(|e| (400, e))?;
-                    attachments.push(att);
-                }
+                let mut attachments = std::mem::take(inline);
                 for id in uploads.iter() {
                     if let Some(i) = self.uploads.iter().position(|(u, _, _)| u == id) {
                         attachments.push(self.uploads.remove(i).2);
@@ -1303,7 +1290,7 @@ impl NemotronApp {
                 if self.active.is_some() {
                     return Err(busy());
                 }
-                self.new_chat(ctx);
+                self.new_chat(ctx).map_err(|e| (500, e))?;
                 ok
             }
             Command::Retry => {
@@ -1361,7 +1348,13 @@ impl NemotronApp {
     /// Hands the current state to the server, at most a few times a second.
     fn publish_remote(&mut self, ctx: &egui::Context) {
         const EVERY: Duration = Duration::from_millis(150);
-        if self.remote.is_none() {
+        // Building the snapshot costs time on the window's thread; nobody
+        // looking, nothing to build.
+        if !self
+            .remote
+            .as_ref()
+            .is_some_and(|s| s.recently_seen(PHONE_RECENTLY))
+        {
             return;
         }
         if let Some(last) = self.remote_published
@@ -1646,7 +1639,7 @@ impl NemotronApp {
                         self.export_markdown();
                     }
                     if ui.button("➕ Neuer Chat").on_hover_text("⌘ N").clicked() {
-                        self.new_chat(ctx);
+                        let _ = self.new_chat(ctx);
                     }
                     if self.workspace.is_home()
                         && ui.button("📁 Projekt öffnen").on_hover_text("Ordner wählen, in dem Nemotron arbeiten soll (⌘ O)").clicked()
@@ -1749,7 +1742,7 @@ impl NemotronApp {
                     });
             });
         if new {
-            self.new_chat(ctx);
+            let _ = self.new_chat(ctx);
         }
         if let Some(id) = open
             && let Err((_, message)) = self.open_chat(&id, ctx)
@@ -2531,6 +2524,13 @@ impl eframe::App for NemotronApp {
     }
 }
 
+fn attachment_bytes(attachment: &Attachment) -> usize {
+    match &attachment.source {
+        attachments::Source::Data { bytes, .. } => bytes.len(),
+        attachments::Source::Url(_) => 0,
+    }
+}
+
 fn busy_error() -> (u16, String) {
     (
         409,
@@ -3125,6 +3125,55 @@ mod tests {
         assert!(requests[0].contains(r#""type":"video_url""#));
         assert!(requests[0].contains("data:video/mp4;base64,AAAAGGZ0eXA="));
         assert!(!dir.join(format!("{first_chat}.json")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_chat_that_cannot_be_saved_is_not_thrown_away() {
+        let dir = std::env::temp_dir().join(format!("fadis-app-nosave-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A file where the chats folder should be: every save fails.
+        std::fs::write(dir.join("chats"), "ich bin eine Datei").unwrap();
+        let ctx = egui::Context::default();
+        let mut app = NemotronApp::with_settings(Settings::default(), None);
+        app.chat_store = Some(ChatStore::new(dir.join("chats")));
+        app.messages
+            .push(Message::user("Wichtige Arbeit".into(), Vec::new()));
+        let id = app.chat_id.clone();
+        let err = app.new_chat(&ctx).unwrap_err();
+        assert!(err.contains("nicht gespeichert"), "{err}");
+        assert_eq!((app.messages.len(), &app.chat_id), (1, &id));
+        assert!(app.notice.as_ref().is_some_and(|n| n.error));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn viewing_old_chats_does_not_reorder_the_list() {
+        let dir = std::env::temp_dir().join(format!("fadis-app-order-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = egui::Context::default();
+        let mut app = NemotronApp::with_settings(Settings::default(), None);
+        app.chat_store = Some(ChatStore::new(dir.clone()));
+        app.messages
+            .push(Message::user("Erster".into(), Vec::new()));
+        let first = app.chat_id.clone();
+        app.save_chat();
+        std::thread::sleep(Duration::from_millis(1_100));
+        app.new_chat(&ctx).unwrap();
+        app.messages
+            .push(Message::user("Zweiter".into(), Vec::new()));
+        let second = app.chat_id.clone();
+        app.save_chat();
+        let order = |app: &NemotronApp| app.chats.iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+        assert_eq!(order(&app), [second.clone(), first.clone()]);
+        // Looking at the older chat and back changes nothing about who is newest.
+        app.open_chat(&first, &ctx).unwrap();
+        app.open_chat(&second, &ctx).unwrap();
+        assert_eq!(order(&app), [second.clone(), first.clone()]);
+        // Deleting the open (newest) chat opens the newest of the others.
+        app.delete_chat(&second, &ctx).unwrap();
+        assert_eq!(app.chat_id, first);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
