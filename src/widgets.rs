@@ -292,7 +292,7 @@ pub fn tool_title(tool: &ToolView) -> String {
     let path = || {
         let p = text("path");
         if p.is_empty() || p == "." {
-            "Projektordner".to_owned()
+            "Arbeitsordner".to_owned()
         } else {
             p
         }
@@ -439,7 +439,7 @@ fn tool_card(ui: &mut egui::Ui, tool: &ToolView, actions: &mut Vec<UiAction>) {
                             );
                         });
                         ui.label(
-                            RichText::new("Läuft im Projektordner mit deinen Benutzerrechten.")
+                            RichText::new("Läuft im Arbeitsordner mit deinen Benutzerrechten.")
                                 .small()
                                 .weak(),
                         );
@@ -675,7 +675,7 @@ mod tests {
         );
         assert_eq!(
             tool_title(&view("list_dir", "{}", ToolState::Done)),
-            "Ordner angesehen: Projektordner"
+            "Ordner angesehen: Arbeitsordner"
         );
         assert_eq!(
             tool_title(&view(

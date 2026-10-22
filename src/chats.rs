@@ -160,11 +160,28 @@ impl ChatStore {
             updated: now(),
             message_count: chat.messages.len(),
         };
+        let path = self.file(&chat.id);
+        let messages = Value::Array(messages);
+        // Unchanged since the last save (e.g. when switching chats): keep the
+        // file and its time, so the list order stays meaningful.
+        if let Some(stored) = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            && stored.get("messages") == Some(&messages)
+            && let Ok(old) = serde_json::from_value::<Header>(stored)
+            && old.title == header.title
+        {
+            return Ok(ChatSummary {
+                id: old.id,
+                title: old.title,
+                updated: old.updated,
+                messages: old.message_count,
+            });
+        }
         let mut body = serde_json::to_value(&header).map_err(std::io::Error::other)?;
         body["version"] = json!(1);
-        body["messages"] = Value::Array(messages);
+        body["messages"] = messages;
         std::fs::create_dir_all(&self.dir)?;
-        let path = self.file(&chat.id);
         let tmp = path.with_extension("json.tmp");
         crate::config::write_private(
             &tmp,
@@ -352,8 +369,15 @@ mod tests {
         let summary = store.save(&chat).unwrap();
         assert_eq!(summary.messages, 2);
         assert!(store.exists(&id));
-        // Saving again does not rewrite or duplicate the attachment files.
-        store.save(&chat).unwrap();
+        // Saving again does not rewrite the file or duplicate attachments.
+        let file = dir.join(format!("{id}.json"));
+        let written = std::fs::metadata(&file).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(store.save(&chat).unwrap().updated, summary.updated);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().modified().unwrap(),
+            written
+        );
         assert_eq!(std::fs::read_dir(dir.join(&id)).unwrap().count(), 1);
 
         let loaded: Chat<Msg> = store.load(&id).unwrap();
