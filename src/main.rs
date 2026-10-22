@@ -6,6 +6,7 @@ mod api;
 mod app;
 mod attachments;
 mod chats;
+mod computer;
 mod config;
 mod remote;
 mod tools;

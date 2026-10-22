@@ -323,10 +323,16 @@ pub fn tool_title(tool: &ToolView) -> String {
         "write_file" => format!("Geschrieben: {}", path()),
         "run_command" if pending => format!("Möchte ausführen: {}", text("command")),
         "run_command" => format!("Befehl: {}", text("command")),
-        "browser_action" if pending => format!("Möchte Browser-Aktion: {}", text("action")),
-        "browser_action" => format!("Browser: {}", text("action")),
-        "computer_action" if pending => format!("Möchte PC-Aktion: {}", text("action")),
-        "computer_action" => format!("Computer: {}", text("action")),
+        "browser_action" | "computer_action" => {
+            let what = crate::computer::describe(&tool.call.name, &args).unwrap_or_default();
+            let web = canonical_tool_name(&tool.call.name) == "browser_action";
+            match (web, pending) {
+                (true, true) => format!("Möchte im Netz: {what}"),
+                (true, false) => format!("Netz: {what}"),
+                (false, true) => format!("Möchte am Mac: {what}"),
+                (false, false) => format!("Am Mac: {what}"),
+            }
+        }
         other => format!("Werkzeug „{other}“"),
     }
 }
@@ -710,6 +716,26 @@ mod tests {
                 ToolState::Done
             )),
             "Befehl: cargo test"
+        );
+        assert_eq!(
+            tool_title(&view(
+                "computer_action",
+                r#"{"action":"click","x":450,"y":720}"#,
+                ToolState::AwaitingApproval
+            )),
+            "Möchte am Mac: click (450, 720)"
+        );
+        assert_eq!(
+            tool_title(&view("screenshot", "{}", ToolState::Done)),
+            "Am Mac: screenshot"
+        );
+        assert_eq!(
+            tool_title(&view(
+                "browser_action",
+                r#"{"action":"open","url":"https://example.org"}"#,
+                ToolState::Done
+            )),
+            "Netz: open https://example.org"
         );
         assert_eq!(
             tool_title(&view("rm_rf", "kaputt", ToolState::Done)),

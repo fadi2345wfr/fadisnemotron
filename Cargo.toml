@@ -33,6 +33,9 @@ ureq = { version = "3.5", features = ["platform-verifier"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = { version = "0.25", features = ["highsierra"] }
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
