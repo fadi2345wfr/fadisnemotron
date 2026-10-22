@@ -109,8 +109,9 @@ pub fn canonical_tool_name(name: &str) -> &str {
         "grep" | "Grep" | "search_files" | "search_code" => "search",
         "glob" | "Glob" | "find" | "find_file" => "find_files",
         "ls" | "LS" | "list" | "list_directory" | "list_files" => "list_dir",
-        "browser" | "Browser" | "web" | "browse" | "open_url" | "web_search"
-        | "browser_action" => "browser_action",
+        "browser" | "Browser" | "web" | "browse" | "open_url" | "web_search" | "browser_action" => {
+            "browser_action"
+        }
         other => other,
     }
 }
@@ -1376,9 +1377,13 @@ impl Workspace {
             "type" => {
                 let text = args.text.unwrap_or_default();
                 let escaped = text.replace('"', "\\\"");
-                let script = format!("tell application \"System Events\" to keystroke \"{escaped}\"");
+                let script =
+                    format!("tell application \"System Events\" to keystroke \"{escaped}\"");
                 let _ = Command::new("osascript").arg("-e").arg(&script).output();
-                ToolOutput::ok(format!("Typed {} characters into active window.", text.len()))
+                ToolOutput::ok(format!(
+                    "Typed {} characters into active window.",
+                    text.len()
+                ))
             }
             other => ToolOutput::err(format!(
                 "unknown browser action '{other}'. Supported: search, open, click, type, copy."
