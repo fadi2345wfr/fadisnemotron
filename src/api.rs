@@ -598,6 +598,77 @@ pub enum TextDelta {
     Content(String),
 }
 
+/// Writing systems, grouped coarsely, to recognise a model that lost its mind.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Script {
+    Latin,
+    Greek,
+    Cyrillic,
+    Hebrew,
+    Arabic,
+    Indic,
+    Thai,
+    Hangul,
+    Cjk,
+    Other,
+}
+
+fn script_of(c: char) -> Option<Script> {
+    if !c.is_alphabetic() {
+        return None;
+    }
+    Some(match c as u32 {
+        0..=0x24F | 0x1E00..=0x1EFF => Script::Latin,
+        0x370..=0x3FF | 0x1F00..=0x1FFF => Script::Greek,
+        0x400..=0x52F => Script::Cyrillic,
+        0x590..=0x5FF => Script::Hebrew,
+        0x600..=0x6FF | 0x750..=0x77F | 0xFB50..=0xFDFF | 0xFE70..=0xFEFF => Script::Arabic,
+        0x900..=0xDFF => Script::Indic,
+        0xE00..=0xEFF => Script::Thai,
+        0x1100..=0x11FF | 0x3130..=0x318F | 0xAC00..=0xD7AF => Script::Hangul,
+        0x3040..=0x30FF | 0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF => Script::Cjk,
+        _ => Script::Other,
+    })
+}
+
+/// True if the end of `text` looks like a language model gone wrong: letters
+/// from four or more writing systems, jumping from one to another directly
+/// (Hangul, Hebrew, Cyrillic and Devanagari within a few words). Real text
+/// that mixes scripts, like a list of greetings, has Latin words between them
+/// or stays within one or two scripts.
+pub fn looks_degenerate(text: &str) -> bool {
+    const WINDOW: usize = 240;
+    const MIN_SCRIPTS: usize = 4;
+    const MIN_DIRECT_JUMPS: usize = 10;
+    let tail: Vec<char> = text.chars().rev().take(WINDOW).collect();
+    let mut scripts: Vec<Script> = Vec::new();
+    let mut jumps = 0;
+    let mut previous: Option<Script> = None;
+    for c in tail.iter().rev() {
+        if c.is_whitespace() {
+            // A space does not separate: "한국어 العربية" is still a direct jump.
+            continue;
+        }
+        let Some(script) = script_of(*c) else {
+            // Punctuation, digits and symbols do separate words.
+            previous = None;
+            continue;
+        };
+        if script != Script::Latin && !scripts.contains(&script) {
+            scripts.push(script);
+        }
+        if let Some(before) = previous
+            && before != script
+            && before != Script::Latin
+            && script != Script::Latin
+        {
+            jumps += 1;
+        }
+        previous = Some(script);
+    }
+    scripts.len() >= MIN_SCRIPTS && jumps >= MIN_DIRECT_JUMPS
+}
+
 /// Everything one model step produced.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct StepResult {
@@ -605,6 +676,8 @@ pub struct StepResult {
     pub reasoning: String,
     pub tool_calls: Vec<ToolCall>,
     pub finish_reason: Option<String>,
+    /// The model started producing unreadable text; the stream was cut off.
+    pub garbled: bool,
 }
 
 impl StepResult {
@@ -641,6 +714,19 @@ pub enum StepOutcome {
     Done(StepResult),
     Cancelled,
     Failed(String),
+    /// The model produced unreadable text (many scripts mixed up) and the
+    /// stream was cut off; asking again with less context usually helps.
+    Garbled,
+}
+
+/// Why reading the stream stopped before its end: the model went off the
+/// rails, or the caller asked to stop.
+fn stopped_early(result: &StepResult) -> StepOutcome {
+    if result.garbled {
+        StepOutcome::Garbled
+    } else {
+        StepOutcome::Cancelled
+    }
 }
 
 /// Sends one request and streams the reply. Text is passed to `on_text` as it
@@ -696,12 +782,21 @@ pub fn stream_step(
     let mut apply = |delta: ChunkDelta, result: &mut StepResult| -> bool {
         if let Some(r) = delta.reasoning {
             result.reasoning.push_str(&r);
+            // Checked before the text is shown, so little of it reaches the screen.
+            if looks_degenerate(&result.reasoning) {
+                result.garbled = true;
+                return false;
+            }
             if !on_text(TextDelta::Reasoning(r)) {
                 return false;
             }
         }
         if let Some(c) = delta.content {
             result.content.push_str(&c);
+            if looks_degenerate(&result.content) {
+                result.garbled = true;
+                return false;
+            }
             if !on_text(TextDelta::Content(c)) {
                 return false;
             }
@@ -726,7 +821,7 @@ pub fn stream_step(
             return StepOutcome::Failed(err);
         }
         if !apply(delta, &mut result) {
-            return StepOutcome::Cancelled;
+            return stopped_early(&result);
         }
     } else {
         for line in reader.lines() {
@@ -751,7 +846,7 @@ pub fn stream_step(
                 break;
             }
             if !apply(delta, &mut result) {
-                return StepOutcome::Cancelled;
+                return stopped_early(&result);
             }
         }
         if cancel.load(Ordering::Relaxed) {
@@ -1138,6 +1233,37 @@ pub(crate) mod tests {
         assert_eq!(r.content, "Alles OK");
     }
 
+    /// The start of the unreadable text a user got from the model.
+    const GIBBERISH: &str = "심지어מוד expenses关系лいずれに ш формаướ র亚就是说senavitక్ష следе chú가로 meantime ві 대기 empe nurRp вс حم své producción retain travailווה 가져 그만 파库md khoảng mak를ittä세요 ವಿಎ ਬ navზე開始 zp人間cknow刻фон색이нейிய Supportkingbil appel trot Сергей jerերի 내에서 ام说来قد expérience収 사람들 aied maintained systems accesses حظر Arbeiten гу펍 الاعتiksi bay العهد 마गरuloksiрой subscriber padding그 кама rang turns numpy磅票 secuulator جماعة başar recognised";
+
+    #[test]
+    fn unreadable_text_is_recognised_but_real_text_is_not() {
+        assert!(looks_degenerate(GIBBERISH));
+        // Already after the first sentence-length chunk, not only at the end.
+        let mut seen = String::new();
+        let mut first = None;
+        for (i, c) in GIBBERISH.chars().enumerate() {
+            seen.push(c);
+            if first.is_none() && looks_degenerate(&seen) {
+                first = Some(i);
+            }
+        }
+        assert!(first.is_some_and(|i| i < 260), "{first:?}");
+
+        for fine in [
+            "Ich habe die Datei geändert und die Tests laufen. Außerdem habe ich `src/app.rs:120` angepasst.",
+            "fn main() { println!(\"Grüße: こんにちは\"); }",
+            "这是一个测试。我们把文件移到了桌面文件夹里，然后检查了所有的内容。",
+            "日本語のテキストです。漢字とひらがなとカタカナが混ざっています。",
+            "Привет, как дела? Это обычный русский текст без латиницы, но и без каши.",
+            "| Sprache | Gruß |\n|---|---|\n| Russisch | Привет |\n| Chinesisch | 你好 |\n| Arabisch | مرحبا |\n| Hindi | नमस्ते |\n| Koreanisch | 안녕하세요 |\n| Griechisch | Γεια σας |\n| Hebräisch | שלום |\n| Thai | สวัสดี |",
+            "中文 日本語 한국어 العربية עברית हिन्दी ไทย русский Ελληνικά ქართული",
+            "",
+        ] {
+            assert!(!looks_degenerate(fine), "{fine}");
+        }
+    }
+
     #[test]
     fn xml_tool_calls_in_content_are_recovered() {
         let tools = crate::tools::definitions();
@@ -1271,6 +1397,7 @@ pub(crate) mod tests {
                 reasoning: "Der Nutzer grüßt.".into(),
                 tool_calls: vec![],
                 finish_reason: Some("stop".into()),
+                garbled: false,
             })
         );
         let request = &server.join().unwrap()[0];
@@ -1282,6 +1409,37 @@ pub(crate) mod tests {
         );
         assert!(request.contains(r#""model":"nvidia/nemotron-3.5-super-vl-120b-a12b""#));
         assert!(request.contains(r#""enable_thinking":true"#));
+    }
+
+    #[test]
+    fn unreadable_stream_is_cut_off_before_it_reaches_the_screen() {
+        let chunk = |text: &str| {
+            format!(
+                "data: {}\n\n",
+                json!({"choices": [{"delta": {"content": text}}]})
+            )
+        };
+        let mut sse = chunk("Ich schaue nach. ");
+        // Word by word, like a real stream.
+        for word in GIBBERISH.split(' ') {
+            sse.push_str(&chunk(&format!("{word} ")));
+        }
+        sse.push_str("data: [DONE]\n\n");
+        let (base_url, server) = mock_server(vec![("200 OK", "text/event-stream", sse)]);
+        let (outcome, shown) = step(&base_url, "k");
+        server.join().unwrap();
+        assert_eq!(outcome, StepOutcome::Garbled);
+        let shown: String = shown
+            .iter()
+            .map(|d| match d {
+                TextDelta::Content(c) | TextDelta::Reasoning(c) => c.as_str(),
+            })
+            .collect();
+        assert!(shown.starts_with("Ich schaue nach."));
+        assert!(
+            shown.chars().count() < GIBBERISH.chars().count() / 2,
+            "too much unreadable text was shown: {shown}"
+        );
     }
 
     #[test]

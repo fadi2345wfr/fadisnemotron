@@ -24,6 +24,23 @@ const NUDGE_SHOWED_CODE: &str = "You showed code but did not change any file. If
 /// A fenced code block at least this long in an answer without tool calls
 /// means the model showed code instead of editing.
 const SHOWN_CODE_LINES: usize = 8;
+/// How big the conversation may get (in rough tokens) before old tool
+/// outputs are cut. The model accepts far more, but its answers got worse
+/// long before that, and with very long chats it produced unreadable text.
+const CONTEXT_BUDGET_TOKENS: usize = 100_000;
+/// The budget after the model produced unreadable text.
+const RETRY_CONTEXT_BUDGET_TOKENS: usize = 40_000;
+/// The newest tool results are never cut; the model is working with them.
+const KEEP_RECENT_TOOL_RESULTS: usize = 4;
+/// Older thinking is dropped last; the newest steps keep theirs.
+const KEEP_RECENT_THINKING: usize = 2;
+/// What is left of a cut tool output.
+const SHORTENED_OUTPUT_CHARS: usize = 1_500;
+/// A step that comes out as unreadable text is asked again this many times.
+const MAX_GARBLED_RETRIES: usize = 2;
+const GARBLED_FAILURE: &str = "Nemotron liefert immer wieder unlesbaren Text. Das passiert vor allem, wenn sehr \
+     viel gelesen wurde oder der Chat sehr lang ist. Starte einen neuen Chat (⌘N) und teile die Aufgabe in \
+     kleinere Schritte, z. B. erst die Ordner auflisten und dann einzeln auswerten.";
 const DECLINED: &str = "The user declined this action, so it was not run. Do not retry it unchanged; \
      choose another approach or ask the user.";
 
@@ -253,6 +270,11 @@ pub fn run(
     // Set once a file was changed in this run; then code in the answer is a summary.
     let mut edited = false;
     let mut no_tool_parser = lacks_tool_parser(&config.base_url);
+    // Tightened when the model produces unreadable text.
+    let mut options = config.options.clone();
+    let mut budget = CONTEXT_BUDGET_TOKENS;
+    let mut garbled_retries = 0;
+    let mut warned_about_cutting = false;
 
     for _ in 0..config.max_steps.max(1) {
         if cancel.load(Ordering::Relaxed) {
@@ -262,10 +284,16 @@ pub fn run(
         if !emit(AgentEvent::StepStarted) {
             return;
         }
+        if compact(&mut messages, &config.system_prompt, budget) && !warned_about_cutting {
+            warned_about_cutting = true;
+            emit(AgentEvent::Notice(
+                "Das Gespräch ist lang geworden – ältere Werkzeugausgaben wurden gekürzt, damit Nemotron den Faden behält.".into(),
+            ));
+        }
         let body = api::build_request_body(
             &config.system_prompt,
             &messages,
-            &config.options,
+            &options,
             tool_defs.as_ref(),
             // Without a parser vLLM rejects "auto"; with "none" it still shows
             // the tools to the model, and the calls are read from the text.
@@ -288,6 +316,31 @@ pub fn run(
             StepOutcome::Cancelled => {
                 emit(AgentEvent::Cancelled);
                 return;
+            }
+            StepOutcome::Garbled => {
+                // Take what was shown off the screen, then ask again with a
+                // shorter conversation and calmer sampling.
+                if !emit(AgentEvent::StepFinished {
+                    content: String::new(),
+                    reasoning: String::new(),
+                    tool_calls: Vec::new(),
+                }) {
+                    return;
+                }
+                if garbled_retries >= MAX_GARBLED_RETRIES {
+                    emit(AgentEvent::Failed(GARBLED_FAILURE.into()));
+                    return;
+                }
+                garbled_retries += 1;
+                options.temperature =
+                    options
+                        .temperature
+                        .min(if garbled_retries == 1 { 0.6 } else { 0.3 });
+                budget = RETRY_CONTEXT_BUDGET_TOKENS;
+                emit(AgentEvent::Notice(
+                    "Nemotron hat unlesbaren Text erzeugt (viele Schriften durcheinander) – ich starte den Schritt mit weniger Kontext und ruhigerer Einstellung neu.".into(),
+                ));
+                continue;
             }
             StepOutcome::Failed(e)
                 if tool_defs.is_some() && !no_tool_parser && api::needs_tool_parser(&e) =>
@@ -459,6 +512,78 @@ pub fn run(
         "Nach {} Schritten angehalten. Schreib „weiter“, damit Nemotron fortsetzt.",
         config.max_steps
     )));
+}
+
+/// Rough size of the request in tokens, at 3.5 characters per token.
+fn estimated_tokens(system_prompt: &str, messages: &[ChatMessage]) -> usize {
+    let chars: usize = messages
+        .iter()
+        .map(|m| match m {
+            ChatMessage::User { text, .. } => text.chars().count(),
+            ChatMessage::Assistant {
+                content,
+                reasoning,
+                tool_calls,
+            } => {
+                content.chars().count()
+                    + reasoning.as_deref().map_or(0, |r| r.chars().count())
+                    + tool_calls
+                        .iter()
+                        .map(|c| c.name.len() + c.arguments.chars().count())
+                        .sum::<usize>()
+            }
+            ChatMessage::Tool { content, .. } => content.chars().count(),
+        })
+        .sum();
+    (chars + system_prompt.chars().count()) * 2 / 7
+}
+
+/// Keeps the conversation within `budget` tokens: cuts old tool outputs
+/// first (the model can run the tool again), then old thinking. Returns true
+/// if anything was cut.
+fn compact(messages: &mut [ChatMessage], system_prompt: &str, budget: usize) -> bool {
+    let mut total = estimated_tokens(system_prompt, messages);
+    if total <= budget {
+        return false;
+    }
+    let mut cut = false;
+    let results: Vec<usize> = (0..messages.len())
+        .filter(|&i| matches!(messages[i], ChatMessage::Tool { .. }))
+        .collect();
+    for &i in &results[..results.len().saturating_sub(KEEP_RECENT_TOOL_RESULTS)] {
+        if total <= budget {
+            return cut;
+        }
+        if let ChatMessage::Tool { content, .. } = &mut messages[i] {
+            let before = content.chars().count();
+            // Leave room for the note, so a cut output is not cut again.
+            if before > SHORTENED_OUTPUT_CHARS + 200 {
+                let head: String = content.chars().take(SHORTENED_OUTPUT_CHARS).collect();
+                *content = format!(
+                    "{head}\n[… output shortened to save space; run the tool again if you need the rest …]"
+                );
+                total = total.saturating_sub((before - content.chars().count()) * 2 / 7);
+                cut = true;
+            }
+        }
+    }
+    let thinking: Vec<usize> = (0..messages.len())
+        .filter(|&i| {
+            matches!(&messages[i], ChatMessage::Assistant { reasoning: Some(r), .. } if !r.is_empty())
+        })
+        .collect();
+    for &i in &thinking[..thinking.len().saturating_sub(KEEP_RECENT_THINKING)] {
+        if total <= budget {
+            break;
+        }
+        if let ChatMessage::Assistant { reasoning, .. } = &mut messages[i]
+            && let Some(r) = reasoning.take()
+        {
+            total = total.saturating_sub(r.chars().count() * 2 / 7);
+            cut = true;
+        }
+    }
+    cut
 }
 
 /// Servers that answered "no tool parser" in this session, so later runs
@@ -826,6 +951,169 @@ mod tests {
         assert!(finished_tools(&events)[0].0.contains("pub fn antwort"));
         assert!(matches!(&events[..], [.., AgentEvent::Finished { .. }]));
         assert!(requests[1].contains(r#""role":"tool""#));
+    }
+
+    /// The start of the unreadable text a user once got from the model.
+    const GIBBERISH: &str = "심지어מוד expenses关系лいずれに ш формаướ র亚就是说senavitక్ష следе chú가로 meantime ві 대기 empe nurRp вс حم své producción retain travailווה 가져 그만 파库md khoảng mak를ittä세요 ವಿಎ ਬ navზე開始 zp人間cknow刻фон색이нейிய Supportkingbil appel trot Сергей jerերի 내에서 ام说来قد expérience収 사람들 aied";
+
+    fn temperature_of(request: &str) -> f64 {
+        let body: serde_json::Value =
+            serde_json::from_str(request.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        body["temperature"].as_f64().unwrap()
+    }
+
+    #[test]
+    fn unreadable_text_is_discarded_and_the_step_asked_again_calmer() {
+        let project = Project::new("garbled");
+        let (events, requests) = run_agent(
+            &project,
+            ApprovalMode::AutoEdits,
+            vec![
+                answer_step(&format!("Ich schaue nach. {GIBBERISH}")),
+                answer_step("Alles gut, hier die Antwort."),
+            ],
+            vec![],
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("unlesbaren Text")))
+        );
+        // What was shown is wiped before the retry starts.
+        let wipe = events
+            .iter()
+            .position(|e| matches!(e, AgentEvent::StepFinished { content, tool_calls, .. } if content.is_empty() && tool_calls.is_empty()))
+            .expect("the garbled step is cleared");
+        assert!(matches!(events[wipe + 1], AgentEvent::Notice(_)));
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Finished { .. })),
+            "{:?}",
+            events.last()
+        );
+        assert_eq!(requests.len(), 2);
+        assert!((temperature_of(&requests[0]) - 1.0).abs() < 1e-6);
+        assert!(temperature_of(&requests[1]) <= 0.61);
+    }
+
+    #[test]
+    fn endless_unreadable_text_ends_with_a_clear_message() {
+        let project = Project::new("garbled-fail");
+        let garbled = || answer_step(GIBBERISH);
+        let (events, requests) = run_agent(
+            &project,
+            ApprovalMode::AutoEdits,
+            vec![garbled(), garbled(), garbled()],
+            vec![],
+        );
+        assert_eq!(requests.len(), 3);
+        assert!(temperature_of(&requests[2]) <= 0.31);
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Failed(m)) if m.contains("unlesbaren Text") && m.contains("neuen Chat")),
+            "{:?}",
+            events.last()
+        );
+    }
+
+    #[test]
+    fn long_conversations_lose_old_tool_output_first() {
+        let big = "x".repeat(40_000);
+        let call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "read_file".into(),
+            arguments: "{}".into(),
+        };
+        let mut messages = vec![ChatMessage::User {
+            text: "Analysiere alles".into(),
+            attachments: vec![],
+        }];
+        for i in 0..8 {
+            messages.push(ChatMessage::Assistant {
+                content: String::new(),
+                reasoning: Some(format!("Gedanke {i} {}", "y".repeat(2_000))),
+                tool_calls: vec![call(&format!("c{i}"))],
+            });
+            messages.push(ChatMessage::Tool {
+                call_id: format!("c{i}"),
+                content: big.clone(),
+            });
+        }
+        let before = estimated_tokens("system", &messages);
+        assert!(before > 80_000, "{before}");
+        // Under budget: nothing changes.
+        assert!(!compact(&mut messages, "system", 200_000));
+        assert!(compact(&mut messages, "system", 20_000));
+        let tool_lengths: Vec<usize> = messages
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::Tool { content, .. } => Some(content.chars().count()),
+                _ => None,
+            })
+            .collect();
+        // The four newest results are whole, the older ones cut to a stub.
+        assert!(
+            tool_lengths[4..].iter().all(|n| *n == 40_000),
+            "{tool_lengths:?}"
+        );
+        assert!(
+            tool_lengths[..4].iter().all(|n| *n < 1_700),
+            "{tool_lengths:?}"
+        );
+        // Thinking of the newest two steps stays.
+        let thinking: Vec<bool> = messages
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::Assistant { reasoning, .. } => Some(reasoning.is_some()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            thinking.iter().filter(|t| **t).count(),
+            2.min(thinking.len()),
+            "{thinking:?}"
+        );
+        assert!(estimated_tokens("system", &messages) < before * 3 / 4);
+        // Cut once is cut: asking again with the same budget changes nothing.
+        assert!(!compact(&mut messages, "system", 200_000));
+        let after_first = messages.len();
+        compact(&mut messages, "system", 20_000);
+        assert_eq!(messages.len(), after_first);
+    }
+
+    #[test]
+    fn a_run_with_a_lot_of_reading_tells_the_user_it_cut_old_output() {
+        let project = Project::new("budget");
+        // Nine reads of a 50 KB page, then the answer: run_agent allows ten steps.
+        std::fs::write(
+            project.0.join("gross.txt"),
+            "zeile mit text\n".repeat(3_500),
+        )
+        .unwrap();
+        let mut steps: Vec<String> = (0..9)
+            .map(|i| {
+                tool_step(
+                    &format!("c{i}"),
+                    "read_file",
+                    json!({"path": "gross.txt", "limit": 2000}),
+                    "",
+                )
+            })
+            .collect();
+        steps.push(answer_step("Fertig."));
+        let (events, requests) = run_agent(&project, ApprovalMode::AutoEdits, steps, vec![]);
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("gekürzt"))),
+            "no notice about cut output"
+        );
+        assert!(matches!(events.last(), Some(AgentEvent::Finished { .. })));
+        assert_eq!(requests.len(), 10);
+        let last: serde_json::Value =
+            serde_json::from_str(requests.last().unwrap().split("\r\n\r\n").nth(1).unwrap())
+                .unwrap();
+        let sent: usize = last["messages"].to_string().chars().count();
+        // Nine whole pages would be about 450,000 characters.
+        assert!(sent < 380_000, "request was {sent} characters");
     }
 
     #[test]

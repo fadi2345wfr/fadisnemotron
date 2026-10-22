@@ -2834,7 +2834,7 @@ mod tests {
         assert!(cut.contains("characters left out"));
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn browser_action_alias_and_clipboard() {
         let p = TempProject::new("browser");
@@ -2847,7 +2847,7 @@ mod tests {
         assert!(out.ok && out.text.contains("Copied"), "{}", out.text);
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     #[test]
     fn computer_action_alias_and_screen_info() {
         let p = TempProject::new("computer");
