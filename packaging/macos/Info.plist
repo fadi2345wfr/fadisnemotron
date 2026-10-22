@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Fadis Nemotron</string>
+	<key>CFBundleDisplayName</key>
+	<string>Fadis Nemotron</string>
+	<key>CFBundleIdentifier</key>
+	<string>de.fadi.FadisNemotron</string>
+	<key>CFBundleExecutable</key>
+	<string>fadis-nemotron</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>de</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>__MIN_MACOS__</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSSupportsAutomaticGraphicsSwitching</key>
+	<true/>
+	<key>NSHumanReadableCopyright</key>
+	<string>Fadis Nemotron – Chat-Client für NVIDIA Nemotron 3.5 Super VL</string>
+</dict>
+</plist>

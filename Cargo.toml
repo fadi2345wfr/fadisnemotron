@@ -1,0 +1,33 @@
+[package]
+name = "fadis-nemotron"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+description = "Desktop-Chat für NVIDIA Nemotron 3.5 Super VL (Text, Bilder, Videos)"
+publish = false
+
+[[bin]]
+name = "fadis-nemotron"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.23"
+directories = "6"
+eframe = { version = "0.37", features = ["glow"] }
+egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark"] }
+egui_extras = { version = "0.37", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "3.5", features = ["platform-verifier"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
+
+# Image decoding and scaling are very slow unoptimised; this keeps debug builds usable.
+[profile.dev.package."*"]
+opt-level = 2
