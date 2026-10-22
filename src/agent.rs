@@ -27,9 +27,26 @@ const SHOWN_CODE_LINES: usize = 8;
 /// How big the conversation may get (in rough tokens) before old tool
 /// outputs are cut. The model accepts far more, but its answers got worse
 /// long before that, and with very long chats it produced unreadable text.
-const CONTEXT_BUDGET_TOKENS: usize = 100_000;
-/// The budget after the model produced unreadable text.
+const CONTEXT_BUDGET_TOKENS: usize = 70_000;
+/// The budget after the model produced unreadable text or the server timed out.
 const RETRY_CONTEXT_BUDGET_TOKENS: usize = 40_000;
+/// Above this size the work goes on in a new chat (see `hand_over`): the
+/// server answers slowly and worse the longer the conversation is.
+const HANDOFF_TOKENS: usize = 60_000;
+/// If the server does not answer a conversation this big, it is handed over
+/// at once instead of asking again.
+const HANDOFF_AFTER_TIMEOUT_TOKENS: usize = 25_000;
+/// The conversation sent to write the handover note is cut to this size.
+const HANDOFF_SUMMARY_BUDGET_TOKENS: usize = 25_000;
+const HANDOFF_PROMPT: &str = "This conversation has become too long, so the work continues in a NEW chat where you will \
+     see only the user's request and the note you write now. Write that note for yourself, in the language the \
+     user writes in: 1) the task, as the user wants it; 2) what is done so far, with file paths and what was \
+     changed; 3) what you found that you will need (names, paths, numbers, decisions); 4) what is still to do, in \
+     order. Be concrete and short (at most 500 words). Reply with the note only, and do not call tools.";
+/// A step the server did not answer in time (or answered "busy") is asked
+/// again this many times.
+const MAX_TRANSIENT_RETRIES: usize = 2;
+const TRANSIENT_FAILURE: &str = "NVIDIA antwortet nicht (der Server ist überlastet oder nicht erreichbar). Alles bisher Erledigte steht im Chat: Schreib später „weiter“.";
 /// The newest tool results are never cut; the model is working with them.
 const KEEP_RECENT_TOOL_RESULTS: usize = 4;
 /// Older thinking is dropped last; the newest steps keep theirs.
@@ -60,6 +77,9 @@ pub struct AgentConfig {
     pub workspace: Option<Workspace>,
     pub approval: ApprovalMode,
     pub max_steps: usize,
+    /// When the conversation gets too long, the run may end with a
+    /// [`AgentEvent::Handoff`] so that the work goes on in a new chat.
+    pub handoff: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -98,6 +118,13 @@ pub enum AgentEvent {
         change: Option<FileChange>,
     },
     Notice(String),
+    /// The conversation was too long for the server. `note` is what Nemotron
+    /// wrote down for itself; the app continues in a new chat with it, using
+    /// `approval` (the user may have allowed everything for this run).
+    Handoff {
+        note: String,
+        approval: ApprovalMode,
+    },
     Finished {
         finish_reason: Option<String>,
     },
@@ -287,11 +314,28 @@ pub fn run(
     let mut options = config.options.clone();
     let mut budget = CONTEXT_BUDGET_TOKENS;
     let mut garbled_retries = 0;
+    let mut transient_retries = 0;
     let mut warned_about_cutting = false;
 
     for _ in 0..config.max_steps.max(1) {
         if cancel.load(Ordering::Relaxed) {
             emit(AgentEvent::Cancelled);
+            return;
+        }
+        // Too long for the server: the work goes on in a new chat, with a note.
+        if config.handoff
+            && tool_defs.is_some()
+            && should_hand_over(&messages, &config.system_prompt, HANDOFF_TOKENS)
+        {
+            hand_over(
+                http,
+                &config,
+                tool_defs.as_ref(),
+                &messages,
+                approval,
+                cancel,
+                &mut emit,
+            );
             return;
         }
         if !emit(AgentEvent::StepStarted) {
@@ -353,6 +397,53 @@ pub fn run(
                 emit(AgentEvent::Notice(
                     "Nemotron hat unlesbaren Text erzeugt (viele Schriften durcheinander) – ich starte den Schritt mit weniger Kontext und ruhigerer Einstellung neu.".into(),
                 ));
+                continue;
+            }
+            StepOutcome::Transient(e) => {
+                // Whatever was shown of this step goes off the screen.
+                if !emit(AgentEvent::StepFinished {
+                    content: String::new(),
+                    reasoning: String::new(),
+                    tool_calls: Vec::new(),
+                }) {
+                    return;
+                }
+                // A long conversation is the likely reason the server does not
+                // answer: go on in a new chat instead of asking again.
+                if config.handoff
+                    && tool_defs.is_some()
+                    && should_hand_over(
+                        &messages,
+                        &config.system_prompt,
+                        HANDOFF_AFTER_TIMEOUT_TOKENS,
+                    )
+                {
+                    hand_over(
+                        http,
+                        &config,
+                        tool_defs.as_ref(),
+                        &messages,
+                        approval,
+                        cancel,
+                        &mut emit,
+                    );
+                    return;
+                }
+                if transient_retries >= MAX_TRANSIENT_RETRIES {
+                    emit(AgentEvent::Failed(format!("{TRANSIENT_FAILURE}\n\n{e}")));
+                    return;
+                }
+                transient_retries += 1;
+                emit(AgentEvent::Notice(format!(
+                    "NVIDIA hat nicht rechtzeitig geantwortet ({}) – neuer Versuch {} von {}.",
+                    brief_reason(&e),
+                    transient_retries + 1,
+                    MAX_TRANSIENT_RETRIES + 1
+                )));
+                if !wait_unless_cancelled(retry_wait(transient_retries), cancel) {
+                    emit(AgentEvent::Cancelled);
+                    return;
+                }
                 continue;
             }
             StepOutcome::Failed(e)
@@ -608,6 +699,24 @@ fn compact(messages: &mut [ChatMessage], system_prompt: &str, budget: usize) -> 
             cut = true;
         }
     }
+    // Still too big, as when many whole files were just read: the newer
+    // results are cut too, oldest first. Only the newest stays complete.
+    for &i in &results[..results.len().saturating_sub(1)] {
+        if total <= budget {
+            break;
+        }
+        if let ChatMessage::Tool { content, .. } = &mut messages[i] {
+            let before = content.chars().count();
+            if before > SHORTENED_OUTPUT_CHARS + 200 {
+                let head: String = content.chars().take(SHORTENED_OUTPUT_CHARS).collect();
+                *content = format!(
+                    "{head}\n[… output shortened to save space; run the tool again if you need the rest …]"
+                );
+                total = total.saturating_sub((before - content.chars().count()) * 2 / 7);
+                cut = true;
+            }
+        }
+    }
     cut
 }
 
@@ -643,6 +752,178 @@ fn remember_missing_tool_parser(base_url: &str) {
     {
         urls.push(base_url.to_owned());
     }
+}
+
+/// How many tool results the conversation holds.
+fn tool_result_count(messages: &[ChatMessage]) -> usize {
+    messages
+        .iter()
+        .filter(|m| matches!(m, ChatMessage::Tool { .. }))
+        .count()
+}
+
+/// Whether the conversation is big enough, and has enough in it that a note
+/// can replace, to go on in a new chat.
+fn should_hand_over(messages: &[ChatMessage], system_prompt: &str, tokens: usize) -> bool {
+    tool_result_count(messages) >= 2 && estimated_tokens(system_prompt, messages) > tokens
+}
+
+fn clip(text: &str, max: usize) -> String {
+    let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= max {
+        one_line
+    } else {
+        let head: String = one_line.chars().take(max).collect();
+        format!("{head}…")
+    }
+}
+
+/// A note written by the program itself, for when the model cannot be asked:
+/// what was done, step by step, with the start of each result.
+fn mechanical_note(messages: &[ChatMessage]) -> String {
+    const MAX_CHARS: usize = 6_000;
+    let mut lines: Vec<String> = Vec::new();
+    for message in messages {
+        match message {
+            ChatMessage::Assistant {
+                content,
+                tool_calls,
+                ..
+            } => {
+                if !content.trim().is_empty() {
+                    lines.push(format!("Nemotron: {}", clip(content, 300)));
+                }
+                for call in tool_calls {
+                    lines.push(format!("• {} {}", call.name, clip(&call.arguments, 120)));
+                }
+            }
+            ChatMessage::Tool { content, .. } => {
+                lines.push(format!("  ↳ {}", clip(content, 160)));
+            }
+            ChatMessage::User { .. } => {}
+        }
+    }
+    // The newest steps matter most.
+    let mut kept = Vec::new();
+    let mut size = 0;
+    for line in lines.iter().rev() {
+        size += line.chars().count() + 1;
+        if size > MAX_CHARS {
+            break;
+        }
+        kept.push(line.as_str());
+    }
+    kept.reverse();
+    format!(
+        "Bisher gemacht (automatisch protokolliert, die letzten Schritte):\n{}",
+        kept.join("\n")
+    )
+}
+
+/// The note Nemotron writes for the new chat, or `None` if it could not.
+/// It sees the conversation cut down to a size the server answers quickly.
+fn write_handoff_note(
+    http: &ureq::Agent,
+    config: &AgentConfig,
+    tool_defs: Option<&serde_json::Value>,
+    messages: &[ChatMessage],
+    cancel: &AtomicBool,
+) -> Option<String> {
+    let mut copy = messages.to_vec();
+    drop_old_screenshots(&mut copy, 0);
+    compact(
+        &mut copy,
+        &config.system_prompt,
+        HANDOFF_SUMMARY_BUDGET_TOKENS,
+    );
+    copy.push(ChatMessage::User {
+        text: HANDOFF_PROMPT.into(),
+        attachments: Vec::new(),
+    });
+    let mut options = config.options.clone();
+    options.thinking = false;
+    options.temperature = options.temperature.min(0.4);
+    options.max_tokens = options.max_tokens.min(2_048);
+    let body = api::build_request_body(
+        &config.system_prompt,
+        &copy,
+        &options,
+        tool_defs,
+        // The history holds tool calls, so the tools stay listed, but none may be used.
+        tool_defs.map(|_| "none"),
+    );
+    match api::stream_step(
+        http,
+        &config.base_url,
+        &config.api_key,
+        &body,
+        cancel,
+        |_| true,
+    ) {
+        StepOutcome::Done(step)
+            if step.tool_calls.is_empty() && !step.content.trim().is_empty() =>
+        {
+            Some(step.content.trim().to_owned())
+        }
+        _ => None,
+    }
+}
+
+/// Ends the run with a [`AgentEvent::Handoff`]: Nemotron writes down where
+/// it stands, and the app goes on in a new chat. If the server cannot be
+/// reached for the note, the program writes one itself.
+fn hand_over(
+    http: &ureq::Agent,
+    config: &AgentConfig,
+    tool_defs: Option<&serde_json::Value>,
+    messages: &[ChatMessage],
+    approval: ApprovalMode,
+    cancel: &AtomicBool,
+    emit: &mut impl FnMut(AgentEvent) -> bool,
+) {
+    if !emit(AgentEvent::Notice(
+        "Das Gespräch ist lang geworden – Nemotron fasst zusammen, und ich mache in einem neuen Chat weiter.".into(),
+    )) {
+        return;
+    }
+    let note = write_handoff_note(http, config, tool_defs, messages, cancel);
+    if cancel.load(Ordering::Relaxed) {
+        emit(AgentEvent::Cancelled);
+        return;
+    }
+    let note = note.unwrap_or_else(|| mechanical_note(messages));
+    emit(AgentEvent::Handoff { note, approval });
+}
+
+/// How long to wait before asking again (shorter in tests).
+fn retry_wait(attempt: usize) -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(5)
+    } else {
+        Duration::from_secs(if attempt <= 1 { 4 } else { 12 })
+    }
+}
+
+/// Sleeps in small steps; false if the user pressed Stop meanwhile.
+fn wait_unless_cancelled(total: Duration, cancel: &AtomicBool) -> bool {
+    let end = std::time::Instant::now() + total;
+    while std::time::Instant::now() < end {
+        if cancel.load(Ordering::Relaxed) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50).min(total));
+    }
+    !cancel.load(Ordering::Relaxed)
+}
+
+/// A few words for the notice: the part of the error after the last colon,
+/// e.g. "timeout: receive response" or "HTTP 503".
+fn brief_reason(error: &str) -> String {
+    let first = error.lines().next().unwrap_or(error);
+    if let Some(rest) = first.split("fehlgeschlagen: ").nth(1) {
+        return rest.trim().to_owned();
+    }
+    first.chars().take(80).collect()
 }
 
 enum Asked {
@@ -763,12 +1044,24 @@ mod tests {
         steps: Vec<String>,
         decisions: Vec<Decision>,
     ) -> (Vec<AgentEvent>, Vec<String>) {
-        let (base_url, server) = mock_server(
+        run_agent_with(
+            project,
+            approval,
             steps
                 .into_iter()
                 .map(|s| ("200 OK", "text/event-stream", s))
                 .collect(),
-        );
+            decisions,
+        )
+    }
+
+    fn run_agent_with(
+        project: &Project,
+        approval: ApprovalMode,
+        responses: Vec<(&'static str, &'static str, String)>,
+        decisions: Vec<Decision>,
+    ) -> (Vec<AgentEvent>, Vec<String>) {
+        let (base_url, server) = mock_server(responses);
         let ws = Workspace::open(&project.0).unwrap();
         let config = AgentConfig {
             base_url,
@@ -778,6 +1071,7 @@ mod tests {
             workspace: Some(ws),
             approval,
             max_steps: 10,
+            handoff: false,
         };
         let (tx, rx) = mpsc::channel();
         let mut decisions = decisions.into_iter();
@@ -1086,7 +1380,7 @@ mod tests {
         assert!(before > 80_000, "{before}");
         // Under budget: nothing changes.
         assert!(!compact(&mut messages, "system", 200_000));
-        assert!(compact(&mut messages, "system", 20_000));
+        assert!(compact(&mut messages, "system", 50_000));
         let tool_lengths: Vec<usize> = messages
             .iter()
             .filter_map(|m| match m {
@@ -1111,16 +1405,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            thinking.iter().filter(|t| **t).count(),
-            2.min(thinking.len()),
-            "{thinking:?}"
-        );
+        assert!(thinking[6] && thinking[7], "{thinking:?}");
+        assert!(!thinking[0], "oldest are cut first: {thinking:?}");
+        assert!(estimated_tokens("system", &messages) <= 50_000);
         assert!(estimated_tokens("system", &messages) < before * 3 / 4);
         // Cut once is cut: asking again with the same budget changes nothing.
         assert!(!compact(&mut messages, "system", 200_000));
         let after_first = messages.len();
-        compact(&mut messages, "system", 20_000);
+        compact(&mut messages, "system", 50_000);
         assert_eq!(messages.len(), after_first);
     }
 
@@ -1236,6 +1528,7 @@ mod tests {
             workspace: Some(ws),
             approval: ApprovalMode::AutoEdits,
             max_steps: 10,
+            handoff: false,
         };
         let (_tx, rx) = mpsc::channel();
         let mut events = Vec::new();
@@ -1311,6 +1604,277 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, AgentEvent::ApprovalNeeded { .. }))
         );
+    }
+
+    #[test]
+    fn a_busy_server_is_asked_again_and_a_dead_one_gets_advice() {
+        let project = Project::new("busy");
+        let busy = || {
+            (
+                "503 Service Unavailable",
+                "application/json",
+                r#"{"detail":"overloaded"}"#.to_owned(),
+            )
+        };
+        // One "busy", then the answer: the run goes on and says so.
+        let (events, requests) = run_agent_with(
+            &project,
+            ApprovalMode::AutoEdits,
+            vec![
+                busy(),
+                ("200 OK", "text/event-stream", answer_step("Fertig.")),
+            ],
+            vec![],
+        );
+        assert_eq!(requests.len(), 2);
+        assert!(events.iter().any(|e| matches!(e,
+            AgentEvent::Notice(n) if n.contains("neuer Versuch 2 von 3") && n.contains("HTTP 503"))));
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Finished { .. })),
+            "{events:?}"
+        );
+
+        // Always busy: three tries, then a message that says how to go on.
+        let (events, requests) = run_agent_with(
+            &project,
+            ApprovalMode::AutoEdits,
+            vec![busy(), busy(), busy()],
+            vec![],
+        );
+        assert_eq!(requests.len(), 3);
+        assert!(matches!(events.last(),
+            Some(AgentEvent::Failed(m)) if m.contains("„weiter“") && m.contains("HTTP 503")));
+
+        // A wrong key is not retried.
+        let (events, requests) = run_agent_with(
+            &project,
+            ApprovalMode::AutoEdits,
+            vec![(
+                "401 Unauthorized",
+                "application/json",
+                r#"{"detail":"bad key"}"#.to_owned(),
+            )],
+            vec![],
+        );
+        assert_eq!(requests.len(), 1);
+        assert!(matches!(events.last(), Some(AgentEvent::Failed(m)) if m.contains("HTTP 401")));
+    }
+
+    /// A conversation in which `reads` whole files of 50,000 characters were read.
+    fn long_conversation(reads: usize) -> Vec<ChatMessage> {
+        let mut messages = vec![ChatMessage::User {
+            text: "Lies alle Dateien und fasse sie zusammen.".into(),
+            attachments: vec![],
+        }];
+        for i in 0..reads {
+            messages.push(ChatMessage::Assistant {
+                content: String::new(),
+                reasoning: Some("denkt".into()),
+                tool_calls: vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "read_file".into(),
+                    arguments: format!(r#"{{"path":"datei{i}.rs"}}"#),
+                }],
+            });
+            messages.push(ChatMessage::Tool {
+                call_id: format!("c{i}"),
+                content: "x".repeat(50_000),
+            });
+        }
+        messages
+    }
+
+    fn run_handoff(
+        project: &Project,
+        messages: Vec<ChatMessage>,
+        responses: Vec<(&'static str, &'static str, String)>,
+        approval: ApprovalMode,
+    ) -> (Vec<AgentEvent>, Vec<String>) {
+        let (base_url, server) = mock_server(responses);
+        let ws = Workspace::open(&project.0).unwrap();
+        let config = AgentConfig {
+            base_url,
+            api_key: "k".into(),
+            system_prompt: system_prompt("", &ws),
+            options: opts(true),
+            workspace: Some(ws),
+            approval,
+            max_steps: 10,
+            handoff: true,
+        };
+        let (_tx, rx) = mpsc::channel();
+        let mut events = Vec::new();
+        run(
+            &api::agent(),
+            config,
+            messages,
+            &AtomicBool::new(false),
+            &rx,
+            |e| {
+                events.push(e);
+                true
+            },
+        );
+        (events, server.join().unwrap())
+    }
+
+    #[test]
+    fn a_conversation_that_got_too_long_moves_on_with_a_note() {
+        let project = Project::new("handoff");
+        let (events, requests) = run_handoff(
+            &project,
+            long_conversation(6),
+            vec![(
+                "200 OK",
+                "text/event-stream",
+                answer_step("Aufgabe: alles lesen. Gelesen: datei0.rs bis datei5.rs."),
+            )],
+            ApprovalMode::AutoAll,
+        );
+        // Only the request for the note was sent, not the big conversation.
+        assert_eq!(requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_str(requests[0].split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let sent = body.to_string();
+        assert!(sent.contains("NEW chat"), "the note is asked for");
+        assert!(sent.chars().count() < 120_000, "{}", sent.chars().count());
+        assert_eq!(body["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(body["tool_choice"], "none");
+        // The run ends with the note and the approval mode it had.
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Handoff { note, approval })
+                if note.contains("datei5.rs") && *approval == ApprovalMode::AutoAll),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("neuen Chat")))
+        );
+        assert!(!events.iter().any(|e| matches!(e, AgentEvent::StepStarted)));
+    }
+
+    #[test]
+    fn without_an_answer_from_the_server_the_program_writes_the_note() {
+        let project = Project::new("handoff-fallback");
+        let (events, requests) = run_handoff(
+            &project,
+            long_conversation(6),
+            vec![(
+                "503 Service Unavailable",
+                "application/json",
+                r#"{"detail":"overloaded"}"#.to_owned(),
+            )],
+            ApprovalMode::AutoEdits,
+        );
+        assert_eq!(requests.len(), 1);
+        let Some(AgentEvent::Handoff { note, .. }) = events.last() else {
+            panic!("{events:?}");
+        };
+        assert!(
+            note.contains("read_file") && note.contains("datei5.rs"),
+            "{note}"
+        );
+        assert!(note.chars().count() < 7_000, "{}", note.chars().count());
+    }
+
+    #[test]
+    fn a_timeout_with_a_long_conversation_moves_on_instead_of_asking_again() {
+        let project = Project::new("handoff-timeout");
+        // 3 reads are under the size limit but big enough that the server struggles.
+        let (events, requests) = run_handoff(
+            &project,
+            long_conversation(3),
+            vec![
+                (
+                    "504 Gateway Timeout",
+                    "application/json",
+                    r#"{"detail":"timeout"}"#.to_owned(),
+                ),
+                (
+                    "200 OK",
+                    "text/event-stream",
+                    answer_step("Notiz: drei Dateien gelesen."),
+                ),
+            ],
+            ApprovalMode::AutoEdits,
+        );
+        assert_eq!(requests.len(), 2);
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Handoff { note, .. }) if note.contains("drei Dateien")),
+            "{events:?}"
+        );
+
+        // A short conversation is not the reason: it is asked again, not handed over.
+        let (events, requests) = run_handoff(
+            &project,
+            long_conversation(1),
+            vec![
+                (
+                    "504 Gateway Timeout",
+                    "application/json",
+                    r#"{"detail":"timeout"}"#.to_owned(),
+                ),
+                ("200 OK", "text/event-stream", answer_step("Fertig.")),
+            ],
+            ApprovalMode::AutoEdits,
+        );
+        assert_eq!(requests.len(), 2);
+        assert!(
+            matches!(events.last(), Some(AgentEvent::Finished { .. })),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn many_whole_files_are_cut_down_when_the_conversation_is_too_big() {
+        // Six reads of 50,000 characters each, as in a run that timed out.
+        let big = "x".repeat(50_000);
+        let mut messages = vec![ChatMessage::User {
+            text: "Lies alles.".into(),
+            attachments: vec![],
+        }];
+        for i in 0..6 {
+            messages.push(ChatMessage::Assistant {
+                content: String::new(),
+                reasoning: None,
+                tool_calls: vec![ToolCall {
+                    id: format!("c{i}"),
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                }],
+            });
+            messages.push(ChatMessage::Tool {
+                call_id: format!("c{i}"),
+                content: big.clone(),
+            });
+        }
+        let before = estimated_tokens("", &messages);
+        assert!(before > CONTEXT_BUDGET_TOKENS, "{before}");
+        assert!(compact(&mut messages, "", RETRY_CONTEXT_BUDGET_TOKENS));
+        let after = estimated_tokens("", &messages);
+        assert!(after <= RETRY_CONTEXT_BUDGET_TOKENS, "{after}");
+        // The newest result is complete; the oldest ones keep only their start.
+        let lens: Vec<usize> = messages
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::Tool { content, .. } => Some(content.chars().count()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lens[5], 50_000);
+        assert!(lens[..2].iter().all(|n| *n < 2_000), "{lens:?}");
+        // Even a budget below the newest result alone cannot cut that one.
+        assert!(compact(&mut messages, "", 1_000));
+        let lens: Vec<usize> = messages
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::Tool { content, .. } => Some(content.chars().count()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(lens[5], 50_000);
+        assert!(lens[..5].iter().all(|n| *n < 2_000), "{lens:?}");
     }
 
     #[test]
@@ -1414,6 +1978,7 @@ mod tests {
             workspace: Some(ws),
             approval: ApprovalMode::AutoAll,
             max_steps: 5,
+            handoff: false,
         };
         let cancel = AtomicBool::new(false);
         let (_tx, rx) = mpsc::channel();
@@ -1486,6 +2051,7 @@ mod tests {
             workspace: None,
             approval: ApprovalMode::AutoEdits,
             max_steps: 5,
+            handoff: false,
         };
         let (_tx, rx) = mpsc::channel();
         let mut events = Vec::new();

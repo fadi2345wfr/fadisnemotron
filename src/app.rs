@@ -22,6 +22,9 @@ use crate::remote::{self, Command, RemoteServer, Reply};
 use crate::tools::{ApprovalMode, FileChange, Workspace};
 use crate::widgets::{self, UiAction};
 
+/// A request may move on to a new chat this many times by itself; after that
+/// old tool output is cut instead.
+const MAX_HANDOFFS: usize = 3;
 const APK_RELEASE_URL: &str =
     "https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron.apk";
 const NOT_RUN: &str = "Not run: the request was stopped before this tool ran.";
@@ -327,6 +330,13 @@ pub struct NemotronApp {
     apk_offered: bool,
     remote_show_token: bool,
     keep_awake: awake::KeepAwake,
+    /// A run ended because the chat got too long: Nemotron's note for the new
+    /// chat and the approval mode of that run.
+    pending_handoff: Option<(String, ApprovalMode)>,
+    /// How often a request moved on to a new chat without the user writing.
+    handoff_chain: usize,
+    /// Approval mode carried over to the continued run.
+    run_approval: Option<ApprovalMode>,
     /// Answer of the password dialog for "run with the lid closed".
     lid_task: Option<mpsc::Receiver<Result<(), String>>>,
     lid_disabled: Option<bool>,
@@ -421,6 +431,9 @@ impl NemotronApp {
             apk_offered: false,
             remote_show_token: false,
             keep_awake: awake::KeepAwake::new(),
+            pending_handoff: None,
+            handoff_chain: 0,
+            run_approval: None,
             lid_task: None,
             lid_disabled: None,
             lid_checked: None,
@@ -831,6 +844,7 @@ impl NemotronApp {
         self.input.clear();
         self.notice = None;
         self.save_chat();
+        self.handoff_chain = 0;
         self.start_request(ctx);
     }
 
@@ -908,8 +922,9 @@ impl NemotronApp {
             system_prompt,
             options: self.settings.generation_options(),
             workspace: Some(self.workspace.clone()),
-            approval: self.settings.approval,
+            approval: self.run_approval.take().unwrap_or(self.settings.approval),
             max_steps: self.settings.max_steps.max(1),
+            handoff: self.handoff_chain < MAX_HANDOFFS,
         };
         let http = self.http.clone();
         let worker_cancel = cancel.clone();
@@ -1016,6 +1031,7 @@ impl NemotronApp {
             self.messages.pop();
         }
         if self.messages.last().is_some_and(|m| m.role == Role::User) {
+            self.handoff_chain = 0;
             self.start_request(ctx);
         }
     }
@@ -1050,8 +1066,12 @@ impl NemotronApp {
         }
         let mut finished = false;
         let mut changes = Vec::new();
+        let mut handoff = None;
         if let Some(msg) = self.messages.last_mut() {
             for event in events {
+                if let AgentEvent::Handoff { note, approval } = &event {
+                    handoff = Some((note.clone(), *approval));
+                }
                 finished |= apply_event(msg, event, &mut changes);
             }
             if disconnected && !finished {
@@ -1066,7 +1086,44 @@ impl NemotronApp {
         if finished {
             self.active = None;
             self.save_chat();
+            if handoff.is_some() {
+                self.pending_handoff = handoff;
+            }
         }
+    }
+
+    /// The chat got too long: opens a new chat that holds the user's request
+    /// and Nemotron's note, and lets Nemotron go on there.
+    fn continue_in_new_chat(&mut self, ctx: &egui::Context) {
+        let Some((note, approval)) = self.pending_handoff.take() else {
+            return;
+        };
+        let request = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::User)
+            .map(|m| (m.text.clone(), m.attachments.clone()));
+        let old_title = self.chat_title();
+        if let Err(e) = self.new_chat(ctx) {
+            self.notice = Some(Notice {
+                text: format!(
+                    "Der Chat wurde nicht gespeichert, deshalb geht es nicht in einem neuen Chat weiter: {e}"
+                ),
+                error: true,
+            });
+            return;
+        }
+        let (request, attachments) = request.unwrap_or_default();
+        let text = format!(
+            "{request}\n\n— Weiter aus dem Chat „{old_title}“, der zu lang geworden war. Nemotron hat sich diese Notiz geschrieben —\n{note}\n\nMach genau dort weiter, wo die Notiz endet. Lies Dateien nur wieder, wo du sie wirklich brauchst."
+        );
+        self.messages
+            .push(Message::user(text.trim().to_owned(), attachments));
+        self.handoff_chain += 1;
+        self.run_approval = Some(approval);
+        self.save_chat();
+        self.start_request(ctx);
     }
 
     // --------------------------------------------------------- attachments
@@ -1327,6 +1384,7 @@ impl NemotronApp {
                     .push(Message::user(text.trim().to_owned(), attachments));
                 self.notice = None;
                 self.save_chat();
+                self.handoff_chain = 0;
                 self.start_request(ctx);
                 ok
             }
@@ -2643,6 +2701,11 @@ fn apply_event(msg: &mut Message, event: AgentEvent, changes: &mut Vec<FileChang
             }
         }
         AgentEvent::Notice(text) => msg.notices.push(text),
+        AgentEvent::Handoff { .. } => {
+            msg.status = Status::Done;
+            msg.settle_tools();
+            return true;
+        }
         AgentEvent::Finished { finish_reason } => {
             msg.status = Status::Done;
             msg.finish_reason = finish_reason;
@@ -2677,6 +2740,7 @@ impl eframe::App for NemotronApp {
     /// when the Mac app is minimised.
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_agent();
+        self.continue_in_new_chat(ctx);
         self.poll_stopped();
         self.poll_attachments();
         self.handle_remote(ctx);
@@ -3039,6 +3103,7 @@ mod tests {
         let until = Instant::now() + Duration::from_secs(15);
         while !done() && Instant::now() < until {
             app.poll_agent();
+            app.continue_in_new_chat(ctx);
             app.handle_remote(ctx);
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -3067,6 +3132,56 @@ mod tests {
             res.status().as_u16(),
             serde_json::from_str(&text).unwrap_or(Value::Null),
         )
+    }
+
+    #[test]
+    fn a_chat_that_got_too_long_goes_on_in_a_new_chat_with_the_note() {
+        use crate::api::tests::mock_server;
+        let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"Weiter geht es.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let (base_url, nvidia) =
+            mock_server(vec![("200 OK", "text/event-stream", answer.to_owned())]);
+        let settings = Settings {
+            base_url,
+            api_key: "k".into(),
+            ..Settings::default()
+        };
+        let mut app = NemotronApp::with_settings(settings, None);
+        let ctx = egui::Context::default();
+        let mut old = Message::assistant(true);
+        old.status = Status::Done;
+        app.messages = vec![Message::user("Bau das Projekt".into(), vec![]), old];
+        let old_id = app.chat_id.clone();
+        app.pending_handoff = Some((
+            "Gelesen: a.rs, b.rs. Offen: Tests.".into(),
+            ApprovalMode::AutoAll,
+        ));
+
+        app.continue_in_new_chat(&ctx);
+        assert_ne!(app.chat_id, old_id, "a new chat");
+        assert_eq!(app.handoff_chain, 1);
+        assert_eq!(app.messages[0].role, Role::User);
+        let first = &app.messages[0].text;
+        assert!(first.starts_with("Bau das Projekt"), "{first}");
+        assert!(
+            first.contains("Gelesen: a.rs, b.rs. Offen: Tests."),
+            "{first}"
+        );
+        assert!(app.active.is_some(), "Nemotron goes on by himself");
+        let until = Instant::now() + Duration::from_secs(15);
+        while app.active.is_some() && Instant::now() < until {
+            app.poll_agent();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let requests = nvidia.join().unwrap();
+        assert!(
+            requests[0].contains("Offen: Tests."),
+            "the note reaches the model"
+        );
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[1].steps[0].content, "Weiter geht es.");
+        // Nothing is left to continue.
+        app.continue_in_new_chat(&ctx);
+        assert_eq!(app.handoff_chain, 1);
     }
 
     #[test]

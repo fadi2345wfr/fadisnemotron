@@ -583,9 +583,11 @@ pub fn agent() -> ureq::Agent {
         .tls_config(tls)
         .http_status_as_error(false)
         .timeout_connect(Some(Duration::from_secs(20)))
-        // Thinking can take minutes before the first answer token, so only
-        // guard against a silent connection, not a slow answer.
-        .timeout_recv_response(Some(Duration::from_secs(300)))
+        // The answer's first bytes come after the server has read the whole
+        // conversation; with 100k tokens that takes a while, and thinking can
+        // take minutes. Only a connection silent for this long is given up on
+        // (the agent then asks again with less to read).
+        .timeout_recv_response(Some(Duration::from_secs(180)))
         .timeout_recv_body(None)
         .build()
         .into()
@@ -717,6 +719,24 @@ pub enum StepOutcome {
     /// The model produced unreadable text (many scripts mixed up) and the
     /// stream was cut off; asking again with less context usually helps.
     Garbled,
+    /// The server did not answer in time or was busy (timeout, connection
+    /// lost, 429, 5xx). Asking again, with less to read, often works.
+    Transient(String),
+}
+
+/// Errors that say "try again later" rather than "this request is wrong".
+fn is_transient_error(error: &ureq::Error) -> bool {
+    matches!(
+        error,
+        ureq::Error::Timeout(_)
+            | ureq::Error::Io(_)
+            | ureq::Error::ConnectionFailed
+            | ureq::Error::HostNotFound
+    )
+}
+
+fn is_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
 }
 
 /// Why reading the stream stopped before its end: the model went off the
@@ -752,7 +772,14 @@ pub fn stream_step(
 
     let response = match request.send(body.to_string()) {
         Ok(r) => r,
-        Err(e) => return StepOutcome::Failed(format!("Verbindung zu {url} fehlgeschlagen: {e}")),
+        Err(e) => {
+            let text = format!("Verbindung zu {url} fehlgeschlagen: {e}");
+            return if is_transient_error(&e) {
+                StepOutcome::Transient(text)
+            } else {
+                StepOutcome::Failed(text)
+            };
+        }
     };
     if cancel.load(Ordering::Relaxed) {
         return StepOutcome::Cancelled;
@@ -767,7 +794,12 @@ pub fn stream_step(
             .lossy_utf8(true)
             .read_to_string()
             .unwrap_or_default();
-        return StepOutcome::Failed(describe_http_error(status, &text));
+        let text = describe_http_error(status, &text);
+        return if is_transient_status(status) {
+            StepOutcome::Transient(text)
+        } else {
+            StepOutcome::Failed(text)
+        };
     }
 
     let is_event_stream = response
@@ -831,7 +863,7 @@ pub fn stream_step(
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
-                    return StepOutcome::Failed(format!(
+                    return StepOutcome::Transient(format!(
                         "Verbindung während der Antwort abgebrochen: {e}"
                     ));
                 }
@@ -1485,7 +1517,34 @@ pub(crate) mod tests {
         // Port 9 (discard) on localhost is closed in test environments.
         let (outcome, _) = step("http://127.0.0.1:9/v1", "x");
         assert!(
-            matches!(&outcome, StepOutcome::Failed(m) if m.contains("Verbindung")),
+            matches!(&outcome, StepOutcome::Transient(m) if m.contains("Verbindung")),
+            "{outcome:?}"
+        );
+    }
+
+    #[test]
+    fn busy_servers_and_timeouts_are_worth_asking_again() {
+        for status in [408, 429, 500, 502, 503, 504] {
+            assert!(is_transient_status(status), "{status}");
+        }
+        for status in [400, 401, 403, 404, 413, 422] {
+            assert!(!is_transient_status(status), "{status}");
+        }
+        assert!(is_transient_error(&ureq::Error::Timeout(
+            ureq::Timeout::RecvResponse
+        )));
+        assert!(is_transient_error(&ureq::Error::ConnectionFailed));
+        assert!(!is_transient_error(&ureq::Error::BadUri("x".into())));
+
+        let (base_url, server) = mock_server(vec![(
+            "503 Service Unavailable",
+            "application/json",
+            r#"{"detail":"overloaded"}"#.into(),
+        )]);
+        let (outcome, _) = step(&base_url, "k");
+        server.join().unwrap();
+        assert!(
+            matches!(&outcome, StepOutcome::Transient(m) if m.contains("HTTP 503")),
             "{outcome:?}"
         );
     }
