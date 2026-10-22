@@ -29,7 +29,14 @@ const SKIPPED_DIRS: &[&str] = &[
     "DerivedData",
     ".gradle",
     ".next",
+    // Huge and rarely meant when searching the home folder.
+    "Library",
+    ".Trash",
+    ".cache",
+    "Caches",
 ];
+/// Searches over big folders (like the home folder) stop after this long.
+const SEARCH_TIME_LIMIT: Duration = Duration::from_secs(15);
 const MAX_LIST_ENTRIES: usize = 400;
 const MAX_FIND_RESULTS: usize = 100;
 const DEFAULT_READ_LINES: usize = 500;
@@ -519,8 +526,20 @@ impl Workspace {
         Ok(Self { root })
     }
 
+    /// The user's home folder: the working folder when no project is open,
+    /// so Downloads, Desktop and Documents are within reach.
+    pub fn home() -> Self {
+        let home = home_dir();
+        Self::open(&home).unwrap_or(Self { root: home })
+    }
+
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// True if the working folder is the home folder (no project open).
+    pub fn is_home(&self) -> bool {
+        self.root == home_dir()
     }
 
     pub fn name(&self) -> String {
@@ -534,9 +553,9 @@ impl Workspace {
     pub fn resolve(&self, input: &str) -> Result<PathBuf, String> {
         let input = input.trim();
         let input = if input.is_empty() { "." } else { input };
-        let given = Path::new(input);
+        let given = expand_home(input);
         let joined = if given.is_absolute() {
-            given.to_path_buf()
+            given
         } else {
             self.root.join(given)
         };
@@ -570,7 +589,8 @@ impl Workspace {
         }
     }
 
-    /// Path relative to the root, with '/' separators; "." for the root.
+    /// Path relative to the working folder, with '/' separators; "." for
+    /// the folder itself.
     pub fn relative(&self, abs: &Path) -> String {
         let rel = abs.strip_prefix(&self.root).unwrap_or(abs);
         let s = rel
@@ -685,10 +705,14 @@ impl Workspace {
         if let Some(dir) = change.abs.parent()
             && let Err(e) = std::fs::create_dir_all(dir)
         {
-            return ToolOutput::err(format!("could not create folder for {}: {e}", change.path));
+            return ToolOutput::err(format!(
+                "could not create folder for {}: {}",
+                change.path,
+                io_error(&e)
+            ));
         }
         if let Err(e) = std::fs::write(&change.abs, &change.after) {
-            return ToolOutput::err(format!("could not write {}: {e}", change.path));
+            return ToolOutput::err(format!("could not write {}: {}", change.path, io_error(&e)));
         }
         let (added, removed) = change.line_stats();
         let verb = if change.before.is_some() {
@@ -825,8 +849,11 @@ impl Workspace {
         else {
             return String::new();
         };
+        let started = Instant::now();
         let found: Vec<String> = walker(&self.root)
+            .max_depth(Some(8))
             .build()
+            .take_while(|_| started.elapsed() < Duration::from_secs(2))
             .flatten()
             .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
             .filter(|e| e.file_name().to_string_lossy().to_lowercase() == name)
@@ -862,8 +889,14 @@ impl Workspace {
             Ok(g) => g.compile_matcher(),
             Err(e) => return ToolOutput::err(format!("invalid glob \"{pattern}\": {e}")),
         };
+        let started = Instant::now();
+        let mut timed_out = false;
         let mut found: Vec<(std::time::SystemTime, String)> = walker(&base)
             .build()
+            .take_while(|_| {
+                timed_out = started.elapsed() > SEARCH_TIME_LIMIT;
+                !timed_out
+            })
             .flatten()
             .filter(|e| e.file_type().is_some_and(|t| t.is_file()))
             .filter_map(|e| {
@@ -884,16 +917,24 @@ impl Workspace {
                 })
             })
             .collect();
+        let stopped = if timed_out {
+            format!(
+                " (stopped after {} s; search a smaller folder for complete results)",
+                SEARCH_TIME_LIMIT.as_secs()
+            )
+        } else {
+            String::new()
+        };
         if found.is_empty() {
             return ToolOutput::ok(format!(
-                "No files match \"{pattern}\" in {}.",
+                "No files match \"{pattern}\" in {}{stopped}.",
                 self.relative(&base)
             ));
         }
         // Newest first: recently touched files are usually the relevant ones.
         found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         let total = found.len();
-        let mut out = format!("Found {total} files\n");
+        let mut out = format!("Found {total} files{stopped}\n");
         for (_, rel) in found.iter().take(MAX_FIND_RESULTS) {
             out.push_str(rel);
             out.push('\n');
@@ -980,7 +1021,7 @@ impl Workspace {
         }
         let bytes = match std::fs::read(&abs) {
             Ok(b) => b,
-            Err(e) => return ToolOutput::err(format!("could not read {path}: {e}")),
+            Err(e) => return ToolOutput::err(format!("could not read {path}: {}", io_error(&e))),
         };
         if bytes.iter().take(8000).any(|b| *b == 0) {
             return ToolOutput::err(format!(
@@ -1077,7 +1118,16 @@ impl Workspace {
         let mut matches = 0;
         let mut files_with_matches = 0;
         let mut searched = 0;
+        let started = Instant::now();
         'files: for entry in builder.build().flatten() {
+            if started.elapsed() > SEARCH_TIME_LIMIT {
+                let _ = writeln!(
+                    out,
+                    "… stopped after {} s. Search a smaller folder or use a glob.",
+                    SEARCH_TIME_LIMIT.as_secs()
+                );
+                break;
+            }
             if !entry.file_type().is_some_and(|t| t.is_file()) {
                 continue;
             }
@@ -1210,7 +1260,7 @@ fn read_existing_text(abs: &Path, shown: &str) -> Result<Option<String>, String>
             .map(Some)
             .map_err(|_| format!("{shown} is not a UTF-8 text file")),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(format!("could not read {shown}: {e}")),
+        Err(e) => Err(format!("could not read {shown}: {}", io_error(&e))),
     }
 }
 
@@ -1239,6 +1289,36 @@ fn lazy_placeholder(old: &str, new: &str) -> Option<String> {
 
 static LINE_NUMBER: std::sync::LazyLock<regex::Regex> =
     std::sync::LazyLock::new(|| regex::Regex::new(r"^\s*\d+\t").expect("valid regex"));
+
+/// The user's home folder.
+pub fn home_dir() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .and_then(|p| p.canonicalize().ok())
+        .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// `~` and `~/…` mean the home folder, as in a shell.
+fn expand_home(input: &str) -> PathBuf {
+    match input.strip_prefix('~') {
+        Some("") => home_dir(),
+        Some(rest) if rest.starts_with('/') => home_dir().join(rest.trim_start_matches('/')),
+        _ => PathBuf::from(input),
+    }
+}
+
+/// An I/O error for the model; macOS privacy blocks get a hint it can pass on.
+fn io_error(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(1) {
+        format!(
+            "{e}. On macOS this usually means the user has not yet allowed Fadis Nemotron to access this folder: \
+             tell them to allow it in System Settings → Privacy & Security → Files and Folders, then try again."
+        )
+    } else {
+        e.to_string()
+    }
+}
 
 /// Removes read_file's "   12\t" prefixes if every non-empty line has one.
 fn strip_line_numbers(text: &str) -> Option<String> {
@@ -1286,8 +1366,13 @@ fn walker(path: &Path) -> ignore::WalkBuilder {
         .sort_by_file_path(|a, b| a.cmp(b))
         .filter_entry(|e| {
             let name = e.file_name().to_string_lossy();
-            !(e.file_type().is_some_and(|t| t.is_dir()) && SKIPPED_DIRS.contains(&name.as_ref()))
-                && name != ".DS_Store"
+            // The folder asked for is always searched, even if it is e.g. ~/Library.
+            let skipped_dir = e.depth() > 0
+                && e.file_type().is_some_and(|t| t.is_dir())
+                && (SKIPPED_DIRS.contains(&name.as_ref())
+                    || name.ends_with(".app")
+                    || name.ends_with(".photoslibrary"));
+            !skipped_dir && name != ".DS_Store"
         });
     builder
 }
@@ -1729,6 +1814,29 @@ mod tests {
         let inside = p.ws.root().join("src/main.rs");
         assert!(p.ws.resolve(inside.to_str().unwrap()).is_ok());
         assert_eq!(p.ws.relative(p.ws.root()), ".");
+    }
+
+    #[test]
+    fn home_folder_is_the_default_working_folder() {
+        let home = Workspace::home();
+        assert!(home.is_home());
+        assert_eq!(home.root(), home_dir());
+        assert_eq!(expand_home("~"), home_dir());
+        assert_eq!(
+            expand_home("~/Downloads/x.pdf"),
+            home_dir().join("Downloads/x.pdf")
+        );
+        assert_eq!(expand_home("~fremd/x"), PathBuf::from("~fremd/x"));
+        assert_eq!(
+            home.resolve("~/Desktop/Rechnungen").unwrap(),
+            home_dir().join("Desktop/Rechnungen")
+        );
+        assert_eq!(
+            home.relative(&home_dir().join("Desktop/a.txt")),
+            "Desktop/a.txt"
+        );
+        let p = TempProject::new("home");
+        assert!(!p.ws.is_home());
     }
 
     #[cfg(unix)]

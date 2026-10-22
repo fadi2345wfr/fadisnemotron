@@ -265,7 +265,8 @@ pub struct NemotronApp {
     settings: Settings,
     settings_path: Option<PathBuf>,
     settings_draft: Option<SettingsDraft>,
-    workspace: Option<Workspace>,
+    /// Where the agent works: the open project, or the home folder.
+    workspace: Workspace,
     changes: Vec<TrackedChange>,
     messages: Vec<Message>,
     input: String,
@@ -332,7 +333,8 @@ impl NemotronApp {
         let workspace = settings
             .workspace
             .as_deref()
-            .and_then(|p| Workspace::open(p).ok());
+            .and_then(|p| Workspace::open(p).ok())
+            .unwrap_or_else(Workspace::home);
         Self {
             settings,
             settings_path,
@@ -395,9 +397,10 @@ impl NemotronApp {
     }
 
     fn update_title(&self, ctx: &egui::Context) {
-        let title = match &self.workspace {
-            Some(ws) => format!("Fadis Nemotron – {}", ws.name()),
-            None => "Fadis Nemotron".to_owned(),
+        let title = if self.workspace.is_home() {
+            "Fadis Nemotron".to_owned()
+        } else {
+            format!("Fadis Nemotron – {}", self.workspace.name())
         };
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
     }
@@ -406,9 +409,7 @@ impl NemotronApp {
 
     fn pick_workspace(&mut self, ctx: &egui::Context) {
         let mut dialog = rfd::FileDialog::new().set_title("Projektordner öffnen");
-        if let Some(ws) = &self.workspace {
-            dialog = dialog.set_directory(ws.root());
-        }
+        dialog = dialog.set_directory(self.workspace.root());
         if let Some(dir) = dialog.pick_folder() {
             self.open_workspace(&dir, ctx);
         }
@@ -431,8 +432,8 @@ impl NemotronApp {
                     ),
                     error: false,
                 });
-                self.settings.workspace = Some(ws.root().to_path_buf());
-                self.workspace = Some(ws);
+                self.settings.workspace = (!ws.is_home()).then(|| ws.root().to_path_buf());
+                self.workspace = ws;
                 self.changes.clear();
                 self.undo_confirm = None;
                 self.save_settings();
@@ -452,7 +453,7 @@ impl NemotronApp {
         if self.active.is_some() {
             return;
         }
-        self.workspace = None;
+        self.workspace = Workspace::home();
         self.changes.clear();
         self.undo_confirm = None;
         self.settings.workspace = None;
@@ -645,16 +646,13 @@ impl NemotronApp {
         let (tx, rx) = mpsc::channel();
         let (decision_tx, decision_rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        let system_prompt = match &self.workspace {
-            Some(ws) => agent::system_prompt(&self.settings.system_prompt, ws),
-            None => self.settings.system_prompt.clone(),
-        };
+        let system_prompt = agent::system_prompt(&self.settings.system_prompt, &self.workspace);
         let config = AgentConfig {
             base_url: self.settings.base_url.clone(),
             api_key: self.settings.effective_api_key(),
             system_prompt,
             options: self.settings.generation_options(),
-            workspace: self.workspace.clone(),
+            workspace: Some(self.workspace.clone()),
             approval: self.settings.approval,
             max_steps: self.settings.max_steps.max(1),
         };
@@ -1198,7 +1196,11 @@ impl NemotronApp {
                 ApprovalMode::AutoEdits => "AutoEdits",
                 ApprovalMode::AutoAll => "AutoAll",
             },
-            "workspace": self.workspace.as_ref().map(|ws| json!({"name": ws.name(), "path": ws.root().display().to_string()})),
+            "workspace": json!({
+                "name": self.workspace.name(),
+                "path": self.workspace.root().display().to_string(),
+                "home": self.workspace.is_home(),
+            }),
             "notice": self.notice.as_ref().map(|n| json!({"text": n.text, "error": n.error})),
             "changes": changes,
             "messages": messages,
@@ -1347,12 +1349,11 @@ impl NemotronApp {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
                 ui.label(RichText::new("Fadis Nemotron").strong().size(18.0).color(widgets::accent(ui)));
-                let mode = if self.workspace.is_some() { "Agent" } else { "Chat" };
-                ui.label(RichText::new(mode).small().strong().color(Color32::BLACK).background_color(widgets::accent(ui)))
-                    .on_hover_text(if self.workspace.is_some() {
-                        "Nemotron liest und ändert Dateien im geöffneten Projektordner."
+                ui.label(RichText::new("Agent").small().strong().color(Color32::BLACK).background_color(widgets::accent(ui)))
+                    .on_hover_text(if self.workspace.is_home() {
+                        "Nemotron liest und ändert Dateien in deinem Benutzerordner (Downloads, Schreibtisch, Dokumente …)."
                     } else {
-                        "Nur Chat. Öffne einen Projektordner, damit Nemotron Dateien lesen und ändern kann."
+                        "Nemotron liest und ändert Dateien im geöffneten Projektordner."
                     });
                 ui.hyperlink_to(RichText::new(&self.settings.model).small().weak(), widgets::MODEL_URL)
                     .on_hover_text("Modellseite auf build.nvidia.com öffnen");
@@ -1383,7 +1384,7 @@ impl NemotronApp {
                     if ui.button("➕ Neuer Chat").on_hover_text("⌘ N").clicked() {
                         self.new_chat(ctx);
                     }
-                    if self.workspace.is_none()
+                    if self.workspace.is_home()
                         && ui.button("📁 Projekt öffnen").on_hover_text("Ordner wählen, in dem Nemotron arbeiten soll (⌘ O)").clicked()
                     {
                         self.pick_workspace(ctx);
@@ -1407,8 +1408,13 @@ impl NemotronApp {
     }
 
     fn project_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
-        let Some(ws) = &self.workspace else { return };
-        let (name, root) = (ws.name(), ws.root().to_path_buf());
+        let home = self.workspace.is_home();
+        let name = if home {
+            "Benutzerordner".to_owned()
+        } else {
+            self.workspace.name()
+        };
+        let root = self.workspace.root().to_path_buf();
         let busy = self.active.is_some();
         let mut action: Option<UiAction> = None;
         let mut switch = false;
@@ -1416,18 +1422,29 @@ impl NemotronApp {
         egui::Panel::right("projekt").resizable(true).default_size(270.0).min_size(200.0).show(ui, |ui| {
             egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
                 ui.add_space(8.0);
-                ui.label(RichText::new(format!("📁 {name}")).strong().size(16.0));
+                ui.label(RichText::new(format!("{} {name}", if home { "🏠" } else { "📁" })).strong().size(16.0));
                 ui.add(egui::Label::new(RichText::new(root.display().to_string()).small().weak()).truncate())
                     .on_hover_text(root.display().to_string());
+                if home {
+                    ui.label(
+                        RichText::new("Nemotron arbeitet in deinem ganzen Benutzerordner: Downloads, Schreibtisch, Dokumente …")
+                            .small()
+                            .weak(),
+                    );
+                }
                 ui.horizontal_wrapped(|ui| {
-                    switch = ui.add_enabled(!busy, egui::Button::new("Wechseln")).clicked();
+                    switch = ui
+                        .add_enabled(!busy, egui::Button::new(if home { "Projekt öffnen" } else { "Wechseln" }))
+                        .clicked();
                     if ui.button("Im Finder").on_hover_text("Ordner im Dateimanager zeigen").clicked() {
                         Self::reveal_in_file_manager(&root);
                     }
-                    close = ui
-                        .add_enabled(!busy, egui::Button::new("Schließen"))
-                        .on_hover_text("Zurück zum reinen Chat")
-                        .clicked();
+                    if !home {
+                        close = ui
+                            .add_enabled(!busy, egui::Button::new("Schließen"))
+                            .on_hover_text("Zurück zum Benutzerordner")
+                            .clicked();
+                    }
                 });
                 ui.add_space(8.0);
                 ui.label(RichText::new("Nemotron darf").strong());
@@ -1512,10 +1529,10 @@ impl NemotronApp {
             let mut stop = false;
             let mut pick = false;
             let mut add_url = false;
-            let hint = if self.workspace.is_some() {
-                "Sag Nemotron, was im Projekt passieren soll … (Enter senden, Shift+Enter neue Zeile)"
+            let hint = if self.workspace.is_home() {
+                "Sag Nemotron, was passieren soll – z. B. „Räum meinen Downloads-Ordner auf“ … (Enter senden, Shift+Enter neue Zeile)"
             } else {
-                "Nachricht an Nemotron … (Enter senden, Shift+Enter neue Zeile)"
+                "Sag Nemotron, was im Projekt passieren soll … (Enter senden, Shift+Enter neue Zeile)"
             };
             // `horizontal` keeps the row as tall as its content; a free
             // layout here would stretch the panel over the whole window.
@@ -1682,7 +1699,9 @@ impl NemotronApp {
         let mut actions = Vec::new();
         widgets::welcome(
             ui,
-            self.workspace.as_ref().map(Workspace::name).as_deref(),
+            (!self.workspace.is_home())
+                .then(|| self.workspace.name())
+                .as_deref(),
             self.needs_api_key(),
             &mut actions,
         );
@@ -2530,7 +2549,7 @@ mod tests {
             state["messages"][1]["steps"][0]["content"],
             "Hallo vom Mac!"
         );
-        assert_eq!(state["workspace"], Value::Null);
+        assert_eq!(state["workspace"]["home"], true);
         assert_eq!(state["approval"], "AutoEdits");
         assert_eq!(app.messages[0].text, "Hi vom Handy");
     }

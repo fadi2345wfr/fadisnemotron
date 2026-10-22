@@ -111,10 +111,19 @@ pub fn welcome(
                 }
             }
             None => {
-                ui.label(RichText::new("Chat-Modus").size(18.0).strong());
-                ui.label("Damit Nemotron wie Antigravity direkt in deinen Dateien arbeitet, öffne einen Projektordner:");
+                ui.label(RichText::new("Nemotron arbeitet direkt auf deinem Mac").size(18.0).strong());
+                ui.label("Er sieht deinen Benutzerordner – Downloads, Schreibtisch, Dokumente – legt Ordner und Dateien an, räumt auf und führt Befehle aus.");
                 ui.add_space(8.0);
-                if ui.button(RichText::new("📁 Projektordner öffnen").size(16.0)).clicked() {
+                for prompt in [
+                    "Was liegt in meinem Downloads-Ordner? Sortiere es nach Art.",
+                    "Leg auf dem Schreibtisch einen Ordner „Rechnungen“ an und verschiebe alle PDFs mit „Rechnung“ im Namen aus Downloads hinein.",
+                ] {
+                    if ui.button(prompt).clicked() {
+                        actions.push(UiAction::UsePrompt(prompt.to_owned()));
+                    }
+                }
+                ui.add_space(8.0);
+                if ui.button(RichText::new("📁 Projektordner öffnen").size(16.0)).on_hover_text("Für Programmierprojekte: Nemotron arbeitet dann in diesem Ordner").clicked() {
                     actions.push(UiAction::OpenProject);
                 }
                 ui.add_space(8.0);
