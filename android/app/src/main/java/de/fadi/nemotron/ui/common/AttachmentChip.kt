@@ -67,6 +67,17 @@ fun AttachmentChip(attachment: Attachment, removable: Boolean, onRemove: () -> U
     }
 }
 
+/** Stands in for picked photos and videos that are still being read. */
+@Composable
+fun PendingChip() {
+    Box(
+        Modifier.size(CHIP_SIZE.dp).clip(RoundedCornerShape(8.dp)).background(MaterialTheme.colorScheme.surfaceVariant),
+        contentAlignment = Alignment.Center,
+    ) {
+        CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.5.dp)
+    }
+}
+
 @Composable
 private fun VideoPreview(video: VideoAttachment) {
     Box(Modifier.fillMaxSize()) {

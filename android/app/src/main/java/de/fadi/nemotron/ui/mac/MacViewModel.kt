@@ -177,16 +177,18 @@ class MacViewModel(
     /** Uploads the attachments, then sends; on failure text and attachments stay for another try. */
     fun send() {
         val api = api ?: return
-        val text = draft.trim()
+        val typed = draft
+        val text = typed.trim()
         val items = attachments.items.value
-        if (text.isEmpty() && items.isEmpty() || _state.value.sending) return
+        if (text.isEmpty() && items.isEmpty() || _state.value.sending || attachments.preparing.value > 0) return
         val uploads = items.map { it.upload ?: return }
         _state.update { it.copy(sending = true) }
         viewModelScope.launch {
             try {
                 api.send(text, upload(api, uploads))
-                draft = ""
-                attachments.clear()
+                // The field stays editable during a long upload; whatever was typed meanwhile stays.
+                draft = draftAfterSending(draft, typed)
+                items.forEach { attachments.remove(it.key) }
             } catch (e: RemoteException) {
                 showMessage(e.message)
             } finally {
@@ -250,9 +252,18 @@ class MacViewModel(
         if (message != null) _state.update { it.copy(message = message) }
     }
 
-    /** Chats cannot change while an answer runs; saying so right away beats a round trip. */
+    /**
+     * Chats cannot change while an answer runs; saying so right away beats a
+     * round trip. Nor while a message is still uploading: the Mac puts it
+     * into whichever chat is open once the upload is done.
+     */
     private fun whenIdle(action: suspend (RemoteApi) -> Unit) {
-        if (_state.value.remote?.busy == true) showMessage(RemoteApi.BUSY) else act(action)
+        val state = _state.value
+        when {
+            state.sending -> showMessage(STILL_SENDING)
+            state.remote?.busy == true -> showMessage(RemoteApi.BUSY)
+            else -> act(action)
+        }
     }
 
     private fun act(action: suspend (RemoteApi) -> Unit) {
@@ -271,6 +282,7 @@ class MacViewModel(
     companion object {
         private const val MIN_BACKOFF_MS = 2_000L
         private const val MAX_BACKOFF_MS = 10_000L
+        private const val STILL_SENDING = "Die Nachricht wird noch gesendet."
 
         val Factory = viewModelFactory {
             initializer {
@@ -280,3 +292,10 @@ class MacViewModel(
         }
     }
 }
+
+/**
+ * The text field after [sent] went out: empty, or what was typed after it
+ * while it was on its way. If [sent] was edited meanwhile, all is kept.
+ */
+internal fun draftAfterSending(draft: String, sent: String): String =
+    if (draft.startsWith(sent)) draft.substring(sent.length).trimStart() else draft

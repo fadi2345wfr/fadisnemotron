@@ -8,6 +8,7 @@ import de.fadi.nemotron.data.Upload
 import de.fadi.nemotron.data.UploadBody
 import de.fadi.nemotron.data.VideoEncoder
 import de.fadi.nemotron.data.VideoInfo
+import de.fadi.nemotron.data.VideoTooBigException
 import java.io.File
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
@@ -62,6 +63,11 @@ class Attachments(
     private val _items = MutableStateFlow<List<Attachment>>(emptyList())
     val items: StateFlow<List<Attachment>> = _items.asStateFlow()
 
+    private val _preparing = MutableStateFlow(0)
+
+    /** Picks still being read; their attachments are not in [items] yet, so nothing may be sent. */
+    val preparing: StateFlow<Int> = _preparing.asStateFlow()
+
     private val shrinking = mutableMapOf<Long, Job>()
     private val encoder = Mutex()
     private var nextKey = 0L
@@ -71,6 +77,7 @@ class Attachments(
     }
 
     fun add(uris: List<Uri>) {
+        _preparing.update { it + 1 }
         scope.launch {
             // One after the other, so they keep the order they were picked in.
             for (uri in uris) {
@@ -80,7 +87,7 @@ class Attachments(
                 }
                 if (videos.isVideo(uri)) addVideo(uri) else addPhoto(uri)
             }
-        }
+        }.invokeOnCompletion { _preparing.update { it - 1 } }
     }
 
     private suspend fun addPhoto(uri: Uri) {
@@ -124,24 +131,38 @@ class Attachments(
             val file = encoder.withLock {
                 videos.transcode(uri, info) { percent -> updateVideo(key) { it.copy(progress = percent) } }
             }
-            if (file.length() > VideoEncoder.MAX_BYTES) {
-                file.delete()
-                drop(key, TOO_BIG)
-            } else {
-                ready(key, Upload(videos.shrunkName(info), "video/mp4", UploadBody.of(file)), file)
+            val original = videos.original(uri, info)?.takeIf { info.size <= VideoEncoder.MAX_BYTES }
+            when {
+                // Encoders can overshoot on an already lean clip; then the original is the better upload.
+                original != null && file.length() > info.size -> {
+                    file.delete()
+                    ready(key, original, file = null)
+                }
+                file.length() > VideoEncoder.MAX_BYTES -> {
+                    file.delete()
+                    drop(key, TOO_BIG)
+                }
+                else -> ready(key, Upload(videos.shrunkName(info), "video/mp4", UploadBody.of(file)), file)
             }
         } catch (e: CancellationException) {
             throw e
+        } catch (e: VideoTooBigException) {
+            useOriginal(key, uri, info, failure = TOO_BIG)
         } catch (e: Exception) {
             // Usually a codec this phone cannot decode; the Mac may still take the original.
-            val original = videos.original(uri, info)
-            when {
-                original == null -> drop(key, "Dieses Video lässt sich nicht umwandeln. Bitte als MP4 aufnehmen.")
-                info.size > VideoEncoder.MAX_BYTES -> drop(key, TOO_BIG)
-                else -> ready(key, original, file = null)
-            }
+            useOriginal(key, uri, info, failure = "Dieses Video lässt sich nicht umwandeln. Bitte als MP4 aufnehmen.")
         } finally {
             shrinking.remove(key)
+        }
+    }
+
+    /** The picked file unchanged, if the Mac takes it; otherwise the video is dropped with [failure]. */
+    private fun useOriginal(key: Long, uri: Uri, info: VideoInfo, failure: String) {
+        val original = videos.original(uri, info)
+        when {
+            original == null -> drop(key, failure)
+            info.size > VideoEncoder.MAX_BYTES -> drop(key, TOO_BIG)
+            else -> ready(key, original, file = null)
         }
     }
 
@@ -166,7 +187,7 @@ class Attachments(
         _items.getAndUpdate { items -> items.filterNot { it.key == key } }.find { it.key == key }?.deleteFile()
     }
 
-    /** After sending, and when the screen goes away for good: also deletes the shrunk copies. */
+    /** When the screen goes away for good: also deletes the shrunk copies. */
     fun clear() {
         // Copied first: a cancelled job may run its cleanup, which edits the map, right inside cancel().
         val jobs = shrinking.values.toList()

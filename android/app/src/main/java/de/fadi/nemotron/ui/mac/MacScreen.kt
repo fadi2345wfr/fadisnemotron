@@ -222,10 +222,18 @@ private fun ChatTitle(remote: RemoteState?, macName: String) {
 private fun Conversation(viewModel: MacViewModel, state: MacUiState, macName: String, modifier: Modifier) {
     val remote = state.remote
     val attachments by viewModel.attachments.items.collectAsStateWithLifecycle()
+    val preparing by viewModel.attachments.preparing.collectAsStateWithLifecycle()
     val chat = rememberChatListState()
     val chatId = remote?.chat?.id
     // The Mac may switch chats too; the phone follows and starts at the end of the new one.
-    LaunchedEffect(chatId) { chat.jumpToEnd() }
+    // Remembered across rotation, which must not lose the reading position in the same chat.
+    var shownChatId by rememberSaveable { mutableStateOf(chatId) }
+    LaunchedEffect(chatId) {
+        if (chatId != shownChatId) {
+            shownChatId = chatId
+            chat.jumpToEnd()
+        }
+    }
 
     if (state.connectionLost) {
         Banner(stringResource(R.string.connection_lost), MaterialTheme.colorScheme.errorContainer)
@@ -263,6 +271,7 @@ private fun Conversation(viewModel: MacViewModel, state: MacUiState, macName: St
         text = viewModel.draft,
         onTextChange = { viewModel.draft = it },
         attachments = attachments,
+        preparing = preparing > 0,
         onAddMedia = viewModel.attachments::add,
         onRemoveAttachment = { viewModel.attachments.remove(it.key) },
         busy = remote?.busy == true,

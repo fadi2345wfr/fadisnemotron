@@ -1,5 +1,9 @@
 package de.fadi.nemotron.data
 
+import java.io.FileNotFoundException
+import java.io.InterruptedIOException
+import java.net.SocketTimeoutException
+import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -9,7 +13,11 @@ import kotlinx.serialization.json.jsonPrimitive
 import mockwebserver3.MockResponse
 import mockwebserver3.MockWebServer
 import mockwebserver3.RecordedRequest
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
 import org.junit.After
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
@@ -113,6 +121,60 @@ class RemoteApiTest {
         assertEquals(413, error.status)
         assertEquals("Das Video ist größer als 100 MB.", error.message)
     }
+
+    @Test
+    fun `a big upload gets time for a slow link`() = runBlocking {
+        var timeoutNanos = 0L
+        val slow = api(Interceptor { chain ->
+            timeoutNanos = chain.call().timeout().timeoutNanos()
+            fakeAnswer(chain, """{"id": "up-1", "kind": "video", "size": 1}""")
+        })
+        val length = 100L * 1024 * 1024
+
+        slow.upload("lang.mp4", "video/mp4", UploadBody(length) { error("nicht gesendet") })
+
+        val secondsAtOneMegabit = length * 8 / 1_000_000
+        assertTrue(TimeUnit.NANOSECONDS.toSeconds(timeoutNanos) > secondsAtOneMegabit)
+    }
+
+    @Test
+    fun `an upload that runs out of time blames the slow link, not the Mac`() {
+        // Stands in for OkHttp's whole-call timeout, which ends a call with exactly this exception.
+        val cutOff = api(Interceptor { throw InterruptedIOException("timeout") })
+        val stalled = api(Interceptor { throw SocketTimeoutException("timeout") })
+
+        val slow = assertThrows(RemoteException::class.java) {
+            runBlocking { cutOff.upload("clip.mp4", "video/mp4", UploadBody.of(ByteArray(10))) }
+        }
+        assertEquals(RemoteApi.UPLOAD_TOO_SLOW, slow.message)
+        val gone = assertThrows(RemoteException::class.java) {
+            runBlocking { stalled.upload("clip.mp4", "video/mp4", UploadBody.of(ByteArray(10))) }
+        }
+        assertEquals(RemoteApi.UNREACHABLE, gone.message)
+    }
+
+    @Test
+    fun `a video file that is gone is named instead of blaming the network`() {
+        val missing = UploadBody(10) { throw FileNotFoundException("/cache/videos/weg.mp4") }
+
+        val error = assertThrows(RemoteException::class.java) {
+            runBlocking { api.upload("Urlaub.mp4", "video/mp4", missing) }
+        }
+
+        assertNull(error.status)
+        assertEquals("„Urlaub.mp4“ ist nicht mehr verfügbar – bitte entfernen und neu anhängen.", error.message)
+    }
+
+    private fun api(interceptor: Interceptor) =
+        RemoteApi(mac.url("/").toString(), "geheim123", OkHttpClient.Builder().addInterceptor(interceptor).build())
+
+    private fun fakeAnswer(chain: Interceptor.Chain, json: String): Response = Response.Builder()
+        .request(chain.request())
+        .protocol(Protocol.HTTP_1_1)
+        .code(200)
+        .message("OK")
+        .body(json.toResponseBody())
+        .build()
 
     @Test
     fun `sends text with the upload ids`() = runBlocking {

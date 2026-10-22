@@ -31,6 +31,9 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import okio.source
 
+/** The shrunk video would be larger than the Mac takes. */
+class VideoTooBigException : Exception()
+
 /** A picked video, read from its metadata without decoding it. */
 class VideoInfo(
     val name: String,
@@ -46,8 +49,8 @@ class VideoInfo(
 )
 
 /**
- * Shrinks picked videos for the Mac: MP4 with H.264 and AAC, at most 720p,
- * about 2 Mbit/s. The work runs on Transformer's own threads; it is only
+ * Shrinks picked videos for the Mac: MP4 with H.264 and AAC, at most 720p
+ * and 2 Mbit/s. The work runs on Transformer's own threads; it is only
  * driven from the main thread, as Transformer requires.
  */
 @OptIn(UnstableApi::class)
@@ -93,8 +96,14 @@ class VideoEncoder(private val context: Context) {
     /**
      * Writes the shrunk video to the app's cache and returns it; the caller
      * deletes it. [onProgress] gets percent. Cancelling stops the encoder.
+     * Throws [VideoTooBigException] as soon as the result would clearly be
+     * over [MAX_BYTES], before the whole clip is encoded for nothing.
      */
     suspend fun transcode(uri: Uri, info: VideoInfo, onProgress: (Int) -> Unit): File {
+        val target = targetSize(info)
+        val bitrate = videoBitrate(target ?: VideoSize(MAX_VIDEO_SIDE, 720), averageBitrate(info.size, info.durationMs))
+        // Encoders miss their target in both directions, so only refuse up front with a wide margin.
+        if (estimatedVideoBytes(info.durationMs, bitrate, info.hasAudio) > MAX_BYTES * 3 / 2) throw VideoTooBigException()
         val output = withContext(Dispatchers.IO) {
             cache.mkdirs()
             File(cache, "${UUID.randomUUID()}.mp4")
@@ -106,7 +115,7 @@ class VideoEncoder(private val context: Context) {
                 .setAudioMimeType(MimeTypes.AUDIO_AAC)
                 .setEncoderFactory(
                     DefaultEncoderFactory.Builder(context)
-                        .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(BITRATE).build())
+                        .setRequestedVideoEncoderSettings(VideoEncoderSettings.Builder().setBitrate(bitrate).build())
                         .build(),
                 )
                 .addListener(object : Transformer.Listener {
@@ -120,12 +129,13 @@ class VideoEncoder(private val context: Context) {
                 })
                 .build()
             try {
-                transformer.start(composition(uri, info), output.path)
+                transformer.start(composition(uri, info, target), output.path)
                 val progress = ProgressHolder()
                 while (withTimeoutOrNull(PROGRESS_INTERVAL_MS) { result.await() } == null) {
                     if (transformer.getProgress(progress) == Transformer.PROGRESS_STATE_AVAILABLE) {
                         onProgress(progress.progress)
                     }
+                    if (withContext(Dispatchers.IO) { output.length() } > MAX_BYTES) throw VideoTooBigException()
                 }
                 output
             } catch (e: Throwable) {
@@ -137,9 +147,12 @@ class VideoEncoder(private val context: Context) {
         }
     }
 
-    private fun composition(uri: Uri, info: VideoInfo): Composition {
-        val effects = if (info.width > 0 && info.height > 0) {
-            val target = videoTargetSize(info.width, info.height)
+    /** Null if the metadata does not tell the size. */
+    private fun targetSize(info: VideoInfo): VideoSize? =
+        if (info.width > 0 && info.height > 0) videoTargetSize(info.width, info.height) else null
+
+    private fun composition(uri: Uri, info: VideoInfo, target: VideoSize?): Composition {
+        val effects = if (target != null) {
             Effects(emptyList(), listOf(Presentation.createForWidthAndHeight(target.width, target.height, Presentation.LAYOUT_SCALE_TO_FIT)))
         } else {
             Effects.EMPTY
@@ -158,8 +171,8 @@ class VideoEncoder(private val context: Context) {
     fun shrunkName(info: VideoInfo): String = "${info.name.substringBeforeLast('.').ifBlank { "video" }}.mp4"
 
     /**
-     * The picked file as it is, for when it cannot be shrunk: only in a
-     * format the Mac takes, and only if its size is known.
+     * The picked file as it is, for when shrinking fails or does not help:
+     * only in a format the Mac takes, and only if its size is known.
      */
     fun original(uri: Uri, info: VideoInfo): Upload? {
         val extension = ORIGINAL_FORMATS[info.mimeType] ?: return null
@@ -183,7 +196,6 @@ class VideoEncoder(private val context: Context) {
     companion object {
         /** The Mac refuses larger videos. */
         const val MAX_BYTES = 100L * 1024 * 1024
-        private const val BITRATE = 2_000_000
         private const val PROGRESS_INTERVAL_MS = 300L
         private val ORIGINAL_FORMATS = mapOf("video/mp4" to "mp4", "video/quicktime" to "mov", "video/webm" to "webm")
     }

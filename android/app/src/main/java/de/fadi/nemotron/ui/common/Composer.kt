@@ -37,14 +37,16 @@ import de.fadi.nemotron.R
 
 /**
  * The input row: text, photos and videos, and Send, which turns into Stop
- * while Nemotron is busy. [sending] shows a message on its way, with the
- * [upload] progress of its attachments.
+ * while Nemotron is busy. [preparing] means picked media are still being
+ * read. [sending] shows a message on its way, with the [upload] progress of
+ * its attachments.
  */
 @Composable
 fun Composer(
     text: String,
     onTextChange: (String) -> Unit,
     attachments: List<Attachment>,
+    preparing: Boolean,
     onAddMedia: (List<Uri>) -> Unit,
     onRemoveAttachment: (Attachment) -> Unit,
     busy: Boolean,
@@ -58,11 +60,11 @@ fun Composer(
         ActivityResultContracts.PickMultipleVisualMedia(Attachments.MAX_ITEMS),
     ) { uris -> if (uris.isNotEmpty()) onAddMedia(uris) }
     val shrinking = attachments.any { it.upload == null }
-    val canSend = !busy && !sending && !shrinking && (text.isNotBlank() || attachments.isNotEmpty())
+    val canSend = !busy && !sending && !preparing && !shrinking && (text.isNotBlank() || attachments.isNotEmpty())
 
     Surface(color = MaterialTheme.colorScheme.surfaceContainerLow, modifier = modifier.fillMaxWidth()) {
         Column(Modifier.padding(horizontal = 8.dp, vertical = 8.dp)) {
-            if (attachments.isNotEmpty()) {
+            if (attachments.isNotEmpty() || preparing) {
                 Row(
                     Modifier.horizontalScroll(rememberScrollState()).padding(start = 8.dp, bottom = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -72,6 +74,7 @@ fun Composer(
                             AttachmentChip(attachment, removable = !sending, onRemove = { onRemoveAttachment(attachment) })
                         }
                     }
+                    if (preparing) PendingChip()
                 }
             }
             if (upload != null) UploadStatus(upload)

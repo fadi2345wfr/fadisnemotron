@@ -1,6 +1,9 @@
 package de.fadi.nemotron.data
 
+import java.io.FileNotFoundException
 import java.io.IOException
+import java.io.InterruptedIOException
+import java.net.SocketTimeoutException
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -31,11 +34,10 @@ class RemoteApi(baseUrl: String, private val token: String, http: OkHttpClient) 
         .build()
     private val pingClient = client.newBuilder().callTimeout(4, TimeUnit.SECONDS).build()
 
-    // Room for 100 MB over a slow mobile link; a stalled one still fails after two minutes.
+    // A stalled link fails after two minutes; see uploadTimeoutMillis for one that is just slow.
     private val uploadClient = client.newBuilder()
         .writeTimeout(2, TimeUnit.MINUTES)
         .readTimeout(2, TimeUnit.MINUTES)
-        .callTimeout(10, TimeUnit.MINUTES)
         .build()
 
     suspend fun ping(): Ping = decode(execute(pingClient, request("ping")))
@@ -61,7 +63,10 @@ class RemoteApi(baseUrl: String, private val token: String, http: OkHttpClient) 
     ): UploadResult {
         val request = request("upload") { addQueryParameter("name", name) }
             .post(ProgressRequestBody(contentType.toMediaTypeOrNull(), body, onProgress))
-        val result = decode<UploadResult>(execute(uploadClient, request))
+        val client = uploadClient.newBuilder()
+            .callTimeout(uploadTimeoutMillis(body.length), TimeUnit.MILLISECONDS)
+            .build()
+        val result = decode<UploadResult>(execute(client, request) { uploadFailure(name, it) })
         if (result.id.isBlank()) throw RemoteException(null, UNREADABLE)
         return result
     }
@@ -110,7 +115,12 @@ class RemoteApi(baseUrl: String, private val token: String, http: OkHttpClient) 
         }
     }
 
-    private suspend fun execute(client: OkHttpClient, request: Request.Builder): String = try {
+    /** [failure] words an [IOException], which usually means the Mac cannot be reached. */
+    private suspend fun execute(
+        client: OkHttpClient,
+        request: Request.Builder,
+        failure: (IOException) -> String = { UNREACHABLE },
+    ): String = try {
         client.newCall(request.build()).await { response ->
             val body = response.body.string()
             if (!response.isSuccessful) throw remoteError(response.code, body)
@@ -119,7 +129,7 @@ class RemoteApi(baseUrl: String, private val token: String, http: OkHttpClient) 
     } catch (e: IOException) {
         // A cancelled poll also ends up here; that is not a connection problem.
         currentCoroutineContext().ensureActive()
-        throw RemoteException(null, UNREACHABLE)
+        throw RemoteException(null, failure(e))
     }
 
     private inline fun <reified T> decode(body: String): T = try {
@@ -136,9 +146,28 @@ class RemoteApi(baseUrl: String, private val token: String, http: OkHttpClient) 
         const val MAC_TOO_OLD = "Die Mac-App ist zu alt – bitte auf Version 0.4 aktualisieren."
         const val UNREACHABLE =
             "Mac nicht erreichbar. Gleiches WLAN oder Tailscale prüfen – ist der Fernzugriff am Mac an?"
+        const val UPLOAD_TOO_SLOW =
+            "Das Hochladen dauert zu lange – die Verbindung ist zu langsam. Bitte ein kürzeres Video senden."
         private const val UNREADABLE = "Die Antwort des Macs ist unverständlich. Sind beide Apps aktuell?"
         private val JSON = "application/json; charset=utf-8".toMediaType()
     }
+}
+
+/**
+ * The whole-call limit for uploading [length] bytes: time for about 256 kbit/s
+ * plus the Mac's answer, so a slow but working link is not cut off midway.
+ */
+internal fun uploadTimeoutMillis(length: Long): Long = UPLOAD_ANSWER_MS + length * 1000 / MIN_UPLOAD_BYTES_PER_SECOND
+
+private const val UPLOAD_ANSWER_MS = 2 * 60 * 1000L
+private const val MIN_UPLOAD_BYTES_PER_SECOND = 32 * 1000L
+
+private fun uploadFailure(name: String, e: IOException): String = when {
+    // The picked video was deleted, or Android cleared the cache with the shrunk copy.
+    e is FileNotFoundException -> "„$name“ ist nicht mehr verfügbar – bitte entfernen und neu anhängen."
+    // OkHttp reports the whole-call limit this way; a socket timeout means the Mac stopped answering.
+    e is InterruptedIOException && e !is SocketTimeoutException -> RemoteApi.UPLOAD_TOO_SLOW
+    else -> RemoteApi.UNREACHABLE
 }
 
 /** Turns an HTTP error into a message; the Mac's own `{"error": …}` text wins where it makes sense. */
