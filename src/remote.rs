@@ -13,6 +13,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -47,6 +48,10 @@ const BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a request waits for the app to handle a command.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+/// The Android app as it lies in the Mac app's bundle.
+pub const APP_FILE_NAME: &str = "FadisNemotron.apk";
+/// A phone that takes longer than this to load the app is cut off.
+const APP_DOWNLOAD_LIMIT: Duration = Duration::from_secs(10 * 60);
 
 /// Something the phone asks the app to do.
 #[derive(Debug)]
@@ -120,6 +125,10 @@ struct Shared {
     /// Photos are scaled to this size when they arrive.
     max_image_dim: AtomicU32,
     last_seen: Mutex<Option<(Instant, String)>>,
+    /// The Android app, offered for download without a key: a phone that has
+    /// not got the app yet cannot know the key.
+    app_file: Mutex<Option<PathBuf>>,
+    app_downloads: AtomicUsize,
 }
 
 /// A place among the requests being served; freed even if the thread panics.
@@ -208,6 +217,8 @@ impl RemoteServer {
             body_bytes: AtomicUsize::new(0),
             max_image_dim: AtomicU32::new(crate::config::DEFAULT_MAX_IMAGE_DIM),
             last_seen: Mutex::new(None),
+            app_file: Mutex::new(None),
+            app_downloads: AtomicUsize::new(0),
         });
         let (tx, commands) = mpsc::channel();
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
@@ -276,6 +287,37 @@ impl RemoteServer {
     pub fn set_max_image_dim(&self, dim: u32) {
         self.shared.max_image_dim.store(dim, Ordering::Relaxed);
     }
+
+    /// Offers the Android app at `/` (a page with a button) and
+    /// `/FadisNemotron.apk`, for phones on the same network.
+    pub fn offer_app(&self, file: Option<PathBuf>) {
+        *self
+            .shared
+            .app_file
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = file;
+    }
+
+    /// How many times the whole app has been loaded since the server started.
+    pub fn app_downloads(&self) -> usize {
+        self.shared.app_downloads.load(Ordering::Relaxed)
+    }
+}
+
+/// The Android app that came with this Mac app: in the bundle's `Resources`
+/// folder (or next to the program, or named by `FADIS_APK`).
+pub fn bundled_app_file() -> Option<PathBuf> {
+    let named = std::env::var_os("FADIS_APK").map(PathBuf::from);
+    let beside = std::env::current_exe().ok().and_then(|exe| {
+        let dir = exe.parent()?.to_path_buf();
+        [
+            dir.join("..").join("Resources").join(APP_FILE_NAME),
+            dir.join(APP_FILE_NAME),
+        ]
+        .into_iter()
+        .find(|p| p.is_file())
+    });
+    named.filter(|p| p.is_file()).or(beside)
 }
 
 impl Drop for RemoteServer {
@@ -461,11 +503,22 @@ fn serve(
             deadline: Some(Instant::now() + HEAD_TIMEOUT),
         },
     );
-    let (status, body) = match read_head(&mut reader) {
-        Ok(head) => route(&head, &mut reader, &stream, peer, shared, commands, wake),
-        Err(answer) => answer,
+    let answer = match read_head(&mut reader) {
+        Ok(head) if serve_public(&stream, &head, shared) => None,
+        Ok(head) => Some(route(
+            &head,
+            &mut reader,
+            &stream,
+            peer,
+            shared,
+            commands,
+            wake,
+        )),
+        Err(answer) => Some(answer),
     };
-    write_json(&stream, status, &body);
+    if let Some((status, body)) = answer {
+        write_json(&stream, status, &body);
+    }
     // Tell the client the answer is complete; it then closes its side too.
     let _ = stream.shutdown(Shutdown::Write);
     // An answer sent before the body was read (401, 413) must not be lost to
@@ -475,8 +528,8 @@ fn serve(
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-fn write_json(mut stream: &TcpStream, status: u16, body: &Value) {
-    let reason = match status {
+fn status_text(status: u16) -> &'static str {
+    match status {
         200 => "OK",
         400 => "Bad Request",
         401 => "Unauthorized",
@@ -489,16 +542,147 @@ fn write_json(mut stream: &TcpStream, status: u16, body: &Value) {
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "Error",
-    };
-    let body = body.to_string();
+    }
+}
+
+fn write_response(mut stream: &TcpStream, status: u16, content_type: &str, body: &[u8]) {
     let head = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status} {}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        status_text(status),
         body.len()
     );
     let _ = stream
         .write_all(head.as_bytes())
-        .and_then(|()| stream.write_all(body.as_bytes()))
+        .and_then(|()| stream.write_all(body))
         .and_then(|()| stream.flush());
+}
+
+fn write_json(stream: &TcpStream, status: u16, body: &Value) {
+    write_response(
+        stream,
+        status,
+        "application/json; charset=utf-8",
+        body.to_string().as_bytes(),
+    );
+}
+
+/// The pages a phone may fetch without the key: the install page and the
+/// Android app itself. Everything else needs the key.
+fn serve_public(stream: &TcpStream, head: &Head, shared: &Shared) -> bool {
+    if head.method != "GET" {
+        return false;
+    }
+    let path = head.target.split(['?', '#']).next().unwrap_or("");
+    match path {
+        "/" | "/installieren" => {
+            let has_app = shared
+                .app_file
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some();
+            write_response(
+                stream,
+                200,
+                "text/html; charset=utf-8",
+                install_page(has_app).as_bytes(),
+            );
+            true
+        }
+        "/FadisNemotron.apk" => {
+            send_app(stream, shared);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn install_page(has_app: bool) -> String {
+    let steps = if has_app {
+        format!(
+            r#"<a class="knopf" href="/{APP_FILE_NAME}">Fadis Nemotron laden</a>
+<ol>
+<li>Tippe auf den grünen Knopf und lade die Datei.</li>
+<li>Öffne die geladene Datei. Fragt Android nach „Installieren aus dieser Quelle“, erlaube es einmal.</li>
+<li>Öffne die App und tippe auf „QR-Code scannen“. Scanne den Code im Fenster „Fernzugriff fürs Handy“ am Mac (Schritt 2).</li>
+</ol>"#
+        )
+    } else {
+        r#"<p>Diese Mac-App enthält die Android-App nicht. Lade sie hier:</p>
+<a class="knopf" href="https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron.apk">FadisNemotron.apk von GitHub</a>"#
+            .to_owned()
+    };
+    format!(
+        r#"<!doctype html>
+<html lang="de"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Fadis Nemotron aufs Handy</title>
+<style>
+body{{margin:0;padding:24px;background:#10151c;color:#e8edf3;font:17px/1.5 system-ui,sans-serif}}
+main{{max-width:30em;margin:auto}}
+h1{{font-size:1.5em;margin:.2em 0}}
+a.knopf{{display:block;text-align:center;background:#76b900;color:#000;font-weight:700;padding:16px;border-radius:12px;text-decoration:none;margin:22px 0}}
+li{{margin:.5em 0}} small{{color:#9aa7b4}}
+</style></head><body><main>
+<h1>Fadis Nemotron aufs Handy</h1>
+<p>Die Android-App steuert den Mac: Aufträge, Antworten, Freigaben, Fotos und Videos.</p>
+{steps}
+<small>Mac-App {}</small>
+</main></body></html>"#,
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+/// Sends the Android app from the file, not from memory.
+fn send_app(stream: &TcpStream, shared: &Shared) {
+    let path = shared
+        .app_file
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let opened = path
+        .and_then(|p| std::fs::File::open(p).ok())
+        .and_then(|f| f.metadata().ok().map(|m| (f, m.len())))
+        .filter(|(_, len)| *len > 0);
+    let Some((file, len)) = opened else {
+        write_response(
+            stream,
+            404,
+            "text/plain; charset=utf-8",
+            "Diese Mac-App enthält die Android-App nicht.".as_bytes(),
+        );
+        return;
+    };
+    let mut out = stream;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.android.package-archive\r\nContent-Disposition: attachment; filename=\"{APP_FILE_NAME}\"\r\nContent-Length: {len}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n"
+    );
+    if out.write_all(head.as_bytes()).is_err() {
+        return;
+    }
+    let started = Instant::now();
+    let mut file = file.take(len);
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut sent = 0u64;
+    loop {
+        if started.elapsed() > APP_DOWNLOAD_LIMIT || shared.stopping.load(Ordering::Relaxed) {
+            return;
+        }
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if out.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+                sent += n as u64;
+            }
+            Err(_) => return,
+        }
+    }
+    let _ = out.flush();
+    // Only a complete file counts as "loaded".
+    if sent == len {
+        shared.app_downloads.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 fn route(
@@ -932,6 +1116,17 @@ pub fn is_tailscale(addr: Ipv4Addr) -> bool {
     a == 100 && (64..128).contains(&b)
 }
 
+/// The address the phone opens to load the app: the home network first, as
+/// a phone that is still without the app is most likely at home.
+pub fn install_url(addrs: &[Ipv4Addr], port: u16) -> Option<String> {
+    let addr = addrs
+        .iter()
+        .find(|a| a.is_private() && !is_tailscale(**a))
+        .or_else(|| addrs.iter().find(|a| !is_tailscale(**a)))
+        .or(addrs.first())?;
+    Some(format!("http://{addr}:{port}/"))
+}
+
 /// The QR code content the Android app scans.
 pub fn pairing_payload(name: &str, port: u16, token: &str, addrs: &[Ipv4Addr]) -> String {
     let urls: Vec<String> = addrs.iter().map(|a| format!("http://{a}:{port}")).collect();
@@ -1277,6 +1472,85 @@ mod tests {
     }
 
     #[test]
+    fn the_phone_can_load_the_app_without_a_key_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("fadis-apk-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let apk = dir.join(APP_FILE_NAME);
+        let content: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&apk, &content).unwrap();
+
+        let (server, client) = start();
+        let port = server.port();
+        // Without an app in the bundle the page says so and the file is not there.
+        let page = raw(port, b"GET / HTTP/1.1\r\n\r\n");
+        assert!(page.starts_with("HTTP/1.1 200") && page.contains("enthält die Android-App nicht"));
+        assert!(raw(port, b"GET /FadisNemotron.apk HTTP/1.1\r\n\r\n").starts_with("HTTP/1.1 404"));
+
+        server.offer_app(Some(apk.clone()));
+        let page = raw(port, b"GET /?x=1 HTTP/1.1\r\n\r\n");
+        assert!(page.starts_with("HTTP/1.1 200"), "{page}");
+        assert!(page.contains("text/html") && page.contains("href=\"/FadisNemotron.apk\""));
+        assert!(
+            !page.contains("geheim123"),
+            "the key must not appear in a public page"
+        );
+
+        let mut res = client
+            .agent
+            .get(format!("{}/FadisNemotron.apk", client.base))
+            .call()
+            .unwrap();
+        assert_eq!(res.status().as_u16(), 200);
+        assert_eq!(
+            res.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("application/vnd.android.package-archive")
+        );
+        let body = res
+            .body_mut()
+            .with_config()
+            .limit(10_000_000)
+            .read_to_vec()
+            .unwrap();
+        assert_eq!(body, content);
+        for _ in 0..50 {
+            if server.app_downloads() == 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(server.app_downloads(), 1);
+
+        // A phone that gives up half way has not loaded the app.
+        {
+            let mut s = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            s.write_all(b"GET /FadisNemotron.apk HTTP/1.1\r\n\r\n")
+                .unwrap();
+            let mut some = [0u8; 1024];
+            s.read_exact(&mut some).unwrap();
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(server.app_downloads() <= 2);
+
+        // Everything else still needs the key, also under the same prefix,
+        // and only GET is public.
+        for request in [
+            "GET /api/v1/state HTTP/1.1\r\n\r\n",
+            "GET /FadisNemotron.apk/../api/v1/state HTTP/1.1\r\n\r\n",
+            "GET /etc/passwd HTTP/1.1\r\n\r\n",
+            "POST / HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}",
+            "POST /FadisNemotron.apk HTTP/1.1\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let answer = raw(port, request.as_bytes());
+            assert!(answer.starts_with("HTTP/1.1 401"), "{request}: {answer}");
+        }
+        assert!(ping_works(&client));
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn strangers_cannot_crash_or_clog_the_server() {
         let (server, client) = start();
         let port = server.port();
@@ -1448,6 +1722,18 @@ mod tests {
             json!(["http://100.64.0.1:7878", "http://192.168.0.5:7878"])
         );
         assert_eq!(payload["fadis"], 1);
+        // The install page is opened over the home network, if there is one.
+        let tailscale = Ipv4Addr::new(100, 64, 0, 1);
+        let home = Ipv4Addr::new(192, 168, 0, 5);
+        assert_eq!(
+            install_url(&[tailscale, home], 7878).as_deref(),
+            Some("http://192.168.0.5:7878/")
+        );
+        assert_eq!(
+            install_url(&[tailscale], 7878).as_deref(),
+            Some("http://100.64.0.1:7878/")
+        );
+        assert_eq!(install_url(&[], 7878), None);
         assert!(!device_name().is_empty());
         assert!(
             constant_time_eq(b"abc", b"abc")

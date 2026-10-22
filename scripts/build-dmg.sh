@@ -3,6 +3,11 @@
 #
 #   ./scripts/build-dmg.sh                         # Intel (x86_64), the default
 #   TARGET=aarch64-apple-darwin ./scripts/build-dmg.sh   # Apple Silicon
+#   APK=path/to/FadisNemotron.apk ./scripts/build-dmg.sh  # with the Android app inside
+#
+# With APK the Android app goes into the app bundle (Contents/Resources), and
+# the Mac app hands it to the phone: no download from GitHub needed. In CI the
+# APK is required (REQUIRE_APK=1), so a DMG without it cannot be published.
 #
 # The result lands in dist/.
 set -euo pipefail
@@ -46,6 +51,20 @@ for size in 16 32 128 256 512; do
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 rm -rf "$ICONSET"
+
+echo "==> Android-App einpacken"
+APK="${APK:-}"
+if [ -n "$APK" ]; then
+  # A relative path counts from the repository root.
+  [ -f "$APK" ] || { echo "APK nicht gefunden: $APK" >&2; exit 1; }
+  [ "$(wc -c < "$APK")" -gt 1000000 ] || { echo "APK ist verdächtig klein: $APK" >&2; exit 1; }
+  cp "$APK" "$APP/Contents/Resources/FadisNemotron.apk"
+elif [ "${REQUIRE_APK:-0}" = "1" ]; then
+  echo "REQUIRE_APK=1, aber APK ist nicht gesetzt." >&2
+  exit 1
+else
+  echo "Ohne Android-App (APK nicht gesetzt): die Mac-App verweist dann auf GitHub."
+fi
 
 echo "==> Architektur prüfen"
 ARCHS="$(lipo -archs "$APP/Contents/MacOS/$BIN")"

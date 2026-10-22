@@ -19,10 +19,10 @@ gh api -X PATCH "repos/$repo/git/refs/tags/$tag" -f sha="$sha" -F force=true >/d
 
 notes="Immer die neueste Version (Commit ${sha:0:7}).
 
-- **Android:** [FadisNemotron.apk](https://github.com/$repo/releases/download/$tag/FadisNemotron.apk) – auf dem Handy öffnen und installieren (einmal „Installieren aus unbekannten Quellen“ erlauben). Neue Versionen installieren sich über die alte.
-- **Mac (Intel):** [FadisNemotron-Intel.dmg](https://github.com/$repo/releases/download/$tag/FadisNemotron-Intel.dmg) – öffnen und die App in „Programme“ ziehen.
+- **Mac (Intel):** [FadisNemotron-Intel.dmg](https://github.com/$repo/releases/download/$tag/FadisNemotron-Intel.dmg) – öffnen und die App in „Programme“ ziehen. Die Android-App steckt schon drin: Die Mac-App zeigt beim ersten Start einen QR-Code, mit dem das Handy sie direkt vom Mac lädt.
+- **Android einzeln:** [FadisNemotron.apk](https://github.com/$repo/releases/download/$tag/FadisNemotron.apk) – auf dem Handy öffnen und installieren (einmal „Installieren aus unbekannten Quellen“ erlauben). Neue Versionen installieren sich über die alte.
 
-Mac-App und Android-App aus demselben Release passen zusammen."
+Die Android-App in der DMG ist genau diese APK."
 
 # Both workflows may get here at the same time; one of them creates it.
 gh release view "$tag" --repo "$repo" >/dev/null 2>&1 ||

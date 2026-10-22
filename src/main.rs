@@ -5,6 +5,7 @@ mod agent;
 mod api;
 mod app;
 mod attachments;
+mod awake;
 mod chats;
 mod computer;
 mod config;

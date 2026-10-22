@@ -1,4 +1,4 @@
-name: macOS DMG (Intel)
+name: Mac-App + Android-App
 
 on:
   push:
@@ -12,14 +12,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  apk:
+    # Builds, tests and publishes the Android app (android-apk.yml); the DMG
+    # below takes this very APK into the Mac app.
+    name: Android-App
+    uses: ./.github/workflows/android-apk.yml
+    permissions:
+      contents: write # publishes the build as "neueste" and on v* tags
+
   dmg:
     name: Tests + Intel-DMG
+    needs: apk
     # Apple Silicon runner; Rust cross-compiles to x86_64 with the same SDK.
     runs-on: macos-latest
     permissions:
       contents: write # publishes the build as "neueste" and on v* tags
+      actions: read # fetches the APK of this run
     steps:
       - uses: actions/checkout@v7
+
+      - name: APK dieses Laufs holen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name FadisNemotron-android-apk --dir build/apk
+          ls -la build/apk
+          test -n "$(ls build/apk/*.apk)"
 
       - name: Rust installieren
         run: |
@@ -41,7 +61,10 @@ jobs:
         run: cargo test --locked
 
       - name: App und DMG bauen
-        run: ./scripts/build-dmg.sh
+        env:
+          REQUIRE_APK: "1"
+        run: |
+          APK="$(ls "$PWD"/build/apk/FadisNemotron-*.apk | head -n1)" ./scripts/build-dmg.sh
 
       - name: DMG prüfen
         run: |
@@ -53,6 +76,8 @@ jobs:
           app="$mnt/Fadis Nemotron.app"
           test -L "$mnt/Applications"
           test -f "$app/Contents/Resources/AppIcon.icns"
+          test "$(wc -c < "$app/Contents/Resources/FadisNemotron.apk")" -gt 1000000
+          cmp "$app/Contents/Resources/FadisNemotron.apk" build/apk/FadisNemotron-*.apk
           plutil -p "$app/Contents/Info.plist"
           file "$app/Contents/MacOS/fadis-nemotron"
           lipo -archs "$app/Contents/MacOS/fadis-nemotron" | grep -qx x86_64

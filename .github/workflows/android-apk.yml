@@ -1,15 +1,10 @@
-name: Android APK
+name: Android APK (wird von macos-dmg.yml aufgerufen)
 
+# Called by "Mac-App + Android-App" (macos-dmg.yml) before the DMG is built, so
+# that the DMG carries exactly this APK. Can also be started by hand.
 on:
-  push:
-    branches: [main]
-    tags: ["v*"]
-  pull_request:
+  workflow_call:
   workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
 
 jobs:
   apk:

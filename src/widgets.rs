@@ -17,6 +17,7 @@ pub const ACCENT: Color32 = Color32::from_rgb(118, 185, 0);
 const ACCENT_LIGHT_THEME: Color32 = Color32::from_rgb(64, 118, 0);
 pub const ADDED: Color32 = Color32::from_rgb(110, 190, 90);
 pub const REMOVED: Color32 = Color32::from_rgb(225, 95, 85);
+pub const API_KEY_URL: &str = "https://build.nvidia.com/settings/api-keys";
 pub const MODEL_URL: &str = "https://build.nvidia.com/nvidia/nemotron-3.5-super-vl-120b-a12b";
 /// Messages are laid out in a column no wider than this.
 const MAX_COLUMN_WIDTH: f32 = 900.0;
@@ -26,6 +27,7 @@ const INLINE_DIFF_LINES: usize = 120;
 
 /// Something the user clicked inside the chat; handled by the app afterwards.
 pub enum UiAction {
+    OpenPhoneSetup,
     Copy(String),
     Retry,
     Decide { call_id: String, decision: Decision },
@@ -132,9 +134,18 @@ pub fn welcome(
         }
         if needs_key {
             ui.add_space(14.0);
-            if ui.button("🔑 API-Schlüssel eintragen").clicked() {
+            ui.label(RichText::new("Ein kostenloser NVIDIA-Schlüssel fehlt noch:").strong());
+            ui.hyperlink_to("🌐 Schlüssel holen: build.nvidia.com/settings/api-keys", API_KEY_URL);
+            if ui.button("🔑 Schlüssel eintragen").clicked() {
                 actions.push(UiAction::OpenSettings);
             }
+        }
+        ui.add_space(10.0);
+        if ui
+            .button("📱 Handy einrichten (Android-App installieren und koppeln)")
+            .clicked()
+        {
+            actions.push(UiAction::OpenPhoneSetup);
         }
     });
 }

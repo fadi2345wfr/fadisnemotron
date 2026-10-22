@@ -20,6 +20,15 @@ Die Mac-App zeigt einen QR-Code mit diesem JSON:
 
 `urls` enthält alle IPv4-Adressen des Macs (Tailscale-Adressen `100.64.0.0/10` zuerst). Das Handy probiert sie der Reihe nach mit `GET /api/v1/ping` und merkt sich die erste, die antwortet. Alternativ gibt man Adresse und Schlüssel von Hand ein.
 
+## Installationsseite (ohne Schlüssel)
+
+Ein Handy ohne App kennt den Schlüssel noch nicht. Deshalb liefert der Server zwei Adressen ohne Schlüssel aus, nur mit `GET`:
+
+- `GET /` (auch `/installieren`): eine kleine HTML-Seite mit dem Knopf „Fadis Nemotron laden“.
+- `GET /FadisNemotron.apk`: die Android-App aus dem Bundle der Mac-App (`Contents/Resources/FadisNemotron.apk`), als `application/vnd.android.package-archive`, Datei für Datei von der Platte gelesen. Fehlt sie, antwortet der Server `404`.
+
+Alles andere, auch jedes `POST`, verlangt weiter den Schlüssel. Die Mac-App zeigt für `/` einen QR-Code (Schritt 1 im Fernzugriff-Fenster) und merkt sich, ob das Handy die Datei vollständig geladen hat.
+
 ## Fehler
 
 Fehler haben einen passenden Status (`400`, `401`, `404`, `408`, `409`, `411`, `413`, `431`, `500`, `503`) und den Body `{"error": "Text für den Nutzer"}`.

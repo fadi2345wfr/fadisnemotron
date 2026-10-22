@@ -15,13 +15,15 @@ use serde_json::{Value, json};
 use crate::agent::{self, AgentConfig, AgentEvent, Decision};
 use crate::api::{self, ChatMessage, Role, TextDelta, ToolCall};
 use crate::attachments::{self, Attachment, AttachmentKind};
+use crate::awake;
 use crate::chats::{self, Chat, ChatStore, ChatSummary};
 use crate::config::Settings;
 use crate::remote::{self, Command, RemoteServer, Reply};
 use crate::tools::{ApprovalMode, FileChange, Workspace};
 use crate::widgets::{self, UiAction};
 
-const API_KEY_URL: &str = "https://build.nvidia.com/settings/api-keys";
+const APK_RELEASE_URL: &str =
+    "https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron.apk";
 const NOT_RUN: &str = "Not run: the request was stopped before this tool ran.";
 const INTERRUPTED: &str = "Stopped by the user while running; it may have partly run. \
      Check its effects before running it again.";
@@ -319,7 +321,17 @@ pub struct NemotronApp {
     remote_window: bool,
     /// The pairing payload and its QR code texture.
     remote_qr: Option<(String, egui::TextureHandle)>,
+    /// QR code of the page the phone opens to load the app.
+    install_qr: Option<(String, egui::TextureHandle)>,
+    /// The Android app came with this Mac app and is offered to phones.
+    apk_offered: bool,
     remote_show_token: bool,
+    keep_awake: awake::KeepAwake,
+    /// Answer of the password dialog for "run with the lid closed".
+    lid_task: Option<mpsc::Receiver<Result<(), String>>>,
+    lid_disabled: Option<bool>,
+    lid_checked: Option<Instant>,
+    lid_message: Option<String>,
     remote_published: Option<Instant>,
     device_name: String,
     undo_confirm: Option<UndoConfirm>,
@@ -340,7 +352,11 @@ impl NemotronApp {
             .unwrap_or_default();
         let mut app = Self::with_settings(settings, settings_path);
         app.update_title(&cc.egui_ctx);
-        if app.needs_api_key() {
+        // First start: the phone comes first (app, then pairing); the key
+        // window follows when that one is closed.
+        if app.first_phone_setup() {
+            app.remote_window = true;
+        } else if app.needs_api_key() {
             app.open_settings();
         }
         // Command line arguments: a folder opens as project, files are attached
@@ -401,7 +417,14 @@ impl NemotronApp {
             remote_error: None,
             remote_window: false,
             remote_qr: None,
+            install_qr: None,
+            apk_offered: false,
             remote_show_token: false,
+            keep_awake: awake::KeepAwake::new(),
+            lid_task: None,
+            lid_disabled: None,
+            lid_checked: None,
+            lid_message: None,
             remote_published: None,
             device_name: remote::device_name(),
             undo_confirm: None,
@@ -410,6 +433,12 @@ impl NemotronApp {
             focus_input: true,
             scroll_to_bottom: false,
         }
+    }
+
+    /// True until the phone setup window was shown once (and for nobody who
+    /// already paired a phone).
+    fn first_phone_setup(&self) -> bool {
+        !self.settings.phone_setup_seen && self.settings.remote_token.trim().is_empty()
     }
 
     /// NVIDIA's cloud needs a key; a local vLLM/NIM server usually does not.
@@ -1164,6 +1193,7 @@ impl NemotronApp {
         // Free the port before binding it again.
         self.remote = None;
         self.remote_qr = None;
+        self.install_qr = None;
         self.remote_published = None;
         let wake = {
             let ctx = ctx.clone();
@@ -1176,6 +1206,9 @@ impl NemotronApp {
             wake,
         ) {
             Ok(server) => {
+                let apk = remote::bundled_app_file();
+                self.apk_offered = apk.is_some();
+                server.offer_app(apk);
                 self.remote = Some(server);
                 self.remote_error = None;
             }
@@ -1192,6 +1225,7 @@ impl NemotronApp {
             self.remote = None;
             self.remote_error = None;
             self.remote_qr = None;
+            self.install_qr = None;
         }
     }
 
@@ -1201,6 +1235,33 @@ impl NemotronApp {
         self.save_settings();
         if self.remote.is_some() {
             self.start_remote(ctx);
+        }
+    }
+
+    /// Keeps the Mac awake while the phone can reach it or an agent works
+    /// (with the screen on, as it may look at it), and takes in the answer
+    /// of the password dialog for sleeping with the lid closed.
+    fn update_awake(&mut self, ctx: &egui::Context) {
+        let level = if self.active.is_some() && self.settings.keep_awake {
+            awake::Awake::Screen
+        } else if self.remote.is_some() && self.settings.keep_awake {
+            awake::Awake::System
+        } else {
+            awake::Awake::No
+        };
+        self.keep_awake.set(level);
+        if let Some(task) = &self.lid_task {
+            match task.try_recv() {
+                Ok(result) => {
+                    self.lid_task = None;
+                    self.lid_message = result.err();
+                    self.lid_disabled = awake::lid_sleep_disabled();
+                }
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(Duration::from_millis(300));
+                }
+                Err(TryRecvError::Disconnected) => self.lid_task = None,
+            }
         }
     }
 
@@ -1474,26 +1535,54 @@ impl NemotronApp {
         let mut renew = false;
         let mut restart = false;
         let mut copy = None;
+        let mut awake_changed = false;
+        let mut lid_wanted = None;
         let addresses = remote::local_addresses();
+        let port = self
+            .remote
+            .as_ref()
+            .map_or(self.settings.remote_port, RemoteServer::port);
         let payload = remote::pairing_payload(
             &self.device_name,
-            self.remote
-                .as_ref()
-                .map_or(self.settings.remote_port, RemoteServer::port),
+            port,
             &self.settings.remote_token,
             &addresses,
         );
-        if self.remote.is_some() && self.remote_qr.as_ref().is_none_or(|(p, _)| *p != payload) {
-            self.remote_qr = qr_texture(ctx, &payload).map(|t| (payload.clone(), t));
+        let install_url = remote::install_url(&addresses, port);
+        if self.remote.is_some() {
+            if self.remote_qr.as_ref().is_none_or(|(p, _)| *p != payload) {
+                self.remote_qr = qr_texture(ctx, &payload).map(|t| (payload.clone(), t));
+            }
+            match &install_url {
+                Some(url) if self.install_qr.as_ref().is_none_or(|(u, _)| u != url) => {
+                    self.install_qr = qr_texture(ctx, url).map(|t| (url.clone(), t));
+                }
+                None => self.install_qr = None,
+                Some(_) => {}
+            }
+            // Asking the system takes a moment; not every frame.
+            if self
+                .lid_checked
+                .is_none_or(|t| t.elapsed() > Duration::from_secs(3))
+                && self.lid_task.is_none()
+            {
+                self.lid_disabled = awake::lid_sleep_disabled();
+                self.lid_checked = Some(Instant::now());
+            }
         }
+        let has_apk = self.apk_offered;
         egui::Window::new("Fernzugriff fürs Handy")
             .pivot(egui::Align2::CENTER_CENTER)
             .default_pos(screen.center())
             .open(&mut open)
             .collapsible(false)
             .resizable(false)
-            .default_width(620.0)
+            .default_width(640.0)
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, true])
+                    .max_height((screen.height() - 110.0).max(240.0))
+                    .show(ui, |ui| {
                 toggled = ui
                     .checkbox(&mut enabled, RichText::new("Fernzugriff an").strong())
                     .on_hover_text("Die Android-App kann dann Aufträge schicken, Antworten sehen und Freigaben geben.")
@@ -1502,75 +1591,150 @@ impl NemotronApp {
                     ui.colored_label(ui.visuals().error_fg_color, format!("⚠ {e}"));
                 }
                 let Some(server) = &self.remote else {
-                    ui.label("Schalte den Fernzugriff ein, um dein Handy zu koppeln. Er bleibt aus, bis du ihn einschaltest.");
+                    ui.label("Schalte den Fernzugriff ein, um dein Handy einzurichten: erst die App aufs Handy bringen, dann koppeln. Er bleibt aus, bis du ihn einschaltest.");
+                    ui.add_space(6.0);
+                    if ui.button(RichText::new("📱 Handy einrichten").size(16.0)).clicked() {
+                        toggled = true;
+                        enabled = true;
+                    }
                     return;
                 };
                 ui.label(RichText::new(format!("Läuft auf Port {} · Gerät „{}“", server.port(), self.device_name)).weak());
-                ui.add_space(6.0);
+
+                ui.add_space(8.0);
+                ui.label(RichText::new("Schritt 1 · App aufs Handy bringen").strong().size(16.0));
                 ui.horizontal_top(|ui| {
-                    if let Some((_, texture)) = &self.remote_qr {
-                        ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(220.0, 220.0)));
+                    if has_apk && let Some((_, texture)) = &self.install_qr {
+                        ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(170.0, 170.0)));
                     }
                     ui.vertical(|ui| {
-                        ui.label(RichText::new("So koppelst du dein Handy").strong());
-                        ui.label("1. Android-App „Fadis Nemotron“ öffnen → Tab „Mac“.");
+                        if has_apk {
+                            ui.label("Scanne diesen Code mit der Kamera deines Android-Handys (gleiches WLAN wie der Mac).");
+                            ui.label("Die Seite öffnet sich: „Fadis Nemotron laden“ tippen, die Datei öffnen und installieren. Android fragt einmal, ob es Installationen aus dieser Quelle erlauben soll – erlauben.");
+                            if let Some(url) = &install_url {
+                                ui.label(RichText::new(format!("Oder im Handy-Browser öffnen: {url}")).monospace().small());
+                            }
+                            if server.app_downloads() > 0 {
+                                ui.colored_label(widgets::accent(ui), "✔ Das Handy hat die App geladen. Weiter mit Schritt 2.");
+                            } else {
+                                ui.label(RichText::new("Noch nicht geladen. App schon installiert? Dann gleich weiter mit Schritt 2.").weak());
+                            }
+                        } else {
+                            ui.colored_label(ui.visuals().warn_fg_color, "Die Android-App steckt nur in der fertigen Mac-App (DMG), nicht in diesem Programm.");
+                            ui.hyperlink_to("FadisNemotron.apk von GitHub laden", APK_RELEASE_URL);
+                            ui.label(RichText::new("Auf dem Handy öffnen und installieren, danach weiter mit Schritt 2.").weak());
+                        }
+                    });
+                });
+
+                ui.add_space(10.0);
+                ui.label(RichText::new("Schritt 2 · Handy koppeln").strong().size(16.0));
+                ui.horizontal_top(|ui| {
+                    if let Some((_, texture)) = &self.remote_qr {
+                        ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(170.0, 170.0)));
+                    }
+                    ui.vertical(|ui| {
+                        ui.label("1. Die App „Fadis Nemotron“ auf dem Handy öffnen.");
                         ui.label("2. „QR-Code scannen“ tippen und diesen Code scannen.");
-                        ui.label("3. Fertig – Aufträge, Antworten und Freigaben laufen jetzt auch übers Handy.");
-                        ui.add_space(6.0);
+                        ui.label("3. Fertig – alle Chats sind sofort auch auf dem Handy, Aufträge und Freigaben laufen von dort.");
+                        ui.add_space(4.0);
+                        match server.last_seen() {
+                            Some((when, from)) => {
+                                ui.label(RichText::new(format!("Zuletzt verbunden: vor {} s von {from}", when.elapsed().as_secs())).weak());
+                            }
+                            None => {
+                                ui.label(RichText::new("Noch kein Handy verbunden.").weak());
+                            }
+                        }
+                        ui.add_space(4.0);
                         ui.label(RichText::new("Unterwegs").strong());
-                        ui.label("Installiere Tailscale auf Mac und Handy und melde dich bei beiden mit demselben Konto an. Dann klappt die Verbindung überall, verschlüsselt und ohne Router-Einstellungen.");
+                        ui.label("Tailscale auf Mac und Handy installieren und bei beiden mit demselben Konto anmelden: dann klappt es überall, verschlüsselt, ohne Router-Einstellungen.");
                         ui.hyperlink_to("tailscale.com/download", "https://tailscale.com/download");
                     });
                 });
-                ui.add_space(6.0);
-                ui.label(RichText::new("Adressen").strong());
-                if addresses.is_empty() {
-                    ui.label(RichText::new("Keine Netzwerkverbindung gefunden.").weak());
+
+                ui.add_space(10.0);
+                ui.label(RichText::new("Im Hintergrund weiterlaufen").strong().size(16.0));
+                awake_changed = ui
+                    .checkbox(&mut self.settings.keep_awake, "Mac wach halten, solange der Fernzugriff an ist")
+                    .on_hover_text("Der Mac schläft nicht von selbst ein. Bildschirm aus und App im Hintergrund ist in Ordnung; wenn Nemotron arbeitet, bleibt auch der Bildschirm an, damit er ihn sehen kann.")
+                    .changed();
+                if let Some(task) = &self.lid_task {
+                    let _ = task;
+                    ui.label(RichText::new("Warte auf das Passwort …").weak());
+                } else {
+                    match self.lid_disabled {
+                        Some(true) => {
+                            ui.colored_label(widgets::accent(ui), "✔ Der Mac läuft auch bei zugeklapptem Deckel weiter.");
+                            if ui.button("Wieder normal schlafen lassen").clicked() {
+                                lid_wanted = Some(false);
+                            }
+                        }
+                        Some(false) | None => {
+                            if ui
+                                .button("🔒 Auch bei zugeklapptem Deckel weiterlaufen (Passwort)")
+                                .on_hover_text("Führt mit deinem Passwort „pmset -a disablesleep 1“ aus. Rückgängig mit dem Knopf, der danach hier steht.")
+                                .clicked()
+                            {
+                                lid_wanted = Some(true);
+                            }
+                        }
+                    }
                 }
-                for addr in &addresses {
-                    let kind = if remote::is_tailscale(*addr) {
-                        "Tailscale (auch unterwegs)"
-                    } else if addr.is_private() {
-                        "Heimnetz / WLAN"
-                    } else {
-                        "anderes Netz"
-                    };
+                if let Some(message) = &self.lid_message {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("⚠ {message}"));
+                }
+                ui.label(
+                    RichText::new(
+                        "Ein zugeklapptes MacBook schläft sonst immer ein – das kann keine App verhindern. \
+                         Mit dem Schalter wird es warm, wenn es im Rucksack steckt: danach wieder normal schlafen lassen. \
+                         Ohne Passwort geht es mit Netzteil, externem Bildschirm und Tastatur.",
+                    )
+                    .small()
+                    .weak(),
+                );
+
+                ui.add_space(6.0);
+                egui::CollapsingHeader::new("Technik: Adressen, Schlüssel, Port").show(ui, |ui| {
+                    if addresses.is_empty() {
+                        ui.label(RichText::new("Keine Netzwerkverbindung gefunden.").weak());
+                    }
+                    for addr in &addresses {
+                        let kind = if remote::is_tailscale(*addr) {
+                            "Tailscale (auch unterwegs)"
+                        } else if addr.is_private() {
+                            "Heimnetz / WLAN"
+                        } else {
+                            "anderes Netz"
+                        };
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("http://{addr}:{}", server.port())).monospace());
+                            ui.label(RichText::new(kind).small().weak());
+                        });
+                    }
                     ui.horizontal(|ui| {
-                        ui.label(RichText::new(format!("http://{addr}:{}", server.port())).monospace());
-                        ui.label(RichText::new(kind).small().weak());
+                        ui.label(RichText::new("Schlüssel").strong());
+                        let shown = if self.remote_show_token {
+                            self.settings.remote_token.clone()
+                        } else {
+                            "•".repeat(12)
+                        };
+                        ui.label(RichText::new(shown).monospace());
+                        ui.checkbox(&mut self.remote_show_token, "anzeigen");
+                        if ui.small_button("📋 Kopieren").clicked() {
+                            copy = Some(self.settings.remote_token.clone());
+                        }
                     });
-                }
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Schlüssel").strong());
-                    let shown = if self.remote_show_token {
-                        self.settings.remote_token.clone()
-                    } else {
-                        "•".repeat(12)
-                    };
-                    ui.label(RichText::new(shown).monospace());
-                    ui.checkbox(&mut self.remote_show_token, "anzeigen");
-                    if ui.small_button("📋 Kopieren").clicked() {
-                        copy = Some(self.settings.remote_token.clone());
-                    }
+                    ui.horizontal(|ui| {
+                        renew = ui
+                            .button("Neuen Schlüssel erzeugen")
+                            .on_hover_text("Alle gekoppelten Handys müssen danach neu scannen.")
+                            .clicked();
+                        ui.label("Port");
+                        let port_changed = ui.add(egui::DragValue::new(&mut self.settings.remote_port).range(1024..=65535)).changed();
+                        restart = port_changed;
+                    });
                 });
-                ui.horizontal(|ui| {
-                    renew = ui
-                        .button("Neuen Schlüssel erzeugen")
-                        .on_hover_text("Alle gekoppelten Handys müssen danach neu scannen.")
-                        .clicked();
-                    ui.label("Port");
-                    let port_changed = ui.add(egui::DragValue::new(&mut self.settings.remote_port).range(1024..=65535)).changed();
-                    restart = port_changed;
-                });
-                match server.last_seen() {
-                    Some((when, from)) => {
-                        ui.label(RichText::new(format!("Zuletzt verbunden: vor {} s von {from}", when.elapsed().as_secs())).weak());
-                    }
-                    None => {
-                        ui.label(RichText::new("Noch kein Handy verbunden.").weak());
-                    }
-                }
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(
@@ -1580,9 +1744,19 @@ impl NemotronApp {
                     .small()
                     .weak(),
                 );
+                    });
             });
         if toggled {
             self.set_remote_enabled(enabled, ctx);
+        }
+        if awake_changed {
+            self.save_settings();
+        }
+        if let Some(disabled) = lid_wanted
+            && self.lid_task.is_none()
+        {
+            self.lid_message = None;
+            self.lid_task = Some(awake::set_lid_sleep_disabled(disabled));
         }
         if renew {
             self.renew_remote_token(ctx);
@@ -1596,6 +1770,14 @@ impl NemotronApp {
         }
         if !open {
             self.remote_window = false;
+            if !self.settings.phone_setup_seen {
+                self.settings.phone_setup_seen = true;
+                self.save_settings();
+                // The key window was held back on the first start.
+                if self.needs_api_key() {
+                    self.open_settings();
+                }
+            }
         }
     }
 
@@ -2074,6 +2256,7 @@ impl NemotronApp {
             UiAction::Undo(index) => self.undo_change(index, false),
             UiAction::OpenProject => self.pick_workspace(ctx),
             UiAction::OpenSettings => self.open_settings(),
+            UiAction::OpenPhoneSetup => self.remote_window = true,
             UiAction::UsePrompt(text) => {
                 self.input = text;
                 self.focus_input = true;
@@ -2189,7 +2372,7 @@ impl NemotronApp {
                             ui.add(egui::TextEdit::singleline(&mut s.api_key).password(!draft.show_key).hint_text("nvapi-…").desired_width(340.0));
                             ui.checkbox(&mut draft.show_key, "anzeigen");
                         });
-                        ui.hyperlink_to("Kostenlosen Schlüssel auf build.nvidia.com holen", API_KEY_URL);
+                        ui.hyperlink_to("Kostenlosen Schlüssel auf build.nvidia.com holen", widgets::API_KEY_URL);
                         if s.api_key.trim().is_empty() && std::env::var("NVIDIA_API_KEY").is_ok_and(|k| !k.is_empty()) {
                             ui.label(RichText::new("Leer: NVIDIA_API_KEY aus der Umgebung wird benutzt.").small().weak());
                         }
@@ -2497,6 +2680,7 @@ impl eframe::App for NemotronApp {
         self.poll_stopped();
         self.poll_attachments();
         self.handle_remote(ctx);
+        self.update_awake(ctx);
         if self.active.is_some() || self.loading_attachments > 0 {
             // Keeps spinners moving even when no tokens arrive (long thinking).
             ctx.request_repaint_after(Duration::from_millis(200));

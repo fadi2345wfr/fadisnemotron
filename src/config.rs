@@ -43,6 +43,10 @@ pub struct Settings {
     pub remote_port: u16,
     /// Pairing key; created when remote access is first switched on.
     pub remote_token: String,
+    /// The first-start window for setting up the phone has been shown.
+    pub phone_setup_seen: bool,
+    /// The Mac stays awake while remote access is on.
+    pub keep_awake: bool,
 }
 
 impl Default for Settings {
@@ -66,6 +70,8 @@ impl Default for Settings {
             remote_enabled: false,
             remote_port: crate::remote::DEFAULT_PORT,
             remote_token: String::new(),
+            phone_setup_seen: false,
+            keep_awake: true,
         }
     }
 }
