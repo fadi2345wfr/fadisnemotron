@@ -1,46 +1,95 @@
-//! The chat window.
+//! The main window: chat with Nemotron, or, with a project folder open, an
+//! agent that reads, edits and runs things in that folder.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
-use eframe::egui::{
-    self, Align, Color32, Key, KeyboardShortcut, Layout, Modifiers, RichText, TextStyle,
-};
-use egui_commonmark::{CommonMarkCache, CommonMarkViewer};
+use eframe::egui::{self, Align, Color32, Key, KeyboardShortcut, Layout, Modifiers, RichText};
+use egui_commonmark::CommonMarkCache;
 
-use crate::api::{self, Role, StreamEvent, Turn};
+use crate::agent::{self, AgentConfig, AgentEvent, Decision};
+use crate::api::{self, ChatMessage, Role, TextDelta, ToolCall};
 use crate::attachments::{self, Attachment, AttachmentKind};
 use crate::config::Settings;
+use crate::tools::{ApprovalMode, FileChange, Workspace};
+use crate::widgets::{self, UiAction};
 
-const ACCENT: Color32 = Color32::from_rgb(118, 185, 0);
-const ACCENT_LIGHT_THEME: Color32 = Color32::from_rgb(64, 118, 0);
 const API_KEY_URL: &str = "https://build.nvidia.com/settings/api-keys";
-const MODEL_URL: &str = "https://build.nvidia.com/nvidia/nemotron-3.5-super-vl-120b-a12b";
-/// Messages are laid out in a column no wider than this.
-const MAX_COLUMN_WIDTH: f32 = 880.0;
+const NOT_RUN: &str = "Not run: the request was stopped before this tool ran.";
 
 #[derive(Clone, Debug, PartialEq)]
-enum Status {
+pub enum Status {
     Streaming,
     Done,
     Cancelled,
     Failed(String),
 }
 
-struct Message {
-    role: Role,
-    /// The user's text, or the assistant's answer.
-    text: String,
-    /// The assistant's thinking, if the server sent it separately.
-    reasoning: String,
-    attachments: Vec<Attachment>,
-    status: Status,
-    finish_reason: Option<String>,
-    /// Set when the answer starts so the thinking folds away once.
-    collapse_reasoning: bool,
+#[derive(Clone, Debug, PartialEq)]
+pub enum ToolState {
+    Planned,
+    AwaitingApproval,
+    Running,
+    Done,
+    Declined,
+    NotRun,
+}
+
+pub struct ToolView {
+    pub call: ToolCall,
+    pub state: ToolState,
+    pub output: String,
+    pub ok: bool,
+    /// What the tool changed on disk.
+    pub change: Option<FileChange>,
+    /// What it would change, shown while it waits for approval.
+    pub preview: Option<FileChange>,
+    /// Why this command always needs a yes (e.g. `sudo`).
+    pub warning: Option<String>,
+}
+
+/// One model request within an answer: its thinking, text and tool calls.
+#[derive(Default)]
+pub struct Step {
+    pub reasoning: String,
+    pub content: String,
+    pub tools: Vec<ToolView>,
+    /// Set once so the thinking folds away when the answer or tools arrive.
+    pub collapse_reasoning: bool,
+    reasoning_collapsed: bool,
+}
+
+impl Step {
+    /// `(thinking, answer)`, also when the server sent the thinking inline.
+    pub fn parts(&self) -> (Option<&str>, &str) {
+        if self.reasoning.trim().is_empty() {
+            api::split_inline_thinking(&self.content)
+        } else {
+            (Some(self.reasoning.trim()), self.content.trim_start())
+        }
+    }
+
+    fn collapse_once(&mut self) {
+        if !self.reasoning_collapsed && self.parts().0.is_some() {
+            self.collapse_reasoning = true;
+            self.reasoning_collapsed = true;
+        }
+    }
+}
+
+pub struct Message {
+    pub role: Role,
+    /// The user's text.
+    pub text: String,
+    pub attachments: Vec<Attachment>,
+    /// The assistant's steps.
+    pub steps: Vec<Step>,
+    pub status: Status,
+    pub finish_reason: Option<String>,
+    pub notices: Vec<String>,
 }
 
 impl Message {
@@ -48,11 +97,11 @@ impl Message {
         Self {
             role: Role::User,
             text,
-            reasoning: String::new(),
             attachments,
+            steps: Vec::new(),
             status: Status::Done,
             finish_reason: None,
-            collapse_reasoning: false,
+            notices: Vec::new(),
         }
     }
 
@@ -64,24 +113,65 @@ impl Message {
         }
     }
 
-    /// `(thinking, answer)`, also when the server sent the thinking inline.
-    fn parts(&self) -> (Option<&str>, &str) {
-        if self.reasoning.trim().is_empty() {
-            api::split_inline_thinking(&self.text)
-        } else {
-            (Some(self.reasoning.trim()), self.text.trim_start())
+    /// The final answer: the text of the last step that has some.
+    pub fn answer(&self) -> &str {
+        self.steps
+            .iter()
+            .rev()
+            .map(|s| s.parts().1.trim())
+            .find(|a| !a.is_empty())
+            .unwrap_or("")
+    }
+
+    fn tool_mut(&mut self, call_id: &str) -> Option<&mut ToolView> {
+        self.steps
+            .last_mut()?
+            .tools
+            .iter_mut()
+            .find(|t| t.call.id == call_id)
+    }
+
+    /// Marks tools that never got to run, after a stop or an error.
+    fn settle_tools(&mut self) {
+        for tool in self.steps.iter_mut().flat_map(|s| &mut s.tools) {
+            if matches!(
+                tool.state,
+                ToolState::Planned | ToolState::AwaitingApproval | ToolState::Running
+            ) {
+                tool.state = ToolState::NotRun;
+                tool.preview = None;
+            }
         }
     }
 }
 
-enum MessageAction {
-    Copy(String),
-    Retry,
+/// A file the agent changed during this session, with its original content.
+pub struct TrackedChange {
+    pub path: String,
+    pub abs: PathBuf,
+    /// `None` if the agent created the file.
+    pub original: Option<String>,
+    pub current: String,
+}
+
+impl TrackedChange {
+    pub fn line_stats(&self) -> (usize, usize) {
+        crate::tools::line_stats(self.original.as_deref().unwrap_or(""), &self.current)
+    }
+
+    pub fn diff(&self) -> String {
+        crate::tools::unified_diff(
+            self.original.as_deref().unwrap_or(""),
+            &self.current,
+            &self.path,
+        )
+    }
 }
 
 struct ActiveRequest {
-    rx: Receiver<StreamEvent>,
+    rx: Receiver<AgentEvent>,
     cancel: Arc<AtomicBool>,
+    decisions: Sender<(String, Decision)>,
 }
 
 struct SettingsDraft {
@@ -103,10 +193,17 @@ struct Notice {
     error: bool,
 }
 
+/// An undo whose file was changed again outside the agent; needs a yes.
+struct UndoConfirm {
+    index: usize,
+}
+
 pub struct NemotronApp {
     settings: Settings,
     settings_path: Option<PathBuf>,
     settings_draft: Option<SettingsDraft>,
+    workspace: Option<Workspace>,
+    changes: Vec<TrackedChange>,
     messages: Vec<Message>,
     input: String,
     pending: Vec<Attachment>,
@@ -115,26 +212,58 @@ pub struct NemotronApp {
     attach_rx: Receiver<Result<Attachment, String>>,
     url_draft: Option<UrlDraft>,
     active: Option<ActiveRequest>,
+    /// Workers that were stopped but may still report a file they wrote
+    /// just before noticing; kept so the change can still be undone.
+    stopped: Vec<Receiver<AgentEvent>>,
     notice: Option<Notice>,
+    diff_view: Option<(String, String)>,
+    undo_confirm: Option<UndoConfirm>,
     markdown: CommonMarkCache,
-    agent: ureq::Agent,
+    http: ureq::Agent,
     focus_input: bool,
+    scroll_to_bottom: bool,
 }
 
 impl NemotronApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
-        setup_style(&cc.egui_ctx);
+        widgets::setup_style(&cc.egui_ctx);
         let settings_path = Settings::default_path();
         let settings = settings_path
             .as_deref()
             .map(Settings::load_from)
             .unwrap_or_default();
+        let mut app = Self::with_settings(settings, settings_path);
+        app.update_title(&cc.egui_ctx);
+        if app.needs_api_key() {
+            app.open_settings();
+        }
+        // Command line arguments: a folder opens as project, files are attached
+        // (`open -a "Fadis Nemotron" --args ~/Projekt bild.png`).
+        let mut files = Vec::new();
+        for arg in std::env::args_os().skip(1).map(PathBuf::from) {
+            if arg.is_dir() {
+                app.open_workspace(&arg, &cc.egui_ctx);
+            } else if arg.is_file() {
+                files.push(arg);
+            }
+        }
+        app.load_paths(files, &cc.egui_ctx);
+        app
+    }
+
+    fn with_settings(settings: Settings, settings_path: Option<PathBuf>) -> Self {
         let (attach_tx, attach_rx) = mpsc::channel();
-        let mut app = Self {
+        let workspace = settings
+            .workspace
+            .as_deref()
+            .and_then(|p| Workspace::open(p).ok());
+        Self {
             settings,
             settings_path,
             settings_draft: None,
+            workspace,
+            changes: Vec::new(),
             messages: Vec::new(),
             input: String::new(),
             pending: Vec::new(),
@@ -143,22 +272,15 @@ impl NemotronApp {
             attach_rx,
             url_draft: None,
             active: None,
+            stopped: Vec::new(),
             notice: None,
+            diff_view: None,
+            undo_confirm: None,
             markdown: CommonMarkCache::default(),
-            agent: api::agent(),
+            http: api::agent(),
             focus_input: true,
-        };
-        if app.needs_api_key() {
-            app.open_settings();
+            scroll_to_bottom: false,
         }
-        // Files given on the command line (`open -a "Fadis Nemotron" --args bild.png`) are attached.
-        let files: Vec<PathBuf> = std::env::args_os()
-            .skip(1)
-            .map(PathBuf::from)
-            .filter(|p| p.is_file())
-            .collect();
-        app.load_paths(files, &cc.egui_ctx);
-        app
     }
 
     /// NVIDIA's cloud needs a key; a local vLLM/NIM server usually does not.
@@ -190,6 +312,127 @@ impl NemotronApp {
         }
     }
 
+    fn update_title(&self, ctx: &egui::Context) {
+        let title = match &self.workspace {
+            Some(ws) => format!("Fadis Nemotron – {}", ws.name()),
+            None => "Fadis Nemotron".to_owned(),
+        };
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(title));
+    }
+
+    // ------------------------------------------------------------- project
+
+    fn pick_workspace(&mut self, ctx: &egui::Context) {
+        let mut dialog = rfd::FileDialog::new().set_title("Projektordner öffnen");
+        if let Some(ws) = &self.workspace {
+            dialog = dialog.set_directory(ws.root());
+        }
+        if let Some(dir) = dialog.pick_folder() {
+            self.open_workspace(&dir, ctx);
+        }
+    }
+
+    fn open_workspace(&mut self, dir: &Path, ctx: &egui::Context) {
+        if self.active.is_some() {
+            self.notice = Some(Notice {
+                text: "Erst die laufende Antwort stoppen, dann den Ordner wechseln.".into(),
+                error: true,
+            });
+            return;
+        }
+        match Workspace::open(dir) {
+            Ok(ws) => {
+                self.notice = Some(Notice {
+                    text: format!(
+                        "Projekt „{}“ geöffnet. Nemotron arbeitet jetzt direkt in diesem Ordner.",
+                        ws.name()
+                    ),
+                    error: false,
+                });
+                self.settings.workspace = Some(ws.root().to_path_buf());
+                self.workspace = Some(ws);
+                self.changes.clear();
+                self.save_settings();
+                self.update_title(ctx);
+                self.focus_input = true;
+            }
+            Err(e) => {
+                self.notice = Some(Notice {
+                    text: e,
+                    error: true,
+                })
+            }
+        }
+    }
+
+    fn close_workspace(&mut self, ctx: &egui::Context) {
+        if self.active.is_some() {
+            return;
+        }
+        self.workspace = None;
+        self.changes.clear();
+        self.settings.workspace = None;
+        self.save_settings();
+        self.update_title(ctx);
+    }
+
+    fn record_change(&mut self, change: &FileChange) {
+        if let Some(tracked) = self.changes.iter_mut().find(|t| t.abs == change.abs) {
+            tracked.current = change.after.clone();
+        } else {
+            self.changes.push(TrackedChange {
+                path: change.path.clone(),
+                abs: change.abs.clone(),
+                original: change.before.clone(),
+                current: change.after.clone(),
+            });
+        }
+    }
+
+    /// Restores a file to how it was before the agent first touched it.
+    fn undo_change(&mut self, index: usize, force: bool) {
+        let Some(tracked) = self.changes.get(index) else {
+            return;
+        };
+        let on_disk = std::fs::read_to_string(&tracked.abs).ok();
+        if !force && on_disk.as_deref() != Some(tracked.current.as_str()) {
+            self.undo_confirm = Some(UndoConfirm { index });
+            return;
+        }
+        let tracked = self.changes.remove(index);
+        let result = match &tracked.original {
+            Some(text) => std::fs::write(&tracked.abs, text),
+            None => match std::fs::remove_file(&tracked.abs) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                other => other,
+            },
+        };
+        self.notice = Some(match result {
+            Ok(()) if tracked.original.is_some() => Notice {
+                text: format!("{} wiederhergestellt.", tracked.path),
+                error: false,
+            },
+            Ok(()) => Notice {
+                text: format!("{} gelöscht (war neu).", tracked.path),
+                error: false,
+            },
+            Err(e) => {
+                let text = format!("{} konnte nicht zurückgesetzt werden: {e}", tracked.path);
+                self.changes.insert(index.min(self.changes.len()), tracked);
+                Notice { text, error: true }
+            }
+        });
+    }
+
+    fn reveal_in_file_manager(path: &Path) {
+        let opener = if cfg!(target_os = "macos") {
+            "open"
+        } else {
+            "xdg-open"
+        };
+        let _ = std::process::Command::new(opener).arg(path).spawn();
+    }
+
     fn new_chat(&mut self, ctx: &egui::Context) {
         self.stop();
         for att in self
@@ -208,7 +451,7 @@ impl NemotronApp {
         self.focus_input = true;
     }
 
-    // ---------------------------------------------------------------- sending
+    // ------------------------------------------------------------- sending
 
     fn can_send(&self) -> bool {
         self.active.is_none()
@@ -237,48 +480,83 @@ impl NemotronApp {
         self.start_request(ctx);
     }
 
-    /// Sends the whole conversation and appends a streaming answer.
-    fn start_request(&mut self, ctx: &egui::Context) {
-        let history: Vec<(Role, String, Vec<Attachment>)> = self
-            .messages
-            .iter()
-            .filter_map(|m| match (m.role, &m.status) {
-                (Role::User, _) => Some((Role::User, m.text.clone(), m.attachments.clone())),
-                (Role::Assistant, Status::Done | Status::Cancelled) => {
-                    let answer = m.parts().1.trim();
-                    (!answer.is_empty()).then(|| (Role::Assistant, answer.to_owned(), Vec::new()))
+    /// The conversation so far in API form, including every tool call and
+    /// its result, so follow-up messages keep the context.
+    fn api_history(&self) -> Vec<ChatMessage> {
+        let mut out = Vec::new();
+        for msg in &self.messages {
+            match msg.role {
+                Role::User => out.push(ChatMessage::User {
+                    text: msg.text.clone(),
+                    attachments: msg.attachments.clone(),
+                }),
+                Role::Assistant if msg.status == Status::Streaming => {}
+                Role::Assistant => {
+                    for step in &msg.steps {
+                        let answer = step.parts().1.trim().to_owned();
+                        if step.tools.is_empty() {
+                            if !answer.is_empty() {
+                                out.push(ChatMessage::Assistant {
+                                    content: answer,
+                                    reasoning: None,
+                                    tool_calls: Vec::new(),
+                                });
+                            }
+                            continue;
+                        }
+                        out.push(ChatMessage::Assistant {
+                            content: answer,
+                            reasoning: None,
+                            tool_calls: step.tools.iter().map(|t| t.call.clone()).collect(),
+                        });
+                        for tool in &step.tools {
+                            let content = match tool.state {
+                                ToolState::Done | ToolState::Declined => tool.output.clone(),
+                                _ => NOT_RUN.to_owned(),
+                            };
+                            out.push(ChatMessage::Tool {
+                                call_id: tool.call.id.clone(),
+                                content,
+                            });
+                        }
+                    }
                 }
-                (Role::Assistant, _) => None,
-            })
-            .collect();
+            }
+        }
+        out
+    }
+
+    fn start_request(&mut self, ctx: &egui::Context) {
+        let history = self.api_history();
         self.messages.push(Message::assistant());
+        self.scroll_to_bottom = true;
 
         let (tx, rx) = mpsc::channel();
+        let (decision_tx, decision_rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
+        let system_prompt = match &self.workspace {
+            Some(ws) => agent::system_prompt(&self.settings.system_prompt, ws),
+            None => self.settings.system_prompt.clone(),
+        };
+        let config = AgentConfig {
+            base_url: self.settings.base_url.clone(),
+            api_key: self.settings.effective_api_key(),
+            system_prompt,
+            options: self.settings.generation_options(),
+            workspace: self.workspace.clone(),
+            approval: self.settings.approval,
+            max_steps: self.settings.max_steps.max(1),
+        };
+        let http = self.http.clone();
         let worker_cancel = cancel.clone();
-        let system_prompt = self.settings.system_prompt.clone();
-        let options = self.settings.generation_options();
-        let base_url = self.settings.base_url.clone();
-        let api_key = self.settings.effective_api_key();
-        let agent = self.agent.clone();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            // Encoding large videos as base64 takes a moment, so it happens here and not in the UI thread.
-            let turns: Vec<Turn<'_>> = history
-                .iter()
-                .map(|(role, text, attachments)| Turn {
-                    role: *role,
-                    text,
-                    attachments,
-                })
-                .collect();
-            let body = api::build_request_body(&system_prompt, &turns, &options);
-            api::stream_chat(
-                &agent,
-                &base_url,
-                &api_key,
-                &body,
+            agent::run(
+                &http,
+                config,
+                history,
                 &worker_cancel,
+                &decision_rx,
                 |event| {
                     let delivered = tx.send(event).is_ok();
                     ctx.request_repaint();
@@ -286,21 +564,56 @@ impl NemotronApp {
                 },
             );
         });
-        self.active = Some(ActiveRequest { rx, cancel });
+        self.active = Some(ActiveRequest {
+            rx,
+            cancel,
+            decisions: decision_tx,
+        });
     }
 
     fn stop(&mut self) {
+        // Take in whatever already arrived, e.g. a finished edit.
+        self.poll_agent();
         if let Some(active) = self.active.take() {
             active.cancel.store(true, Ordering::Relaxed);
             if let Some(msg) = self.messages.last_mut()
                 && msg.status == Status::Streaming
             {
                 msg.status = Status::Cancelled;
+                msg.settle_tools();
             }
+            self.stopped.push(active.rx);
         }
     }
 
-    /// Drops the last answer and asks again.
+    /// Records file changes that stopped workers still report.
+    fn poll_stopped(&mut self) {
+        let mut changes = Vec::new();
+        self.stopped.retain(|rx| {
+            loop {
+                match rx.try_recv() {
+                    Ok(AgentEvent::ToolFinished {
+                        change: Some(change),
+                        ..
+                    }) => changes.push(change),
+                    Ok(_) => {}
+                    Err(TryRecvError::Empty) => break true,
+                    Err(TryRecvError::Disconnected) => break false,
+                }
+            }
+        });
+        for change in &changes {
+            self.record_change(change);
+        }
+        if !changes.is_empty() {
+            self.notice = Some(Notice {
+                text: "Nemotron hat vor dem Stopp noch eine Datei geändert – sie steht rechts in den Änderungen.".into(),
+                error: false,
+            });
+        }
+    }
+
+    /// Drops the last answer and asks again. File changes stay in place.
     fn retry(&mut self, ctx: &egui::Context) {
         if self.active.is_some() {
             return;
@@ -317,46 +630,54 @@ impl NemotronApp {
         }
     }
 
-    fn poll_stream(&mut self) {
+    fn decide(&mut self, call_id: &str, decision: Decision) {
         let Some(active) = &self.active else { return };
-        let Some(msg) = self.messages.last_mut() else {
-            return;
-        };
-        let mut finished = false;
+        let _ = active.decisions.send((call_id.to_owned(), decision));
+        if let Some(tool) = self.messages.last_mut().and_then(|m| m.tool_mut(call_id)) {
+            tool.state = if decision == Decision::Deny {
+                ToolState::Declined
+            } else {
+                ToolState::Running
+            };
+            tool.preview = None;
+        }
+    }
+
+    fn poll_agent(&mut self) {
+        let Some(active) = &self.active else { return };
+        let mut events = Vec::new();
+        let mut disconnected = false;
         loop {
             match active.rx.try_recv() {
-                Ok(StreamEvent::Reasoning(r)) => msg.reasoning.push_str(&r),
-                Ok(StreamEvent::Content(c)) => {
-                    if msg.text.is_empty() && !msg.reasoning.trim().is_empty() {
-                        msg.collapse_reasoning = true;
-                    }
-                    msg.text.push_str(&c);
-                }
-                Ok(StreamEvent::Done(reason)) => {
-                    msg.status = Status::Done;
-                    msg.finish_reason = reason;
-                    finished = true;
-                    break;
-                }
-                Ok(StreamEvent::Error(e)) => {
-                    msg.status = Status::Failed(e);
-                    finished = true;
-                    break;
-                }
+                Ok(e) => events.push(e),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    msg.status = Status::Failed("Die Verbindung wurde unerwartet beendet.".into());
-                    finished = true;
+                    disconnected = true;
                     break;
                 }
             }
+        }
+        let mut finished = false;
+        let mut changes = Vec::new();
+        if let Some(msg) = self.messages.last_mut() {
+            for event in events {
+                finished |= apply_event(msg, event, &mut changes);
+            }
+            if disconnected && !finished {
+                msg.status = Status::Failed("Die Verbindung wurde unerwartet beendet.".into());
+                msg.settle_tools();
+                finished = true;
+            }
+        }
+        for change in &changes {
+            self.record_change(change);
         }
         if finished {
             self.active = None;
         }
     }
 
-    // ------------------------------------------------------------ attachments
+    // --------------------------------------------------------- attachments
 
     fn load_paths(&mut self, paths: Vec<PathBuf>, ctx: &egui::Context) {
         if paths.is_empty() {
@@ -431,10 +752,11 @@ impl NemotronApp {
     // --------------------------------------------------------------- input
 
     fn handle_global_input(&mut self, ctx: &egui::Context) {
-        let (settings, new_chat, escape) = ctx.input_mut(|i| {
+        let (settings, new_chat, open_project, escape) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::N)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O)),
                 i.key_pressed(Key::Escape),
             )
         });
@@ -444,11 +766,12 @@ impl NemotronApp {
         if new_chat {
             self.new_chat(ctx);
         }
-        if escape
-            && self.active.is_some()
-            && self.settings_draft.is_none()
-            && self.url_draft.is_none()
-        {
+        if open_project {
+            self.pick_workspace(ctx);
+        }
+        let dialog_open =
+            self.settings_draft.is_some() || self.url_draft.is_some() || self.diff_view.is_some();
+        if escape && self.active.is_some() && !dialog_open {
             self.stop();
         }
 
@@ -459,7 +782,12 @@ impl NemotronApp {
                 .map(|f| f.path().to_path_buf())
                 .collect()
         });
-        self.load_paths(dropped, ctx);
+        // A dropped folder opens as project; files are attached.
+        let (dirs, files): (Vec<_>, Vec<_>) = dropped.into_iter().partition(|p| p.is_dir());
+        if let Some(dir) = dirs.first() {
+            self.open_workspace(dir, ctx);
+        }
+        self.load_paths(files, ctx);
     }
 
     // ------------------------------------------------------------------ UI
@@ -468,15 +796,22 @@ impl NemotronApp {
         egui::Panel::top("kopfzeile").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Fadis Nemotron").strong().size(18.0).color(accent(ui)));
-                ui.hyperlink_to(RichText::new(&self.settings.model).small().weak(), MODEL_URL)
+                ui.label(RichText::new("Fadis Nemotron").strong().size(18.0).color(widgets::accent(ui)));
+                let mode = if self.workspace.is_some() { "Agent" } else { "Chat" };
+                ui.label(RichText::new(mode).small().strong().color(Color32::BLACK).background_color(widgets::accent(ui)))
+                    .on_hover_text(if self.workspace.is_some() {
+                        "Nemotron liest und ändert Dateien im geöffneten Projektordner."
+                    } else {
+                        "Nur Chat. Öffne einen Projektordner, damit Nemotron Dateien lesen und ändern kann."
+                    });
+                ui.hyperlink_to(RichText::new(&self.settings.model).small().weak(), widgets::MODEL_URL)
                     .on_hover_text("Modellseite auf build.nvidia.com öffnen");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("⚙ Einstellungen").on_hover_text("⌘ ,").clicked() {
+                    if ui.button("⚙").on_hover_text("Einstellungen (⌘ ,)").clicked() {
                         self.open_settings();
                     }
                     if ui
-                        .add_enabled(!self.messages.is_empty(), egui::Button::new("💾 Exportieren"))
+                        .add_enabled(!self.messages.is_empty(), egui::Button::new("💾"))
                         .on_hover_text("Chat als Markdown speichern")
                         .clicked()
                     {
@@ -485,13 +820,15 @@ impl NemotronApp {
                     if ui.button("➕ Neuer Chat").on_hover_text("⌘ N").clicked() {
                         self.new_chat(ctx);
                     }
+                    if self.workspace.is_none()
+                        && ui.button("📁 Projekt öffnen").on_hover_text("Ordner wählen, in dem Nemotron arbeiten soll (⌘ O)").clicked()
+                    {
+                        self.pick_workspace(ctx);
+                    }
                     let mut thinking = self.settings.thinking;
                     if ui
                         .checkbox(&mut thinking, "Denkmodus")
-                        .on_hover_text(
-                            "An: Nemotron denkt vor der Antwort nach (besser bei schweren Aufgaben).\n\
-                             Aus: schnellere, direkte Antworten.",
-                        )
+                        .on_hover_text("An: Nemotron denkt vor der Antwort nach (besser bei schweren Aufgaben).\nAus: schnellere, direkte Antworten.")
                         .changed()
                     {
                         self.settings.thinking = thinking;
@@ -506,10 +843,95 @@ impl NemotronApp {
         });
     }
 
+    fn project_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let Some(ws) = &self.workspace else { return };
+        let (name, root) = (ws.name(), ws.root().to_path_buf());
+        let busy = self.active.is_some();
+        let mut action: Option<UiAction> = None;
+        let mut switch = false;
+        let mut close = false;
+        egui::Panel::right("projekt").resizable(true).default_size(270.0).min_size(200.0).show(ui, |ui| {
+            egui::ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+                ui.add_space(8.0);
+                ui.label(RichText::new(format!("📁 {name}")).strong().size(16.0));
+                ui.add(egui::Label::new(RichText::new(root.display().to_string()).small().weak()).truncate())
+                    .on_hover_text(root.display().to_string());
+                ui.horizontal_wrapped(|ui| {
+                    switch = ui.add_enabled(!busy, egui::Button::new("Wechseln")).clicked();
+                    if ui.button("Im Finder").on_hover_text("Ordner im Dateimanager zeigen").clicked() {
+                        Self::reveal_in_file_manager(&root);
+                    }
+                    close = ui
+                        .add_enabled(!busy, egui::Button::new("Schließen"))
+                        .on_hover_text("Zurück zum reinen Chat")
+                        .clicked();
+                });
+                ui.add_space(8.0);
+                ui.label(RichText::new("Nemotron darf").strong());
+                let before = self.settings.approval;
+                for mode in ApprovalMode::ALL {
+                    ui.radio_value(&mut self.settings.approval, mode, mode.label());
+                }
+                if self.settings.approval != before {
+                    self.save_settings();
+                }
+                ui.label(
+                    RichText::new("Lesen und Suchen geht immer ohne Nachfrage. Gilt ab der nächsten Nachricht.")
+                        .small()
+                        .weak(),
+                );
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(format!("Änderungen ({})", self.changes.len())).strong());
+                });
+                if self.changes.is_empty() {
+                    ui.label(RichText::new("Noch keine Dateien geändert.").weak());
+                }
+                for (i, change) in self.changes.iter().enumerate() {
+                    let (added, removed) = change.line_stats();
+                    ui.push_id(i, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Label::new(RichText::new(&change.path).monospace().size(12.0))
+                                    .truncate()
+                                    .sense(egui::Sense::click()),
+                            )
+                            .on_hover_text(if change.original.is_none() { "neu erstellt" } else { "geändert" });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(format!("+{added}")).color(widgets::ADDED).small());
+                            ui.label(RichText::new(format!("−{removed}")).color(widgets::REMOVED).small());
+                            if ui.small_button("Diff").clicked() {
+                                action = Some(UiAction::ShowDiff { title: change.path.clone(), diff: change.diff() });
+                            }
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("↶ Rückgängig").small())
+                                .on_hover_text("Datei wieder auf den Stand vor Nemotrons Änderung setzen")
+                                .clicked()
+                            {
+                                action = Some(UiAction::Undo(i));
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+            });
+        });
+        if switch {
+            self.pick_workspace(ctx);
+        }
+        if close {
+            self.close_workspace(ctx);
+        }
+        if let Some(action) = action {
+            self.apply_ui_action(action, ctx);
+        }
+    }
+
     fn composer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::Panel::bottom("eingabe").show(ui, |ui| {
             ui.add_space(8.0);
-            if let Some(i) = attachment_row(ui, &self.pending, true) {
+            if let Some(i) = widgets::attachment_row(ui, &self.pending, true) {
                 let att = self.pending.remove(i);
                 ctx.forget_image(&att.preview_uri());
             }
@@ -524,47 +946,68 @@ impl NemotronApp {
             let mut stop = false;
             let mut pick = false;
             let mut add_url = false;
+            let hint = if self.workspace.is_some() {
+                "Sag Nemotron, was im Projekt passieren soll … (Enter senden, Shift+Enter neue Zeile)"
+            } else {
+                "Nachricht an Nemotron … (Enter senden, Shift+Enter neue Zeile)"
+            };
+            // `horizontal` keeps the row as tall as its content; a free
+            // layout here would stretch the panel over the whole window.
             ui.horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Max), |ui| {
-                    if self.active.is_some() {
-                        stop = ui
-                            .add_sized([96.0, 34.0], egui::Button::new("⏹ Stop"))
-                            .on_hover_text("Esc")
-                            .clicked();
-                    } else {
-                        let label = RichText::new("Senden ➤").strong().color(Color32::BLACK);
-                        send = ui
-                            .add_enabled_ui(self.can_send(), |ui| {
-                                ui.add_sized([96.0, 34.0], egui::Button::new(label).fill(ACCENT))
+                let spacing = ui.spacing().item_spacing.x;
+                let buttons = 34.0 + 34.0 + 96.0 + 3.0 * spacing;
+                let input_width = (ui.available_width() - buttons).max(120.0);
+                // A long prompt scrolls inside the box instead of pushing the
+                // chat out of the window.
+                let response = ui
+                    .allocate_ui_with_layout(egui::vec2(input_width, 0.0), Layout::top_down(Align::Min), |ui| {
+                        ui.set_width(input_width);
+                        egui::ScrollArea::vertical()
+                            .id_salt("eingabe_scroll")
+                            .max_height(180.0)
+                            .min_scrolled_height(180.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.add(
+                                    egui::TextEdit::multiline(&mut self.input)
+                                        .hint_text(hint)
+                                        .desired_rows(2)
+                                        .desired_width(f32::INFINITY)
+                                        .min_size(egui::vec2(0.0, 56.0))
+                                        .return_key(KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter)),
+                                )
                             })
                             .inner
-                            .on_hover_text("Enter")
-                            .clicked();
-                    }
-                    add_url = ui
-                        .add_sized([34.0, 34.0], egui::Button::new("🔗"))
-                        .on_hover_text("Bild- oder Video-Link anhängen")
-                        .clicked();
-                    pick = ui
-                        .add_sized([34.0, 34.0], egui::Button::new("📎"))
-                        .on_hover_text("Bilder oder Videos anhängen (oder ins Fenster ziehen)")
-                        .clicked();
+                    })
+                    .inner;
+                if self.focus_input {
+                    response.request_focus();
+                    self.focus_input = false;
+                }
+                if response.has_focus() && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift) {
+                    send = true;
+                }
 
-                    let edit = egui::TextEdit::multiline(&mut self.input)
-                        .hint_text("Nachricht an Nemotron … (Enter senden, Shift+Enter neue Zeile)")
-                        .desired_rows(2)
-                        .return_key(KeyboardShortcut::new(Modifiers::SHIFT, Key::Enter));
-                    let response = ui.add_sized([ui.available_width(), 56.0], edit);
-                    if self.focus_input {
-                        response.request_focus();
-                        self.focus_input = false;
-                    }
-                    if response.has_focus()
-                        && ui.input(|i| i.key_pressed(Key::Enter) && !i.modifiers.shift)
-                    {
-                        send = true;
-                    }
-                });
+                pick = ui
+                    .add_sized([34.0, 34.0], egui::Button::new("📎"))
+                    .on_hover_text("Bilder oder Videos anhängen (oder ins Fenster ziehen)")
+                    .clicked();
+                add_url = ui
+                    .add_sized([34.0, 34.0], egui::Button::new("🔗"))
+                    .on_hover_text("Bild- oder Video-Link anhängen")
+                    .clicked();
+                if self.active.is_some() {
+                    stop = ui.add_sized([96.0, 34.0], egui::Button::new("⏹ Stop")).on_hover_text("Esc").clicked();
+                } else {
+                    let label = RichText::new("Senden ➤").strong().color(Color32::BLACK);
+                    send |= ui
+                        .add_enabled_ui(self.can_send(), |ui| {
+                            ui.add_sized([96.0, 34.0], egui::Button::new(label).fill(widgets::ACCENT))
+                        })
+                        .inner
+                        .on_hover_text("Enter")
+                        .clicked();
+                }
             });
             ui.add_space(8.0);
 
@@ -579,12 +1022,7 @@ impl NemotronApp {
                 self.pick_files(ctx);
             }
             if add_url {
-                self.url_draft = Some(UrlDraft {
-                    url: String::new(),
-                    kind: AttachmentKind::Image,
-                    kind_chosen: false,
-                    error: None,
-                });
+                self.url_draft = Some(UrlDraft { url: String::new(), kind: AttachmentKind::Image, kind_chosen: false, error: None });
             }
         });
     }
@@ -597,7 +1035,7 @@ impl NemotronApp {
                     let color = if notice.error {
                         ui.visuals().error_fg_color
                     } else {
-                        accent(ui)
+                        widgets::accent(ui)
                     };
                     ui.label(RichText::new(&notice.text).color(color));
                     close = ui.small_button("✖").on_hover_text("Ausblenden").clicked();
@@ -609,63 +1047,137 @@ impl NemotronApp {
             }
 
             if self.messages.is_empty() {
-                self.welcome(ui);
+                self.welcome(ui, ctx);
                 return;
             }
 
-            let mut action = None;
+            let mut actions = Vec::new();
             let count = self.messages.len();
             let busy = self.active.is_some();
+            // The only scroll area in the chat: nested ones would catch the
+            // mouse wheel and make the chat feel stuck.
+            let jump_to_end = std::mem::take(&mut self.scroll_to_bottom);
             egui::ScrollArea::vertical()
+                .id_salt("chat")
                 .auto_shrink(false)
                 .stick_to_bottom(true)
                 .show(ui, |ui| {
-                    centered_column(ui, |ui| {
+                    widgets::centered_column(ui, |ui| {
                         ui.add_space(8.0);
                         for (i, msg) in self.messages.iter_mut().enumerate() {
                             let is_last = i + 1 == count;
                             ui.push_id(i, |ui| {
-                                if let Some(a) =
-                                    message_ui(ui, msg, is_last && !busy, &mut self.markdown)
-                                {
-                                    action = Some(a);
-                                }
+                                widgets::message_ui(
+                                    ui,
+                                    msg,
+                                    is_last,
+                                    busy,
+                                    &mut self.markdown,
+                                    &mut actions,
+                                );
                             });
                             ui.add_space(10.0);
                         }
                     });
+                    if jump_to_end {
+                        // After sending, show the new message even if the user had scrolled up.
+                        ui.scroll_to_cursor(Some(Align::BOTTOM));
+                    }
                 });
-
-            match action {
-                Some(MessageAction::Copy(text)) => {
-                    ctx.copy_text(text);
-                    self.notice = Some(Notice {
-                        text: "Antwort kopiert.".into(),
-                        error: false,
-                    });
-                }
-                Some(MessageAction::Retry) => self.retry(ctx),
-                None => {}
+            for action in actions {
+                self.apply_ui_action(action, ctx);
             }
         });
     }
 
-    fn welcome(&mut self, ui: &mut egui::Ui) {
-        ui.vertical_centered(|ui| {
-            ui.add_space((ui.available_height() * 0.22).max(16.0));
-            ui.label(RichText::new("Nemotron 3.5 Super VL").size(26.0).strong().color(accent(ui)));
-            ui.add_space(4.0);
-            ui.label("Offenes Multimodal-Modell von NVIDIA · 120 Mrd. Parameter (12 Mrd. aktiv) · bis 1 Mio. Token Kontext");
-            ui.add_space(14.0);
-            ui.label("Stell eine Frage, oder zieh Bilder, Screenshots, Dokument-Seiten oder ein MP4-Video ins Fenster.");
-            ui.label(RichText::new("Tipp: Für Videos 1–2 Minuten lange Clips verwenden. PDFs vorher als PNG exportieren.").weak());
-            if self.needs_api_key() {
-                ui.add_space(14.0);
-                if ui.button("🔑 API-Schlüssel eintragen").clicked() {
-                    self.open_settings();
-                }
+    fn apply_ui_action(&mut self, action: UiAction, ctx: &egui::Context) {
+        match action {
+            UiAction::Copy(text) => {
+                ctx.copy_text(text);
+                self.notice = Some(Notice {
+                    text: "In die Zwischenablage kopiert.".into(),
+                    error: false,
+                });
             }
-        });
+            UiAction::Retry => self.retry(ctx),
+            UiAction::Decide { call_id, decision } => self.decide(&call_id, decision),
+            UiAction::ShowDiff { title, diff } => self.diff_view = Some((title, diff)),
+            UiAction::Undo(index) => self.undo_change(index, false),
+            UiAction::OpenProject => self.pick_workspace(ctx),
+            UiAction::OpenSettings => self.open_settings(),
+            UiAction::UsePrompt(text) => {
+                self.input = text;
+                self.focus_input = true;
+            }
+        }
+    }
+
+    fn welcome(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let mut actions = Vec::new();
+        widgets::welcome(
+            ui,
+            self.workspace.as_ref().map(Workspace::name).as_deref(),
+            self.needs_api_key(),
+            &mut actions,
+        );
+        for action in actions {
+            self.apply_ui_action(action, ctx);
+        }
+    }
+
+    fn diff_window(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let Some((title, diff)) = &self.diff_view else {
+            return;
+        };
+        let mut open = true;
+        egui::Window::new(format!("Änderungen: {title}"))
+            .open(&mut open)
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(screen.center())
+            .default_size([720.0, 520.0])
+            .resizable(true)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                    widgets::diff_label(ui, diff, usize::MAX);
+                });
+            });
+        if !open {
+            self.diff_view = None;
+        }
+    }
+
+    fn undo_confirm_window(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let Some(confirm) = &self.undo_confirm else {
+            return;
+        };
+        let index = confirm.index;
+        let Some(path) = self.changes.get(index).map(|c| c.path.clone()) else {
+            self.undo_confirm = None;
+            return;
+        };
+        let mut yes = false;
+        let mut no = false;
+        egui::Window::new("Trotzdem rückgängig machen?")
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(screen.center())
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "{path} wurde nach Nemotrons Änderung noch einmal verändert. Rückgängig setzt die Datei auf den Stand vor Nemotron zurück; spätere Änderungen gehen verloren."
+                ));
+                ui.horizontal(|ui| {
+                    yes = ui.button("Zurücksetzen").clicked();
+                    no = ui.button("Abbrechen").clicked();
+                });
+            });
+        if yes {
+            self.undo_confirm = None;
+            self.undo_change(index, true);
+        } else if no {
+            self.undo_confirm = None;
+        }
     }
 
     fn settings_window(&mut self, ctx: &egui::Context, screen: egui::Rect) {
@@ -690,19 +1202,14 @@ impl NemotronApp {
             .open(&mut open)
             .collapsible(false)
             .resizable(true)
-            .default_width(600.0)
+            .default_width(620.0)
             .show(ctx, |ui| {
                 let s = &mut draft.settings;
                 egui::Grid::new("einstellungen").num_columns(2).spacing([14.0, 10.0]).show(ui, |ui| {
                     ui.label("API-Schlüssel");
                     ui.vertical(|ui| {
                         ui.horizontal(|ui| {
-                            ui.add(
-                                egui::TextEdit::singleline(&mut s.api_key)
-                                    .password(!draft.show_key)
-                                    .hint_text("nvapi-…")
-                                    .desired_width(340.0),
-                            );
+                            ui.add(egui::TextEdit::singleline(&mut s.api_key).password(!draft.show_key).hint_text("nvapi-…").desired_width(340.0));
                             ui.checkbox(&mut draft.show_key, "anzeigen");
                         });
                         ui.hyperlink_to("Kostenlosen Schlüssel auf build.nvidia.com holen", API_KEY_URL);
@@ -733,29 +1240,37 @@ impl NemotronApp {
                     ui.end_row();
 
                     ui.label("Denkmodus");
-                    ui.horizontal(|ui| {
-                        ui.checkbox(&mut s.thinking, "an");
-                        ui.add_enabled_ui(s.thinking, |ui| {
-                            ui.label("Denk-Budget");
-                            ui.add(egui::DragValue::new(&mut s.reasoning_budget).range(0..=1_000_000).speed(64))
-                                .on_hover_text("Höchstzahl Tokens fürs Nachdenken. 0 = keine Grenze (Standard).");
+                    ui.checkbox(&mut s.thinking, "an (Nemotron denkt vor der Antwort nach)");
+                    ui.end_row();
+
+                    ui.label("Agent darf");
+                    egui::ComboBox::from_id_salt("freigabe")
+                        .selected_text(s.approval.label())
+                        .width(340.0)
+                        .show_ui(ui, |ui| {
+                            for mode in ApprovalMode::ALL {
+                                ui.selectable_value(&mut s.approval, mode, mode.label());
+                            }
                         });
-                    });
+                    ui.end_row();
+
+                    ui.label("Max. Schritte");
+                    ui.add(egui::DragValue::new(&mut s.max_steps).range(1..=300))
+                        .on_hover_text("So viele Anfragen darf Nemotron pro Nachricht stellen (lesen, ändern, prüfen …), bevor er pausiert.");
                     ui.end_row();
 
                     ui.label("Temperatur");
                     ui.add(egui::Slider::new(&mut s.temperature, 0.0..=2.0).step_by(0.05))
-                        .on_hover_text("NVIDIA empfiehlt 1.0");
+                        .on_hover_text("NVIDIA empfiehlt 1.0 für Text, 0.6 für Bilder und Agenten.");
                     ui.end_row();
 
                     ui.label("Top-p");
-                    ui.add(egui::Slider::new(&mut s.top_p, 0.0..=1.0).step_by(0.01))
-                        .on_hover_text("NVIDIA empfiehlt 0.95");
+                    ui.add(egui::Slider::new(&mut s.top_p, 0.0..=1.0).step_by(0.01)).on_hover_text("NVIDIA empfiehlt 0.95");
                     ui.end_row();
 
                     ui.label("Max. Tokens");
-                    ui.add(egui::DragValue::new(&mut s.max_tokens).range(256..=262_144).speed(128))
-                        .on_hover_text("Länge von Denken + Antwort zusammen. Bei leeren Antworten erhöhen.");
+                    ui.add(egui::DragValue::new(&mut s.max_tokens).range(256..=131_072).speed(128))
+                        .on_hover_text("Länge von Denken + Antwort je Schritt. Bei leeren oder abgeschnittenen Antworten erhöhen (NVIDIA-Cloud: max. 131072).");
                     ui.end_row();
 
                     ui.label("Max. Bildgröße");
@@ -765,8 +1280,9 @@ impl NemotronApp {
                     });
                     ui.end_row();
 
-                    ui.label("System-Prompt");
-                    ui.add(egui::TextEdit::multiline(&mut s.system_prompt).desired_rows(3).desired_width(400.0));
+                    ui.label("Eigene Anweisungen");
+                    ui.add(egui::TextEdit::multiline(&mut s.system_prompt).desired_rows(3).desired_width(400.0))
+                        .on_hover_text("Im Chat der System-Prompt; im Agent-Modus zusätzliche Anweisungen.");
                     ui.end_row();
                 });
 
@@ -776,9 +1292,10 @@ impl NemotronApp {
                     save = ui.button(RichText::new("Speichern").strong()).clicked();
                     cancel = ui.button("Abbrechen").clicked();
                     check = ui.add_enabled(draft.check.is_none(), egui::Button::new("Verbindung testen")).clicked();
-                    if ui.button("Standardwerte").on_hover_text("Alles außer dem API-Schlüssel zurücksetzen").clicked() {
+                    if ui.button("Standardwerte").on_hover_text("Alles außer API-Schlüssel und Projekt zurücksetzen").clicked() {
                         let key = std::mem::take(&mut draft.settings.api_key);
-                        draft.settings = Settings { api_key: key, ..Settings::default() };
+                        let workspace = draft.settings.workspace.take();
+                        draft.settings = Settings { api_key: key, workspace, ..Settings::default() };
                     }
                 });
                 if draft.check.is_some() {
@@ -789,7 +1306,7 @@ impl NemotronApp {
                 }
                 match &draft.check_result {
                     Some(Ok(msg)) => {
-                        ui.label(RichText::new(format!("✔ {msg}")).color(accent(ui)));
+                        ui.label(RichText::new(format!("✔ {msg}")).color(widgets::accent(ui)));
                     }
                     Some(Err(msg)) => {
                         ui.label(RichText::new(format!("⚠ {msg}")).color(ui.visuals().error_fg_color));
@@ -800,12 +1317,12 @@ impl NemotronApp {
 
         if check {
             let (tx, rx) = mpsc::channel();
-            let agent = self.agent.clone();
+            let http = self.http.clone();
             let s = draft.settings.clone();
             let ctx = ctx.clone();
             std::thread::spawn(move || {
                 let result = api::check_connection(
-                    &agent,
+                    &http,
                     &s.base_url,
                     &s.effective_api_key(),
                     s.model.trim(),
@@ -821,6 +1338,8 @@ impl NemotronApp {
             settings.base_url = settings.base_url.trim().to_owned();
             settings.model = settings.model.trim().to_owned();
             settings.api_key = settings.api_key.trim().to_owned();
+            // The project folder is managed in the side panel, not here.
+            settings.workspace = self.settings.workspace.clone();
             self.settings = settings;
             self.settings_draft = None;
             self.save_settings();
@@ -886,237 +1405,134 @@ impl NemotronApp {
     }
 }
 
+/// Applies one agent event to the streaming message. Returns true when the
+/// request is over. File changes are collected for the change list.
+fn apply_event(msg: &mut Message, event: AgentEvent, changes: &mut Vec<FileChange>) -> bool {
+    match event {
+        AgentEvent::StepStarted => msg.steps.push(Step::default()),
+        AgentEvent::Text(delta) => {
+            if msg.steps.is_empty() {
+                msg.steps.push(Step::default());
+            }
+            let step = msg.steps.last_mut().expect("step exists");
+            match delta {
+                TextDelta::Reasoning(r) => step.reasoning.push_str(&r),
+                TextDelta::Content(c) => {
+                    let was_answering = !step.parts().1.is_empty();
+                    step.content.push_str(&c);
+                    if !was_answering && !step.parts().1.is_empty() {
+                        step.collapse_once();
+                    }
+                }
+            }
+        }
+        AgentEvent::StepFinished {
+            content,
+            reasoning,
+            tool_calls,
+        } => {
+            if msg.steps.is_empty() {
+                msg.steps.push(Step::default());
+            }
+            let step = msg.steps.last_mut().expect("step exists");
+            step.content = content;
+            step.reasoning = reasoning;
+            step.tools = tool_calls
+                .into_iter()
+                .map(|call| ToolView {
+                    call,
+                    state: ToolState::Planned,
+                    output: String::new(),
+                    ok: false,
+                    change: None,
+                    preview: None,
+                    warning: None,
+                })
+                .collect();
+            if !step.tools.is_empty() || !step.parts().1.is_empty() {
+                step.collapse_once();
+            }
+        }
+        AgentEvent::ApprovalNeeded {
+            call_id,
+            preview,
+            warning,
+        } => {
+            if let Some(tool) = msg.tool_mut(&call_id) {
+                tool.state = ToolState::AwaitingApproval;
+                tool.preview = preview;
+                tool.warning = warning;
+            }
+        }
+        AgentEvent::ToolStarted { call_id } => {
+            if let Some(tool) = msg.tool_mut(&call_id) {
+                tool.state = ToolState::Running;
+            }
+        }
+        AgentEvent::ToolFinished {
+            call_id,
+            output,
+            ok,
+            change,
+        } => {
+            if let Some(tool) = msg.tool_mut(&call_id) {
+                if tool.state != ToolState::Declined {
+                    tool.state = ToolState::Done;
+                }
+                tool.output = output;
+                tool.ok = ok;
+                tool.preview = None;
+                if let Some(change) = &change {
+                    changes.push(change.clone());
+                }
+                tool.change = change;
+            }
+        }
+        AgentEvent::Notice(text) => msg.notices.push(text),
+        AgentEvent::Finished { finish_reason } => {
+            msg.status = Status::Done;
+            msg.finish_reason = finish_reason;
+            return true;
+        }
+        AgentEvent::Failed(e) => {
+            msg.status = Status::Failed(e);
+            msg.settle_tools();
+            return true;
+        }
+        AgentEvent::Cancelled => {
+            msg.status = Status::Cancelled;
+            msg.settle_tools();
+            return true;
+        }
+    }
+    false
+}
+
 impl eframe::App for NemotronApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let full_rect = ui.max_rect();
 
-        self.poll_stream();
+        self.poll_agent();
+        self.poll_stopped();
         self.poll_attachments();
         self.handle_global_input(&ctx);
 
         self.top_bar(ui, &ctx);
         self.composer(ui, &ctx);
+        self.project_panel(ui, &ctx);
         self.chat_area(ui, &ctx);
         self.settings_window(&ctx, full_rect);
         self.url_window(&ctx, full_rect);
-        drop_overlay(&ctx, full_rect);
+        self.diff_window(&ctx, full_rect);
+        self.undo_confirm_window(&ctx, full_rect);
+        widgets::drop_overlay(&ctx, full_rect);
 
         if self.active.is_some() || self.loading_attachments > 0 {
             // Keeps spinners moving even when no tokens arrive (long thinking).
             ctx.request_repaint_after(Duration::from_millis(200));
         }
     }
-}
-
-// ------------------------------------------------------------------ helpers
-
-fn accent(ui: &egui::Ui) -> Color32 {
-    if ui.visuals().dark_mode {
-        ACCENT
-    } else {
-        ACCENT_LIGHT_THEME
-    }
-}
-
-fn setup_style(ctx: &egui::Context) {
-    ctx.all_styles_mut(|style| {
-        for (text_style, font) in &mut style.text_styles {
-            font.size = match text_style {
-                TextStyle::Small => 11.5,
-                TextStyle::Body | TextStyle::Button => 14.5,
-                TextStyle::Monospace => 13.0,
-                TextStyle::Heading => 20.0,
-                _ => font.size,
-            };
-        }
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(10.0, 5.0);
-        style.url_in_tooltip = true;
-        let accent = if style.visuals.dark_mode {
-            ACCENT
-        } else {
-            ACCENT_LIGHT_THEME
-        };
-        style.visuals.hyperlink_color = accent;
-        style.visuals.selection.bg_fill = accent.gamma_multiply(0.45);
-    });
-}
-
-/// Lays `add_contents` out in a centred column of at most [`MAX_COLUMN_WIDTH`].
-fn centered_column(ui: &mut egui::Ui, add_contents: impl FnOnce(&mut egui::Ui)) {
-    let width = ui.available_width();
-    let column = width.min(MAX_COLUMN_WIDTH);
-    let side = ((width - column) / 2.0).max(0.0);
-    ui.horizontal_top(|ui| {
-        ui.add_space(side);
-        ui.vertical(|ui| {
-            ui.set_width(column);
-            add_contents(ui);
-        });
-    });
-}
-
-fn message_ui(
-    ui: &mut egui::Ui,
-    msg: &mut Message,
-    is_last: bool,
-    markdown: &mut CommonMarkCache,
-) -> Option<MessageAction> {
-    let user = msg.role == Role::User;
-    let fill = if user {
-        accent(ui).gamma_multiply(0.14)
-    } else {
-        ui.visuals().faint_bg_color
-    };
-    let collapse = std::mem::take(&mut msg.collapse_reasoning);
-    let mut action = None;
-
-    egui::Frame::new()
-        .fill(fill)
-        .corner_radius(10)
-        .inner_margin(12)
-        .show(ui, |ui| {
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(if user { "Du" } else { "Nemotron" }).strong());
-                if msg.status == Status::Streaming {
-                    ui.spinner();
-                    let (_, answer) = msg.parts();
-                    ui.label(RichText::new(if answer.is_empty() { "denkt nach …" } else { "schreibt …" }).weak());
-                }
-            });
-
-            if user {
-                if !msg.attachments.is_empty() {
-                    attachment_row(ui, &msg.attachments, false);
-                }
-                if !msg.text.is_empty() {
-                    ui.add(egui::Label::new(&msg.text).selectable(true));
-                }
-                return;
-            }
-
-            let (thinking, answer) = msg.parts();
-            if let Some(thinking) = thinking {
-                egui::CollapsingHeader::new(
-                    RichText::new(format!("💭 Denkprozess ({} Zeichen)", thinking.chars().count())).weak(),
-                )
-                .id_salt("denkprozess")
-                .default_open(msg.status == Status::Streaming)
-                .open(collapse.then_some(false))
-                .show(ui, |ui| {
-                    egui::ScrollArea::vertical()
-                        .max_height(260.0)
-                        .stick_to_bottom(true)
-                        .show(ui, |ui| {
-                            ui.add(egui::Label::new(RichText::new(thinking).weak()).selectable(true));
-                        });
-                });
-            }
-            if !answer.is_empty() {
-                CommonMarkViewer::new().show(ui, markdown, answer);
-            }
-
-            let warn = ui.visuals().warn_fg_color;
-            match &msg.status {
-                Status::Streaming => {}
-                Status::Failed(e) => {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("⚠ {e}"));
-                }
-                Status::Cancelled => {
-                    ui.label(RichText::new("Abgebrochen.").weak());
-                }
-                Status::Done => {
-                    if msg.finish_reason.as_deref() == Some("length") {
-                        ui.colored_label(
-                            warn,
-                            "Die Antwort wurde bei „Max. Tokens“ abgeschnitten. Erhöhe den Wert in den Einstellungen.",
-                        );
-                    } else if answer.trim().is_empty() {
-                        ui.colored_label(
-                            warn,
-                            "Keine Antwort erhalten. Erhöhe „Max. Tokens“ oder schalte den Denkmodus aus.",
-                        );
-                    }
-                }
-            }
-
-            if msg.status != Status::Streaming {
-                ui.horizontal(|ui| {
-                    if !answer.trim().is_empty() && ui.small_button("📋 Kopieren").clicked() {
-                        action = Some(MessageAction::Copy(answer.trim().to_owned()));
-                    }
-                    if is_last {
-                        let label = if msg.status == Status::Done { "↻ Neu generieren" } else { "↻ Erneut versuchen" };
-                        if ui.small_button(label).clicked() {
-                            action = Some(MessageAction::Retry);
-                        }
-                    }
-                });
-            }
-        });
-    action
-}
-
-/// Shows attachments as a row of thumbnails. Returns the index the user
-/// asked to remove, if `removable`.
-fn attachment_row(ui: &mut egui::Ui, items: &[Attachment], removable: bool) -> Option<usize> {
-    let mut remove = None;
-    ui.horizontal_wrapped(|ui| {
-        for (i, att) in items.iter().enumerate() {
-            egui::Frame::group(ui.style()).show(ui, |ui| {
-                ui.set_max_width(150.0);
-                ui.vertical(|ui| {
-                    match att.image_bytes() {
-                        Some(bytes) => {
-                            ui.add(
-                                egui::Image::from_bytes(att.preview_uri(), bytes)
-                                    .fit_to_exact_size(egui::vec2(140.0, 96.0))
-                                    .corner_radius(4),
-                            );
-                        }
-                        None => {
-                            let icon = match (&att.source, att.kind) {
-                                (attachments::Source::Url(_), AttachmentKind::Image) => "🔗🖼",
-                                (attachments::Source::Url(_), AttachmentKind::Video) => "🔗🎬",
-                                (_, _) => "🎬",
-                            };
-                            ui.label(RichText::new(icon).size(30.0));
-                        }
-                    }
-                    ui.add(egui::Label::new(RichText::new(&att.name).small()).truncate())
-                        .on_hover_text(&att.name);
-                    ui.label(RichText::new(att.size_label()).small().weak());
-                    if let Some(note) = &att.note {
-                        ui.label(RichText::new(note).small().weak());
-                    }
-                    if removable && ui.small_button("✖ Entfernen").clicked() {
-                        remove = Some(i);
-                    }
-                });
-            });
-        }
-    });
-    remove
-}
-
-fn drop_overlay(ctx: &egui::Context, rect: egui::Rect) {
-    if ctx.input(|i| i.raw.hovered_files.is_empty()) {
-        return;
-    }
-    let painter = ctx.layer_painter(egui::LayerId::new(
-        egui::Order::Foreground,
-        egui::Id::unique("ablegen"),
-    ));
-    painter.rect_filled(rect, 0.0, Color32::from_black_alpha(170));
-    painter.text(
-        rect.center(),
-        egui::Align2::CENTER_CENTER,
-        "Bilder oder Videos hier ablegen",
-        egui::FontId::proportional(24.0),
-        Color32::WHITE,
-    );
 }
 
 /// The conversation as Markdown, for export.
@@ -1138,17 +1554,31 @@ fn conversation_markdown(messages: &[Message], model: &str) -> String {
             }
             Role::Assistant => {
                 out.push_str("\n## Nemotron\n\n");
-                let (thinking, answer) = msg.parts();
-                if let Some(thinking) = thinking {
-                    out.push_str("<details><summary>Denkprozess</summary>\n\n");
-                    out.push_str(thinking);
-                    out.push_str("\n\n</details>\n\n");
+                for step in &msg.steps {
+                    let (thinking, answer) = step.parts();
+                    if let Some(thinking) = thinking {
+                        out.push_str("<details><summary>Denkprozess</summary>\n\n");
+                        out.push_str(thinking);
+                        out.push_str("\n\n</details>\n\n");
+                    }
+                    if !answer.trim().is_empty() {
+                        out.push_str(answer.trim());
+                        out.push_str("\n\n");
+                    }
+                    for tool in &step.tools {
+                        out.push_str(&format!(
+                            "- `{}`: {}\n",
+                            tool.call.name,
+                            widgets::tool_title(tool)
+                        ));
+                    }
+                    if !step.tools.is_empty() {
+                        out.push('\n');
+                    }
                 }
-                out.push_str(answer.trim());
-                out.push('\n');
                 match &msg.status {
-                    Status::Failed(e) => out.push_str(&format!("\n*Fehler: {e}*\n")),
-                    Status::Cancelled => out.push_str("\n*Abgebrochen.*\n"),
+                    Status::Failed(e) => out.push_str(&format!("*Fehler: {e}*\n")),
+                    Status::Cancelled => out.push_str("*Abgebrochen.*\n"),
                     _ => {}
                 }
             }
@@ -1161,23 +1591,191 @@ fn conversation_markdown(messages: &[Message], model: &str) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parts_prefer_separate_reasoning_and_fall_back_to_inline_tags() {
-        let mut m = Message::assistant();
-        m.reasoning = "Ich überlege.".into();
-        m.text = "\nAntwort".into();
-        assert_eq!(m.parts(), (Some("Ich überlege."), "Antwort"));
+    fn tool(id: &str, name: &str, args: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: args.into(),
+        }
+    }
 
-        let mut m = Message::assistant();
-        m.text = "<think>inline</think>Antwort".into();
-        assert_eq!(m.parts(), (Some("inline"), "Antwort"));
+    fn run_events(events: Vec<AgentEvent>) -> (Message, Vec<FileChange>) {
+        let mut msg = Message::assistant();
+        let mut changes = Vec::new();
+        for e in events {
+            apply_event(&mut msg, e, &mut changes);
+        }
+        (msg, changes)
     }
 
     #[test]
-    fn markdown_export_contains_turns_thinking_and_attachments() {
-        let mut answer = Message::assistant();
-        answer.reasoning = "Hmm.".into();
-        answer.text = "Eine Katze.".into();
+    fn events_build_steps_tools_and_changes() {
+        let change = FileChange {
+            path: "a.rs".into(),
+            abs: "/tmp/a.rs".into(),
+            before: Some("1\n".into()),
+            after: "2\n".into(),
+        };
+        let (msg, changes) = run_events(vec![
+            AgentEvent::StepStarted,
+            AgentEvent::Text(TextDelta::Reasoning("Ich lese.".into())),
+            AgentEvent::StepFinished {
+                content: String::new(),
+                reasoning: "Ich lese.".into(),
+                tool_calls: vec![
+                    tool("c1", "edit_file", "{}"),
+                    tool("c2", "run_command", "{}"),
+                ],
+            },
+            AgentEvent::ToolStarted {
+                call_id: "c1".into(),
+            },
+            AgentEvent::ToolFinished {
+                call_id: "c1".into(),
+                output: "Updated a.rs".into(),
+                ok: true,
+                change: Some(change.clone()),
+            },
+            AgentEvent::ApprovalNeeded {
+                call_id: "c2".into(),
+                preview: None,
+                warning: Some("git push".into()),
+            },
+        ]);
+        assert_eq!(msg.steps.len(), 1);
+        let step = &msg.steps[0];
+        assert!(step.collapse_reasoning);
+        assert_eq!(step.tools[0].state, ToolState::Done);
+        assert_eq!(step.tools[1].state, ToolState::AwaitingApproval);
+        assert_eq!(changes, vec![change]);
+
+        let mut msg = msg;
+        assert!(apply_event(
+            &mut msg,
+            AgentEvent::Cancelled,
+            &mut Vec::new()
+        ));
+        assert_eq!(msg.steps[0].tools[1].state, ToolState::NotRun);
+        assert_eq!(msg.status, Status::Cancelled);
+    }
+
+    #[test]
+    fn inline_thinking_collapses_when_the_answer_starts() {
+        let (msg, _) = run_events(vec![
+            AgentEvent::StepStarted,
+            AgentEvent::Text(TextDelta::Content("<think>hmm".into())),
+            AgentEvent::Text(TextDelta::Content("</think>".into())),
+        ]);
+        assert!(!msg.steps[0].collapse_reasoning);
+        let (msg, _) = run_events(vec![
+            AgentEvent::StepStarted,
+            AgentEvent::Text(TextDelta::Content("<think>hmm</think>".into())),
+            AgentEvent::Text(TextDelta::Content("Antwort".into())),
+        ]);
+        assert!(msg.steps[0].collapse_reasoning);
+        assert_eq!(msg.steps[0].parts(), (Some("hmm"), "Antwort"));
+    }
+
+    #[test]
+    fn history_keeps_tool_calls_paired_with_results() {
+        let mut app_messages = vec![Message::user("Ändere a.rs".into(), Vec::new())];
+        let (mut answer, _) = run_events(vec![
+            AgentEvent::StepStarted,
+            AgentEvent::StepFinished {
+                content: String::new(),
+                reasoning: "denken".into(),
+                tool_calls: vec![
+                    tool("c1", "read_file", r#"{"path":"a.rs"}"#),
+                    tool("c2", "edit_file", "{}"),
+                ],
+            },
+            AgentEvent::ToolFinished {
+                call_id: "c1".into(),
+                output: "1\tx".into(),
+                ok: true,
+                change: None,
+            },
+        ]);
+        apply_event(&mut answer, AgentEvent::Cancelled, &mut Vec::new());
+        app_messages.push(answer);
+
+        let (done, _) = run_events(vec![
+            AgentEvent::StepStarted,
+            AgentEvent::StepFinished {
+                content: "Fertig.".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+            },
+            AgentEvent::Finished {
+                finish_reason: Some("stop".into()),
+            },
+        ]);
+        app_messages.push(Message::user("Weiter".into(), Vec::new()));
+        app_messages.push(done);
+
+        let app = HistoryOnly(app_messages);
+        let history = app.history();
+        let kinds: Vec<String> = history
+            .iter()
+            .map(|m| match m {
+                ChatMessage::User { text, .. } => format!("user:{text}"),
+                ChatMessage::Assistant {
+                    content,
+                    tool_calls,
+                    reasoning,
+                } => {
+                    assert!(reasoning.is_none());
+                    format!("assistant:{content}:{}", tool_calls.len())
+                }
+                ChatMessage::Tool { call_id, content } => format!("tool:{call_id}:{content}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "user:Ändere a.rs".to_owned(),
+                "assistant::2".into(),
+                "tool:c1:1\tx".into(),
+                format!("tool:c2:{NOT_RUN}"),
+                "user:Weiter".into(),
+                "assistant:Fertig.:0".into(),
+            ]
+        );
+    }
+
+    /// Runs `api_history` without a window.
+    struct HistoryOnly(Vec<Message>);
+
+    impl HistoryOnly {
+        fn history(self) -> Vec<ChatMessage> {
+            let mut app = NemotronApp::with_settings(Settings::default(), None);
+            app.messages = self.0;
+            app.api_history()
+        }
+    }
+
+    #[test]
+    fn markdown_export_contains_turns_thinking_tools_and_attachments() {
+        let (mut answer, _) = run_events(vec![
+            AgentEvent::StepStarted,
+            AgentEvent::StepFinished {
+                content: String::new(),
+                reasoning: "Hmm.".into(),
+                tool_calls: vec![tool("c1", "read_file", r#"{"path":"src/main.rs"}"#)],
+            },
+            AgentEvent::ToolFinished {
+                call_id: "c1".into(),
+                output: "x".into(),
+                ok: true,
+                change: None,
+            },
+            AgentEvent::StepStarted,
+            AgentEvent::StepFinished {
+                content: "Eine Katze.".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+            },
+        ]);
         answer.status = Status::Done;
         let messages = vec![
             Message::user(
@@ -1193,7 +1791,60 @@ mod tests {
         assert!(md.starts_with("# Chat mit nvidia/test\n"));
         assert!(md.contains("## Du\n\nWas ist das?\n\n*Anhänge: katze.jpg*"));
         assert!(md.contains("<summary>Denkprozess</summary>\n\nHmm."));
-        assert!(md.contains("## Nemotron"));
-        assert!(md.trim_end().ends_with("Eine Katze."));
+        assert!(md.contains("- `read_file`: Gelesen: src/main.rs"), "{md}");
+        assert!(md.contains("Eine Katze."));
+    }
+
+    #[test]
+    fn undo_restores_and_deletes() {
+        let dir = std::env::temp_dir().join(format!("fadis-undo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let edited = dir.join("alt.txt");
+        let created = dir.join("neu.txt");
+        std::fs::write(&edited, "nachher").unwrap();
+        std::fs::write(&created, "neu").unwrap();
+
+        let mut app = NemotronApp::with_settings(Settings::default(), None);
+        app.record_change(&FileChange {
+            path: "alt.txt".into(),
+            abs: edited.clone(),
+            before: Some("vorher".into()),
+            after: "zwischen".into(),
+        });
+        app.record_change(&FileChange {
+            path: "alt.txt".into(),
+            abs: edited.clone(),
+            before: Some("zwischen".into()),
+            after: "nachher".into(),
+        });
+        app.record_change(&FileChange {
+            path: "neu.txt".into(),
+            abs: created.clone(),
+            before: None,
+            after: "neu".into(),
+        });
+        assert_eq!(app.changes.len(), 2);
+        assert_eq!(app.changes[0].original.as_deref(), Some("vorher"));
+
+        app.undo_change(0, false);
+        assert_eq!(std::fs::read_to_string(&edited).unwrap(), "vorher");
+        app.undo_change(0, false);
+        assert!(!created.exists());
+        assert!(app.changes.is_empty());
+
+        // Changed again outside the agent: needs a confirmation first.
+        std::fs::write(&edited, "von Hand").unwrap();
+        app.record_change(&FileChange {
+            path: "alt.txt".into(),
+            abs: edited.clone(),
+            before: Some("vorher".into()),
+            after: "agent".into(),
+        });
+        app.undo_change(0, false);
+        assert!(app.undo_confirm.is_some());
+        assert_eq!(std::fs::read_to_string(&edited).unwrap(), "von Hand");
+        app.undo_change(0, true);
+        assert_eq!(std::fs::read_to_string(&edited).unwrap(), "vorher");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

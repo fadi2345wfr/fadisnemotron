@@ -1,10 +1,13 @@
 // No console window on Windows; on macOS the app is started from the .app bundle.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod agent;
 mod api;
 mod app;
 mod attachments;
 mod config;
+mod tools;
+mod widgets;
 
 use eframe::egui;
 

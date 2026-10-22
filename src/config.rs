@@ -5,10 +5,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::agent::DEFAULT_MAX_STEPS;
 use crate::api::{self, GenerationOptions};
+use crate::tools::ApprovalMode;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str =
     "Du bist ein hilfreicher Assistent. Antworte in der Sprache des Nutzers.";
+const OLD_DEFAULT_MAX_TOKENS: u32 = 16_384;
 /// The model card recommends 1536×1024 for document pages.
 pub const DEFAULT_MAX_IMAGE_DIM: u32 = 1536;
 
@@ -23,8 +26,13 @@ pub struct Settings {
     pub temperature: f32,
     pub top_p: f32,
     pub max_tokens: u32,
-    pub reasoning_budget: u32,
     pub max_image_dim: u32,
+    /// What the agent may do in the project folder without asking.
+    pub approval: ApprovalMode,
+    /// Model requests per message before the agent pauses.
+    pub max_steps: usize,
+    /// The project folder that was open last time.
+    pub workspace: Option<PathBuf>,
 }
 
 impl Default for Settings {
@@ -39,9 +47,11 @@ impl Default for Settings {
             temperature: 1.0,
             top_p: 0.95,
             // Thinking counts toward max_tokens, so leave plenty of room.
-            max_tokens: 16_384,
-            reasoning_budget: 0,
+            max_tokens: 32_768,
             max_image_dim: DEFAULT_MAX_IMAGE_DIM,
+            approval: ApprovalMode::default(),
+            max_steps: DEFAULT_MAX_STEPS,
+            workspace: None,
         }
     }
 }
@@ -63,7 +73,6 @@ impl Settings {
             top_p: self.top_p,
             max_tokens: self.max_tokens,
             thinking: self.thinking,
-            reasoning_budget: self.reasoning_budget,
         }
     }
 
@@ -74,10 +83,15 @@ impl Settings {
 
     /// Missing or unreadable files give the defaults.
     pub fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        let mut settings: Self = std::fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // 0.1 saved its default of 16384; agent steps need more room.
+        if settings.max_tokens == OLD_DEFAULT_MAX_TOKENS {
+            settings.max_tokens = Settings::default().max_tokens;
+        }
+        settings
     }
 
     /// Writes the settings; the file holds the API key, so only the user may read it.
@@ -144,9 +158,16 @@ mod tests {
     fn missing_fields_fall_back_to_defaults() {
         let path = temp_path("partial");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, r#"{"model":"eigenes/modell"}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"model":"eigenes/modell","reasoning_budget":0,"max_tokens":16384}"#,
+        )
+        .unwrap();
         let s = Settings::load_from(&path);
         assert_eq!(s.model, "eigenes/modell");
+        assert_eq!(s.max_tokens, 32_768, "old default is raised for the agent");
+        assert_eq!(s.approval, ApprovalMode::AutoEdits);
+        assert_eq!(s.workspace, None);
         assert_eq!(s.base_url, api::DEFAULT_BASE_URL);
         assert!(s.thinking);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();

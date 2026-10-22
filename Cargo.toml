@@ -1,9 +1,9 @@
 [package]
 name = "fadis-nemotron"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.95"
-description = "Desktop-Chat für NVIDIA Nemotron 3.5 Super VL (Text, Bilder, Videos)"
+description = "Desktop-Agent und Chat für NVIDIA Nemotron 3.5 Super VL"
 publish = false
 
 [[bin]]
@@ -17,11 +17,18 @@ directories = "6"
 eframe = { version = "0.37", features = ["glow"] }
 egui_commonmark = { version = "0.26", default-features = false, features = ["pulldown_cmark"] }
 egui_extras = { version = "0.37", features = ["image"] }
+globset = "0.4"
+ignore = "0.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+regex = "1"
 rfd = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+similar = "3"
 ureq = { version = "3.5", features = ["platform-verifier"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [profile.release]
 lto = "thin"
