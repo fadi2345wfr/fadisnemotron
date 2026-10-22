@@ -16,7 +16,7 @@ jobs:
     name: Tests + APK
     runs-on: ubuntu-latest
     permissions:
-      contents: write # only used to attach the APK to a release on v* tags
+      contents: write # publishes the build as "neueste" and on v* tags
     defaults:
       run:
         working-directory: android
@@ -54,6 +54,16 @@ jobs:
             android/dist/*.apk
             android/dist/*.sha256
           if-no-files-found: error
+
+      - name: Als „Neueste Version“ veröffentlichen
+        # Pushes, manual runs and pull requests from this repository (not forks, not tags).
+        if: >-
+          !startsWith(github.ref, 'refs/tags/') &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ../scripts/publish-latest.sh dist/FadisNemotron-*.apk FadisNemotron.apk
 
       - name: Release anhängen
         if: startsWith(github.ref, 'refs/tags/v')

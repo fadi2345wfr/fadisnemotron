@@ -17,7 +17,7 @@ jobs:
     # Apple Silicon runner; Rust cross-compiles to x86_64 with the same SDK.
     runs-on: macos-latest
     permissions:
-      contents: write # only used to attach the DMG to a release on v* tags
+      contents: write # publishes the build as "neueste" and on v* tags
     steps:
       - uses: actions/checkout@v7
 
@@ -66,6 +66,16 @@ jobs:
             dist/*.dmg
             dist/*.dmg.sha256
           if-no-files-found: error
+
+      - name: Als „Neueste Version“ veröffentlichen
+        # Pushes, manual runs and pull requests from this repository (not forks, not tags).
+        if: >-
+          !startsWith(github.ref, 'refs/tags/') &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./scripts/publish-latest.sh dist/FadisNemotron-*-intel.dmg FadisNemotron-Intel.dmg
 
       - name: Release anhängen
         if: startsWith(github.ref, 'refs/tags/v')

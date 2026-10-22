@@ -6,6 +6,15 @@ Nemotron arbeitet direkt auf deinem Mac, wie Google Antigravity oder Claude Code
 
 Dazu gibt es eine **Android-App**: QR-Code scannen, und alle Chats vom Mac sind auf dem Handy – du gibst Aufträge mit Fotos und Videos, siehst Nemotron live zu und gibst Befehle frei.
 
+## ⬇ Neueste Version herunterladen
+
+| | Datei |
+|---|---|
+| **Android** | [FadisNemotron.apk](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron.apk) – auf dem Handy antippen und installieren |
+| **Mac (Intel)** | [FadisNemotron-Intel.dmg](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-Intel.dmg) – öffnen und in „Programme“ ziehen |
+
+Die Links zeigen immer auf den neuesten Build (Release [„Neueste Version“](https://github.com/fadi2345wfr/fadisnemotron/releases/tag/neueste), auf der Startseite rechts unter **Releases**). Mac- und Android-App daraus passen zusammen.
+
 Nemotron 3.5 Super VL ist NVIDIAs offenes Multimodal-Modell (veröffentlicht am 15. Oktober 2026): 120 Milliarden Parameter, davon 12 Milliarden aktiv pro Token, hybride Mamba-Transformer-MoE-Architektur, bis zu 1 Million Token Kontext. Es versteht Text, Bilder, Dokument-Seiten und Videos und kann Werkzeuge aufrufen.
 
 ![Agent-Modus: Nemotron liest, ändert und prüft Dateien (Antwort von einem Test-Server)](docs/screenshot.png)
@@ -52,7 +61,7 @@ Die Android-App ist eine zweite Oberfläche der Mac-App – alles läuft über d
 
 ### Installieren
 
-1. APK herunterladen: unter **Actions → Android APK** den neuesten erfolgreichen Lauf öffnen und das Artefakt `FadisNemotron-android-apk` laden (eine ZIP-Datei mit der APK), oder bei einem Release die Datei `FadisNemotron-<Version>.apk`.
+1. Auf dem Handy [FadisNemotron.apk](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron.apk) öffnen (bei GitHub angemeldet, im Browser). Das ist immer die neueste Version.
 2. Die APK auf dem Handy öffnen. Android fragt einmal, ob der Browser bzw. Dateimanager Apps installieren darf: **Zulassen**.
 3. Voraussetzung: Android 8.0 oder neuer.
 
@@ -77,9 +86,7 @@ Der Mac muss dafür wach sein und die App laufen. Damit er nicht einschläft, z.
 
 ## Installation auf dem Mac (Intel)
 
-1. DMG herunterladen:
-   - Unter **Actions → macOS DMG (Intel)** den neuesten erfolgreichen Lauf öffnen und unten das Artefakt `FadisNemotron-intel-dmg` laden, oder
-   - bei einem Release (Tag `v…`) die Datei `FadisNemotron-<Version>-intel.dmg` laden.
+1. [FadisNemotron-Intel.dmg](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-Intel.dmg) laden (immer die neueste Version).
 2. DMG öffnen und **Fadis Nemotron** in den Ordner **Programme** ziehen.
 3. Erster Start: Die App ist nicht von Apple notariell beglaubigt, deshalb blockiert macOS sie beim ersten Öffnen.
    - macOS 15 und neuer: App einmal öffnen, dann **Systemeinstellungen → Datenschutz & Sicherheit → „Dennoch öffnen“**.
@@ -144,7 +151,7 @@ Unter Linux braucht egui zur Laufzeit `libxkbcommon-x11`.
 
 `.github/workflows/android-apk.yml` führt die Unit-Tests der Android-App aus, baut die Release-APK und prüft ihre Signatur. Die APK landet als Artefakt am Lauf.
 
-Ein Tag wie `v0.4.0` hängt DMG und APK zusätzlich an ein GitHub-Release.
+Nach jedem erfolgreichen Build legen beide Workflows die Dateien außerdem unter festen Namen ins Release „Neueste Version“ (Tag `neueste`, Skript `scripts/publish-latest.sh`), daher die festen Download-Links oben. Ein Tag wie `v0.4.0` hängt DMG und APK zusätzlich an ein eigenes Release.
 
 ### Android-App selbst bauen
 
