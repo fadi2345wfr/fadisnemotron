@@ -2,18 +2,21 @@
 
 Desktop-Agent und Chat für **NVIDIA Nemotron 3.5 Super VL**, geschrieben in Rust. Läuft als normale Mac-App; die DMG ist für Intel-Macs gebaut.
 
-Öffnest du einen Projektordner, arbeitet Nemotron darin wie Google Antigravity oder Claude Code: Er liest und durchsucht die Dateien selbst, ändert sie direkt und führt Befehle aus (Build, Tests). Ohne Projektordner ist es ein normaler Chat.
+Nemotron arbeitet direkt auf deinem Mac, wie Google Antigravity oder Claude Code: Er sieht deinen Benutzerordner (Downloads, Schreibtisch, Dokumente …), liest und durchsucht Dateien selbst, legt Ordner und Dateien an, ändert sie und führt Befehle aus. Für Programmierprojekte öffnest du den Projektordner, dann arbeitet er dort (Build, Tests, Fehler beheben).
 
-Dazu gibt es eine **Android-App**: Damit gibst du dem Agenten auf dem Mac von unterwegs Aufträge, siehst ihm live zu und gibst Befehle frei. Ohne Mac chattest du direkt mit NVIDIA.
+Dazu gibt es eine **Android-App**: QR-Code scannen, und alle Chats vom Mac sind auf dem Handy – du gibst Aufträge mit Fotos und Videos, siehst Nemotron live zu und gibst Befehle frei.
 
 Nemotron 3.5 Super VL ist NVIDIAs offenes Multimodal-Modell (veröffentlicht am 15. Oktober 2026): 120 Milliarden Parameter, davon 12 Milliarden aktiv pro Token, hybride Mamba-Transformer-MoE-Architektur, bis zu 1 Million Token Kontext. Es versteht Text, Bilder, Dokument-Seiten und Videos und kann Werkzeuge aufrufen.
 
 ![Agent-Modus: Nemotron liest, ändert und prüft Dateien (Antwort von einem Test-Server)](docs/screenshot.png)
 
-## Agent-Modus
+## So arbeitet Nemotron
 
-1. **📁 Projekt öffnen** klicken (oder ⌘O, oder den Ordner ins Fenster ziehen).
-2. Schreiben, was passieren soll, z. B. „Bau das Projekt und behebe die Fehler“ oder „Füge in `src/app.rs` einen Dunkelmodus-Schalter hinzu“.
+1. Schreiben, was passieren soll, z. B. „Was liegt in meinem Downloads-Ordner? Sortiere es nach Art.“ oder „Leg auf dem Schreibtisch einen Ordner ‚Rechnungen‘ an und verschiebe alle PDFs mit ‚Rechnung‘ im Namen hinein.“
+   - Ohne Projekt arbeitet Nemotron in deinem **Benutzerordner** (rechts steht 🏠 Benutzerordner).
+   - Für Programmierprojekte **📁 Projekt öffnen** klicken (oder ⌘O, oder den Ordner ins Fenster ziehen), dann z. B. „Bau das Projekt und behebe die Fehler“.
+   - macOS fragt beim ersten Zugriff auf Schreibtisch, Dokumente oder Downloads einmal nach: **Erlauben**. Hast du es abgelehnt: **Systemeinstellungen → Datenschutz & Sicherheit → Dateien und Ordner → Fadis Nemotron**.
+2. Grenzen setzt du im Chat: Sagst du „schau nur in den Ordner X“ oder „fass Datei Y nicht an“, hält sich Nemotron daran.
 3. Nemotron arbeitet in Schritten. Jeder Schritt erscheint als Karte im Chat:
    - 📂 Ordner ansehen, 🔎 Dateien finden, 📄 Datei lesen, 🔍 Inhalte suchen – ohne Nachfrage
    - ✏ Datei bearbeiten, 📝 Datei schreiben – mit Diff (+/− Zeilen)
@@ -31,21 +34,21 @@ Was Nemotron ohne Nachfrage darf, stellst du rechts ein:
 Unabhängig davon gilt:
 - Nur lesende Befehle (`git status`, `git diff`, `git log`, `ls`, `cat` …) laufen immer ohne Nachfrage.
 - Riskante Befehle fragen **immer** nach, mit Warnhinweis: `sudo`, `rm -rf` außerhalb des Projekts, `git push`, `git reset --hard`, `git clean`, `curl … | sh`, rekursives `chmod`/`chown`, `dd`, `shutdown` usw.
-- Pfade außerhalb des Projektordners (auch über `..` oder symbolische Links) und Dateien in `.git/` sind gesperrt.
+- Nemotron arbeitet im Arbeitsordner: ohne Projekt dein ganzer Benutzerordner, mit Projekt dieser Ordner. Was außerhalb liegt (z. B. `/Applications`), erreicht er, wenn du einen Ordner darüber öffnest.
 - Ein Platzhalter wie `// ... rest of the code ...` beim Überschreiben einer Datei wird abgelehnt, damit nichts verloren geht.
-- Nur lesende Befehle ohne Nachfrage gelten nur innerhalb des Projektordners: `cat ~/.ssh/…` oder `cat /etc/…` fragt nach.
-- Befehle laufen im Projektordner mit der Umgebung deiner Shell (inklusive `~/.zshrc`, damit `cargo`, `npm` über nvm, `python` über pyenv usw. gefunden werden), mit Zeitlimit. **⏹ Stop**, Esc oder das Beenden der App beendet sie samt Unterprozessen. Sehr lange Ausgaben werden gekürzt (Anfang und Ende bleiben).
+- Befehle laufen im Arbeitsordner mit der Umgebung deiner Shell (inklusive `~/.zshrc`, damit `cargo`, `npm` über nvm, `python` über pyenv usw. gefunden werden), mit Zeitlimit. **⏹ Stop**, Esc oder das Beenden der App beendet sie samt Unterprozessen. Sehr lange Ausgaben werden gekürzt (Anfang und Ende bleiben).
+
+**Chats** werden automatisch gespeichert und stehen links in der Chatliste (➕ Neuer Chat, anklicken zum Wechseln, 🗑 zum Löschen). Dieselbe Liste siehst du auf dem Handy.
 
 Damit Nemotron wirklich ändert statt nur Beispielcode zu zeigen, bekommt er klare Anweisungen; zeigt er trotzdem einen größeren Codeblock ohne Änderung, fordert die App ihn einmal auf, die Änderung selbst einzutragen. Liegt im Projekt eine `AGENTS.md` oder `CLAUDE.md`, liest Nemotron sie als Projektregeln mit.
 
 ## Vom Handy aus (Android)
 
-Die Android-App hat zwei Bereiche:
+Die Android-App ist eine zweite Oberfläche der Mac-App – alles läuft über deinen Mac:
 
-| Bereich | Was er kann | Braucht |
-|---|---|---|
-| **Mac** | Aufträge an den Agenten auf dem Mac schicken (mit Fotos), Denken, Werkzeuge und Antworten live sehen, Befehle freigeben oder ablehnen, stoppen, neu generieren, Änderungen als Diff ansehen und rückgängig machen, Freigabe-Modus und Denkmodus umschalten | laufende Mac-App mit Fernzugriff |
-| **Direkt** | Chat mit Nemotron über die NVIDIA-Cloud, mit Fotos und Denkmodus | eigenen API-Schlüssel (`nvapi-…`) |
+- **Alle Chats synchron:** Die Chatliste (☰ oben links) ist dieselbe wie auf dem Mac. Ein Chat, den du am Handy öffnest oder neu anlegst, ist auch am Mac offen – und umgekehrt.
+- **Fotos und Videos anhängen:** Videos verkleinert das Handy vorher auf 720p, damit sie schnell übertragen werden und NVIDIA sie annimmt (höchstens 100 MB).
+- Denken, Werkzeuge und Antworten live sehen, Befehle freigeben oder ablehnen, stoppen, neu generieren, Änderungen als Diff ansehen und rückgängig machen, Freigabe-Modus und Denkmodus umschalten.
 
 ### Installieren
 
@@ -56,7 +59,7 @@ Die Android-App hat zwei Bereiche:
 ### Mit dem Mac koppeln
 
 1. In der Mac-App oben auf **📱** klicken und **Fernzugriff an** einschalten. macOS fragt beim ersten Mal, ob „Fadis Nemotron“ eingehende Verbindungen annehmen darf: **Erlauben** (bzw. Zugriff aufs lokale Netzwerk erlauben).
-2. In der Android-App den Bereich **Mac** öffnen, **QR-Code scannen** tippen und den Code auf dem Mac scannen. Alternativ Adresse und Schlüssel von Hand eintippen (beides steht im selben Fenster).
+2. In der Android-App **QR-Code scannen** tippen und den Code auf dem Mac scannen. Alternativ Adresse und Schlüssel von Hand eintippen (beides steht im selben Fenster).
 3. Fertig. Im Fernzugriff-Fenster auf dem Mac steht, wann das Handy zuletzt verbunden war; der grüne Punkt am 📱 zeigt, dass der Fernzugriff an ist.
 
 **Unterwegs:** Im eigenen WLAN klappt es sofort. Für unterwegs [Tailscale](https://tailscale.com) auf Mac und Handy installieren und bei beiden mit demselben Konto anmelden: Die Verbindung ist dann verschlüsselt und funktioniert über Mobilfunk, ohne Einstellungen am Router. Danach einmal neu scannen, damit das Handy die Tailscale-Adresse kennt. **Keine Portfreigabe im Router einrichten** – die Verbindung selbst ist unverschlüsselt.
@@ -90,7 +93,7 @@ Voraussetzung: macOS 10.15 (Catalina) oder neuer.
 1. Kostenlosen Schlüssel auf [build.nvidia.com](https://build.nvidia.com/settings/api-keys) erstellen (beginnt mit `nvapi-`).
 2. In der App **⚙** öffnen, Schlüssel eintragen, **Verbindung testen**, **Speichern**.
 
-Die Einstellungen liegen in `~/Library/Application Support/de.fadi.FadisNemotron/settings.json`, nur für deinen Benutzer lesbar. Ist das Feld leer, nimmt die App `NVIDIA_API_KEY` aus der Umgebung.
+Die Einstellungen liegen in `~/Library/Application Support/de.fadi.FadisNemotron/settings.json`, die Chats im Ordner `chats/` daneben – beides nur für deinen Benutzer lesbar. Ist das Feld leer, nimmt die App `NVIDIA_API_KEY` aus der Umgebung.
 
 Standardwerte:
 
@@ -108,7 +111,7 @@ Läuft Nemotron bei dir mit vLLM, trag als Server z. B. `http://localhost:8000/v
 
 ## Tipps
 
-- **Videos:** MP4, 1–2 Minuten. Große Dateien gehen als Base64 mit jeder Nachricht mit. Wenn der Server sie ablehnt, das Video als öffentlichen Link anhängen (🔗).
+- **Videos:** MP4, 1–2 Minuten. Große Dateien gehen als Base64 mit jeder Nachricht mit. Wenn der Server sie ablehnt, das Video kürzen oder als öffentlichen Link anhängen (🔗). Vom Handy kommen Videos schon verkleinert (720p).
 - **PDFs:** Das Modell nimmt keine PDFs. Seiten als PNG exportieren und die Bilder anhängen.
 - **Leere oder abgeschnittene Antwort:** Das Denken verbraucht Tokens. „Max. Tokens“ erhöhen oder den Denkmodus ausschalten.
 - **Tastenkürzel:** Enter senden, Shift+Enter neue Zeile, Esc stoppt, ⌘N neuer Chat, ⌘O Projekt öffnen, ⌘, Einstellungen.
@@ -141,7 +144,7 @@ Unter Linux braucht egui zur Laufzeit `libxkbcommon-x11`.
 
 `.github/workflows/android-apk.yml` führt die Unit-Tests der Android-App aus, baut die Release-APK und prüft ihre Signatur. Die APK landet als Artefakt am Lauf.
 
-Ein Tag wie `v0.3.0` hängt DMG und APK zusätzlich an ein GitHub-Release.
+Ein Tag wie `v0.4.0` hängt DMG und APK zusätzlich an ein GitHub-Release.
 
 ### Android-App selbst bauen
 
@@ -159,10 +162,11 @@ Die APK wird mit dem Schlüssel `android/app/fadis.keystore` signiert, der im Re
 | Datei | Inhalt |
 |---|---|
 | `src/main.rs` | Fenster, Icon, Wahl des Renderers |
-| `src/app.rs` | Zustand und Abläufe: Chat, Projektordner, Freigaben, Änderungsliste, Einstellungen |
+| `src/app.rs` | Zustand und Abläufe: Chat, Chatliste, Arbeitsordner, Freigaben, Änderungsliste, Einstellungen |
+| `src/chats.rs` | Chats speichern, laden und löschen (samt Fotos und Videos) |
 | `src/widgets.rs` | Darstellung: Nachrichten, Werkzeug-Karten, Diffs, Anhänge |
 | `src/agent.rs` | Agent-Schleife: Modell fragen, Werkzeuge ausführen, Ergebnisse zurückgeben; System-Prompt |
-| `src/tools.rs` | Werkzeuge im Projektordner, Pfad-Sperre, Befehlsregeln |
+| `src/tools.rs` | Werkzeuge im Arbeitsordner, Befehlsregeln |
 | `src/api.rs` | Chat-Completions-API, Streaming (SSE), Werkzeugaufrufe, Fehlermeldungen |
 | `src/attachments.rs` | Bilder aufbereiten, Videos prüfen, Data-URLs |
 | `src/config.rs` | Einstellungen laden und speichern |
@@ -171,4 +175,4 @@ Die APK wird mit dem Schlüssel `android/app/fadis.keystore` signiert, der im Re
 | `android/` | Android-App (Kotlin, Jetpack Compose) |
 | `scripts/build-dmg.sh` | App-Bundle und DMG |
 
-Grenzen dieser Version: Chats werden nicht automatisch gespeichert (nur Export), es gibt keinen eingebauten Editor oder Browser wie in Antigravity, die Mac-App ist nicht notariell beglaubigt, und die Android-App gibt es nur als APK (nicht im Play Store).
+Grenzen dieser Version: Es gibt keinen eingebauten Editor oder Browser wie in Antigravity, die Mac-App ist nicht notariell beglaubigt, und die Android-App gibt es nur als APK (nicht im Play Store).
