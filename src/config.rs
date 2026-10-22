@@ -12,12 +12,17 @@ use crate::tools::ApprovalMode;
 pub const DEFAULT_SYSTEM_PROMPT: &str =
     "Du bist ein hilfreicher Assistent. Antworte in der Sprache des Nutzers.";
 const OLD_DEFAULT_MAX_TOKENS: u32 = 16_384;
+/// Bumped when stored settings need a one-time migration.
+const SETTINGS_VERSION: u32 = 2;
 /// The model card recommends 1536×1024 for document pages.
 pub const DEFAULT_MAX_IMAGE_DIM: u32 = 1536;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// 0 for files written before 0.3 (no such field).
+    #[serde(default)]
+    pub version: u32,
     pub api_key: String,
     pub base_url: String,
     pub model: String,
@@ -33,11 +38,17 @@ pub struct Settings {
     pub max_steps: usize,
     /// The project folder that was open last time.
     pub workspace: Option<PathBuf>,
+    /// Remote access for the Android app (docs/remote-api.md).
+    pub remote_enabled: bool,
+    pub remote_port: u16,
+    /// Pairing key; created when remote access is first switched on.
+    pub remote_token: String,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            version: SETTINGS_VERSION,
             api_key: String::new(),
             base_url: api::DEFAULT_BASE_URL.to_owned(),
             model: api::DEFAULT_MODEL.to_owned(),
@@ -52,6 +63,9 @@ impl Default for Settings {
             approval: ApprovalMode::default(),
             max_steps: DEFAULT_MAX_STEPS,
             workspace: None,
+            remote_enabled: false,
+            remote_port: crate::remote::DEFAULT_PORT,
+            remote_token: String::new(),
         }
     }
 }
@@ -87,10 +101,12 @@ impl Settings {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default();
-        // 0.1 saved its default of 16384; agent steps need more room.
-        if settings.max_tokens == OLD_DEFAULT_MAX_TOKENS {
+        // 0.1 saved its default of 16384; agent steps need more room. Only
+        // once, so a user who sets 16384 again keeps it.
+        if settings.version < 2 && settings.max_tokens == OLD_DEFAULT_MAX_TOKENS {
             settings.max_tokens = Settings::default().max_tokens;
         }
+        settings.version = SETTINGS_VERSION;
         settings
     }
 
@@ -170,6 +186,11 @@ mod tests {
         assert_eq!(s.workspace, None);
         assert_eq!(s.base_url, api::DEFAULT_BASE_URL);
         assert!(s.thinking);
+        // Saved again with the version, 16384 is the user's own choice.
+        let mut s = s;
+        s.max_tokens = 16_384;
+        s.save_to(&path).unwrap();
+        assert_eq!(Settings::load_from(&path).max_tokens, 16_384);
         std::fs::remove_dir_all(path.parent().unwrap()).ok();
 
         assert_eq!(

@@ -225,6 +225,9 @@ pub fn run(
     let mut nudged_tool_text = 0;
     let mut nudged_truncation = 0;
     let mut nudged_shown_code = false;
+    // Set once a file was changed in this run; then code in the answer is a summary.
+    let mut edited = false;
+    let mut no_tool_parser = lacks_tool_parser(&config.base_url);
 
     for _ in 0..config.max_steps.max(1) {
         if cancel.load(Ordering::Relaxed) {
@@ -239,7 +242,14 @@ pub fn run(
             &messages,
             &config.options,
             tool_defs.as_ref(),
-            tool_choice.take(),
+            // Without a parser vLLM rejects "auto"; with "none" it still shows
+            // the tools to the model, and the calls are read from the text.
+            if no_tool_parser {
+                tool_choice = None;
+                Some("none")
+            } else {
+                tool_choice.take()
+            },
         );
         let mut step = match api::stream_step(
             http,
@@ -254,6 +264,16 @@ pub fn run(
                 emit(AgentEvent::Cancelled);
                 return;
             }
+            StepOutcome::Failed(e)
+                if tool_defs.is_some() && !no_tool_parser && api::needs_tool_parser(&e) =>
+            {
+                no_tool_parser = true;
+                remember_missing_tool_parser(&config.base_url);
+                emit(AgentEvent::Notice(
+                    "Der Server hat keinen Werkzeug-Parser – Nemotron schreibt die Aufrufe als Text, die App liest sie aus.".into(),
+                ));
+                continue;
+            }
             StepOutcome::Failed(e) => {
                 emit(AgentEvent::Failed(e));
                 return;
@@ -263,11 +283,38 @@ pub fn run(
         // A server without a tool parser leaves the call as XML in the text.
         if let Some(defs) = &tool_defs
             && step.tool_calls.is_empty()
-            && api::looks_like_tool_call_text(&step.content)
             && let Some((before, calls)) = api::parse_xml_tool_calls(&step.content, defs)
         {
             step.content = before;
             step.tool_calls = calls;
+        }
+        // A call cut off by the token limit may have half its arguments: it
+        // never runs, so it is not shown either.
+        let truncated = step.finish_reason.as_deref() == Some("length");
+        if truncated && !step.tool_calls.is_empty() {
+            step.tool_calls.clear();
+            if !emit(AgentEvent::StepFinished {
+                content: step.content.clone(),
+                reasoning: step.reasoning.clone(),
+                tool_calls: Vec::new(),
+            }) {
+                return;
+            }
+            if nudged_truncation < 2 {
+                nudged_truncation += 1;
+                emit(AgentEvent::Notice(
+                    "Die Antwort wurde bei „Max. Tokens“ abgeschnitten – ich lasse den Schritt wiederholen.".into(),
+                ));
+                messages.push(ChatMessage::User {
+                    text: NUDGE_TRUNCATED.into(),
+                    attachments: Vec::new(),
+                });
+                continue;
+            }
+            emit(AgentEvent::Failed(
+                "Die Antwort wurde mehrmals bei „Max. Tokens“ abgeschnitten. Erhöhe den Wert in den Einstellungen.".into(),
+            ));
+            return;
         }
         if !emit(AgentEvent::StepFinished {
             content: step.content.clone(),
@@ -278,8 +325,8 @@ pub fn run(
         }
 
         if step.tool_calls.is_empty() {
-            if tool_defs.is_some()
-                && api::looks_like_tool_call_text(&step.content)
+            if let Some(defs) = &tool_defs
+                && api::looks_like_tool_call_text(&step.content, defs)
                 && nudged_tool_text < 2
             {
                 nudged_tool_text += 1;
@@ -295,13 +342,16 @@ pub fn run(
                     text: NUDGE_TOOL_AS_TEXT.into(),
                     attachments: Vec::new(),
                 });
-                tool_choice = Some("required");
+                if !no_tool_parser {
+                    tool_choice = Some("required");
+                }
                 continue;
             }
             // The complaint this app exists for: code shown instead of applied.
             if tool_defs.is_some()
                 && !nudged_shown_code
-                && step.finish_reason.as_deref() != Some("length")
+                && !edited
+                && !truncated
                 && has_long_code_block(&step.content, SHOWN_CODE_LINES)
             {
                 nudged_shown_code = true;
@@ -322,25 +372,6 @@ pub fn run(
             emit(AgentEvent::Finished {
                 finish_reason: step.finish_reason,
             });
-            return;
-        }
-
-        // A call cut off by the token limit may have half its arguments.
-        if step.finish_reason.as_deref() == Some("length") {
-            if nudged_truncation < 2 {
-                nudged_truncation += 1;
-                emit(AgentEvent::Notice(
-                    "Die Antwort wurde bei „Max. Tokens“ abgeschnitten – ich lasse den Schritt wiederholen.".into(),
-                ));
-                messages.push(ChatMessage::User {
-                    text: NUDGE_TRUNCATED.into(),
-                    attachments: Vec::new(),
-                });
-                continue;
-            }
-            emit(AgentEvent::Failed(
-                "Die Antwort wurde mehrmals bei „Max. Tokens“ abgeschnitten. Erhöhe den Wert in den Einstellungen.".into(),
-            ));
             return;
         }
 
@@ -384,6 +415,7 @@ pub fn run(
                     return;
                 }
             };
+            edited |= output.ok && tools::tool_kind(&call.name) == tools::ToolKind::Edit;
             messages.push(ChatMessage::Tool {
                 call_id: call.id.clone(),
                 content: output.text.clone(),
@@ -402,6 +434,24 @@ pub fn run(
         "Nach {} Schritten angehalten. Schreib „weiter“, damit Nemotron fortsetzt.",
         config.max_steps
     )));
+}
+
+/// Servers that answered "no tool parser" in this session, so later runs
+/// do not pay for the failing request again.
+static NO_TOOL_PARSER: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn lacks_tool_parser(base_url: &str) -> bool {
+    NO_TOOL_PARSER
+        .lock()
+        .is_ok_and(|urls| urls.iter().any(|u| u == base_url))
+}
+
+fn remember_missing_tool_parser(base_url: &str) {
+    if let Ok(mut urls) = NO_TOOL_PARSER.lock()
+        && !urls.iter().any(|u| u == base_url)
+    {
+        urls.push(base_url.to_owned());
+    }
 }
 
 enum Asked {
@@ -423,7 +473,9 @@ fn ask(
         .then(|| tools::command_of(&call.arguments))
         .flatten();
     let warning = command.as_deref().and_then(tools::dangerous_command_reason);
-    let read_only = command.as_deref().is_some_and(tools::is_read_only_command);
+    let read_only = command
+        .as_deref()
+        .is_some_and(|c| ws.is_read_only_command(c));
     if warning.is_none() && (read_only || !approval.needs_approval(kind)) {
         return Asked::Go;
     }
@@ -724,6 +776,10 @@ mod tests {
         );
         assert!(!project.0.join("halb.txt").exists());
         assert!(finished_tools(&events).is_empty());
+        // The cut-off call never reaches the chat, so it cannot be replayed.
+        assert!(events.iter().all(
+            |e| !matches!(e, AgentEvent::StepFinished { tool_calls, .. } if !tool_calls.is_empty())
+        ));
         assert!(
             events
                 .iter()
@@ -774,6 +830,78 @@ mod tests {
         assert!(requests[1].contains("did not change any file"));
         assert!(project.read("src/lib.rs").contains("42"));
         assert!(matches!(events.last(), Some(AgentEvent::Finished { .. })));
+    }
+
+    #[test]
+    fn code_after_an_edit_is_a_summary_not_a_nudge() {
+        let project = Project::new("summary");
+        let code = format!("Geändert:\n```rust\n{}```", "let x = 1;\n".repeat(10));
+        let (events, requests) = run_agent(
+            &project,
+            ApprovalMode::AutoEdits,
+            vec![
+                tool_step(
+                    "c1",
+                    "edit_file",
+                    json!({"path": "src/lib.rs", "old_string": "    41", "new_string": "    42"}),
+                    "",
+                ),
+                answer_step(&code),
+            ],
+            vec![],
+        );
+        assert_eq!(requests.len(), 2);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, AgentEvent::Notice(n) if n.contains("Code nur gezeigt")))
+        );
+        assert!(matches!(events.last(), Some(AgentEvent::Finished { .. })));
+    }
+
+    #[test]
+    fn server_without_tool_parser_gets_tool_choice_none() {
+        let project = Project::new("noparser");
+        let refusal = json!({"object": "error", "message": "\"auto\" tool choice requires --enable-auto-tool-choice and --tool-call-parser to be set", "type": "BadRequestError", "code": 400}).to_string();
+        let xml = "<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/lib.rs\n</parameter>\n</function>\n</tool_call>";
+        let (base_url, server) = mock_server(vec![
+            ("400 Bad Request", "application/json", refusal),
+            ("200 OK", "text/event-stream", answer_step(xml)),
+            ("200 OK", "text/event-stream", answer_step("41.")),
+        ]);
+        let ws = Workspace::open(&project.0).unwrap();
+        let config = AgentConfig {
+            base_url: base_url.clone(),
+            api_key: "k".into(),
+            system_prompt: "s".into(),
+            options: opts(false),
+            workspace: Some(ws),
+            approval: ApprovalMode::AutoEdits,
+            max_steps: 10,
+        };
+        let (_tx, rx) = mpsc::channel();
+        let mut events = Vec::new();
+        run(
+            &api::agent(),
+            config,
+            vec![ChatMessage::User {
+                text: "Was steht in lib.rs?".into(),
+                attachments: vec![],
+            }],
+            &AtomicBool::new(false),
+            &rx,
+            |e| {
+                events.push(e);
+                true
+            },
+        );
+        let requests = server.join().unwrap();
+        assert!(requests[0].contains(r#""tool_choice":"auto""#));
+        assert!(requests[1].contains(r#""tool_choice":"none""#));
+        assert!(requests[2].contains(r#""tool_choice":"none""#));
+        assert!(finished_tools(&events)[0].0.contains("pub fn antwort"));
+        assert!(matches!(events.last(), Some(AgentEvent::Finished { .. })));
+        assert!(lacks_tool_parser(&base_url));
     }
 
     #[test]

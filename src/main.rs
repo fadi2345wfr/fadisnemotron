@@ -6,6 +6,7 @@ mod api;
 mod app;
 mod attachments;
 mod config;
+mod remote;
 mod tools;
 mod widgets;
 
@@ -14,6 +15,10 @@ use eframe::egui;
 const APP_NAME: &str = "Fadis Nemotron";
 
 fn main() -> eframe::Result {
+    if std::env::args().nth(1).as_deref() == Some(tools::PRINT_ENV_ARG) {
+        tools::print_environment();
+        return Ok(());
+    }
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("Icon ist ein gültiges PNG");
     let options = eframe::NativeOptions {

@@ -83,10 +83,20 @@ impl ChatMessage {
                     msg["tool_calls"] = tool_calls
                         .iter()
                         .map(|c| {
+                            // vLLM parses every argument string of the history;
+                            // one broken call (cut off, bad JSON) would fail
+                            // every later request of the chat.
+                            let arguments = if serde_json::from_str::<Value>(&c.arguments)
+                                .is_ok_and(|v| v.is_object())
+                            {
+                                c.arguments.as_str()
+                            } else {
+                                "{}"
+                            };
                             json!({
                                 "id": c.id,
                                 "type": "function",
-                                "function": { "name": c.name, "arguments": c.arguments },
+                                "function": { "name": c.name, "arguments": arguments },
                             })
                         })
                         .collect();
@@ -351,7 +361,18 @@ pub fn describe_http_error(status: u16, body: &str) -> String {
         .ok()
         .and_then(|v| error_message(&v))
         .unwrap_or_else(|| truncate(body.trim(), 300).to_owned());
+    let lower = detail.to_lowercase();
     let hint = match status {
+        400 if lower.contains("context length")
+            || lower.contains("context window")
+            || lower.contains("too long")
+            || lower.contains("maximum model length") =>
+        {
+            "Der Chat ist zu lang für das Kontextfenster. Starte einen neuen Chat (⌘N) oder senke „Max. Tokens“."
+        }
+        400 if needs_tool_parser(&detail) => {
+            "Der Server kann keine Werkzeuge aufrufen. Starte vLLM mit --enable-auto-tool-choice --tool-call-parser qwen3_coder."
+        }
         401 | 403 => "API-Schlüssel fehlt, ist ungültig oder hat keinen Zugriff auf dieses Modell.",
         404 => {
             "Modell oder Adresse nicht gefunden. Prüfe Modell-ID und Basis-URL in den Einstellungen."
@@ -367,6 +388,12 @@ pub fn describe_http_error(status: u16, body: &str) -> String {
     } else {
         format!("HTTP {status}: {hint}\n{detail}")
     }
+}
+
+/// True if a server error says it was started without a tool-call parser
+/// (vLLM without `--enable-auto-tool-choice --tool-call-parser`).
+pub fn needs_tool_parser(error: &str) -> bool {
+    error.contains("enable-auto-tool-choice") || error.contains("tool-call-parser")
 }
 
 /// Nemotron's thinking normally arrives in its own field. Servers without a
@@ -388,13 +415,71 @@ pub fn split_inline_thinking(content: &str) -> (Option<&str>, &str) {
     }
 }
 
-/// True if the text looks like a tool call the server did not convert
-/// (the check NVIDIA's own agent uses).
-pub fn looks_like_tool_call_text(content: &str) -> bool {
-    content.contains("<tool_call")
-        || content.contains("<function=")
-        || content.contains("<parameter=")
-        || content.contains("<invoke")
+/// True if the text holds a tool call the server did not convert: a
+/// `<tool_call>`/`<function=NAME>` block for one of `tools`, outside code.
+/// Markup quoted in an ordinary answer does not count.
+pub fn looks_like_tool_call_text(content: &str, tools: &Value) -> bool {
+    tool_call_start(content, tools).is_some()
+}
+
+/// Byte offset of the first tool-call block in `content`, see
+/// [`looks_like_tool_call_text`].
+fn tool_call_start(content: &str, tools: &Value) -> Option<usize> {
+    use std::sync::LazyLock;
+    static CALL: LazyLock<regex::Regex> = LazyLock::new(|| {
+        regex::Regex::new(r"(?:<tool_call>\s*)?<function=([A-Za-z_][\w.-]*)>").expect("valid regex")
+    });
+    let masked = mask_code(content);
+    CALL.captures_iter(&masked)
+        .find(|c| {
+            let name = crate::tools::canonical_tool_name(&c[1]);
+            tools
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|t| t["function"]["name"] == name)
+        })
+        .map(|c| c.get(0).map_or(0, |m| m.start()))
+}
+
+/// `content` with fenced code blocks and inline code replaced by spaces,
+/// byte for byte, so offsets stay valid.
+fn mask_code(content: &str) -> String {
+    let blank = |text: &str| -> String {
+        text.chars()
+            .flat_map(|c| {
+                let (fill, n) = if c == '\n' {
+                    ('\n', 1)
+                } else {
+                    (' ', c.len_utf8())
+                };
+                std::iter::repeat_n(fill, n)
+            })
+            .collect()
+    };
+    let mut out = String::with_capacity(content.len());
+    let mut fenced = false;
+    for line in content.split_inclusive('\n') {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
+            out.push_str(&blank(line));
+        } else if fenced {
+            out.push_str(&blank(line));
+        } else {
+            for (i, part) in line.split('`').enumerate() {
+                if i > 0 {
+                    out.push(' ');
+                }
+                // Odd parts are between backticks.
+                if i % 2 == 1 {
+                    out.push_str(&blank(part));
+                } else {
+                    out.push_str(part);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Parses Nemotron's tool-call XML when it ends up in `content`:
@@ -412,8 +497,8 @@ pub fn looks_like_tool_call_text(content: &str) -> bool {
 /// Parameter values are converted to the types declared in `tools`.
 /// Returns the text before the first call and the calls, or `None`.
 pub fn parse_xml_tool_calls(content: &str, tools: &Value) -> Option<(String, Vec<ToolCall>)> {
-    let first = content.find("<function=")?;
-    let prefix_end = content[..first].rfind("<tool_call>").unwrap_or(first);
+    let prefix_end = tool_call_start(content, tools)?;
+    let first = prefix_end + content[prefix_end..].find("<function=")?;
     let mut calls = Vec::new();
     let mut rest = &content[first..];
     while let Some(start) = rest.find("<function=") {
@@ -525,7 +610,12 @@ impl StepResult {
     /// Fixes up quirks once the stream is complete: inline `<think>` tags,
     /// and the copy of the thinking that `force_nonempty_content` appends as
     /// content when the model never closed its thinking.
-    fn finalize(mut self) -> Self {
+    fn finalize(mut self, thinking: bool) -> Self {
+        // Without thinking the template already closed an empty <think>, so a
+        // `</think>` in the content is just text.
+        if !thinking {
+            return self;
+        }
         if self.reasoning.trim().is_empty() {
             let (thinking, answer) = split_inline_thinking(&self.content);
             if let Some(thinking) = thinking {
@@ -668,7 +758,10 @@ pub fn stream_step(
         }
     }
     result.tool_calls = calls.finish();
-    StepOutcome::Done(result.finalize())
+    let thinking = body["chat_template_kwargs"]["enable_thinking"]
+        .as_bool()
+        .unwrap_or(true);
+    StepOutcome::Done(result.finalize(thinking))
 }
 
 /// Checks the key and base URL by listing the server's models, and reports
@@ -1008,7 +1101,7 @@ pub(crate) mod tests {
             content: "<think>plane</think>Antwort".into(),
             ..Default::default()
         }
-        .finalize();
+        .finalize(true);
         assert_eq!(
             (r.reasoning.as_str(), r.content.as_str()),
             ("plane", "Antwort")
@@ -1019,7 +1112,7 @@ pub(crate) mod tests {
             content: "nur gedacht".into(),
             ..Default::default()
         }
-        .finalize();
+        .finalize(true);
         assert_eq!(
             (r.reasoning.as_str(), r.content.as_str()),
             ("", "nur gedacht")
@@ -1033,14 +1126,14 @@ pub(crate) mod tests {
             content: format!("Text {long}"),
             ..Default::default()
         }
-        .finalize();
+        .finalize(true);
         assert_eq!(r.content, "Text ");
         let r = StepResult {
             reasoning: "OK".into(),
             content: "Alles OK".into(),
             ..Default::default()
         }
-        .finalize();
+        .finalize(true);
         assert_eq!(r.content, "Alles OK");
     }
 
@@ -1048,7 +1141,7 @@ pub(crate) mod tests {
     fn xml_tool_calls_in_content_are_recovered() {
         let tools = crate::tools::definitions();
         let content = "Ich schaue nach.\n<tool_call>\n<function=read_file>\n<parameter=path>\nsrc/main.rs\n</parameter>\n<parameter=offset>\n10\n</parameter>\n</function>\n</tool_call>\n<tool_call>\n<function=edit_file>\n<parameter=path>\na.rs\n</parameter>\n<parameter=old_string>\n  let x = 1;\n</parameter>\n<parameter=new_string>\n  let x = 2;\n</parameter>\n<parameter=replace_all>\nfalse\n</parameter>\n</function>\n</tool_call>";
-        assert!(looks_like_tool_call_text(content));
+        assert!(looks_like_tool_call_text(content, &tools));
         let (prefix, calls) = parse_xml_tool_calls(content, &tools).unwrap();
         assert_eq!(prefix, "Ich schaue nach.");
         assert_eq!(calls.len(), 2);
@@ -1063,8 +1156,26 @@ pub(crate) mod tests {
         );
         assert!(parse_xml_tool_calls("Kein Aufruf hier", &tools).is_none());
         assert!(!looks_like_tool_call_text(
-            "Normale Antwort mit <b>HTML</b>"
+            "Normale Antwort mit <b>HTML</b>",
+            &tools
         ));
+        // Quoted markup in an answer is not a call.
+        for quoted in [
+            "Das Format ist `<tool_call><function=read_file>`.",
+            "So sieht es aus:\n```xml\n<tool_call>\n<function=read_file>\n<parameter=path>\nx\n</parameter>\n</function>\n</tool_call>\n```\nFertig.",
+            "<tool_call>\n<function=fliegen>\n</function>\n</tool_call>",
+        ] {
+            assert!(!looks_like_tool_call_text(quoted, &tools), "{quoted}");
+            assert!(parse_xml_tool_calls(quoted, &tools).is_none(), "{quoted}");
+        }
+        // A real call after a quoted one is found, with the text before it.
+        let (prefix, calls) = parse_xml_tool_calls(
+            "Mit `<function=x>` ruft man auf.\n<tool_call>\n<function=bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>",
+            &tools,
+        )
+        .unwrap();
+        assert_eq!(prefix, "Mit `<function=x>` ruft man auf.");
+        assert_eq!(calls[0].name, "bash");
     }
 
     /// Serves the given responses, one per connection, on a local port and

@@ -30,7 +30,11 @@
 	<true/>
 	<key>NSSupportsAutomaticGraphicsSwitching</key>
 	<true/>
+	<key>NSAppSleepDisabled</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Fadis Nemotron nimmt im Heimnetz oder über Tailscale Aufträge von deiner Android-App an, wenn du den Fernzugriff einschaltest.</string>
 	<key>NSHumanReadableCopyright</key>
-	<string>Fadis Nemotron – Chat-Client für NVIDIA Nemotron 3.5 Super VL</string>
+	<string>Fadis Nemotron – Desktop-Agent für NVIDIA Nemotron 3.5 Super VL</string>
 </dict>
 </plist>

@@ -5,20 +5,27 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use eframe::egui::{self, Align, Color32, Key, KeyboardShortcut, Layout, Modifiers, RichText};
 use egui_commonmark::CommonMarkCache;
+use serde_json::{Value, json};
 
 use crate::agent::{self, AgentConfig, AgentEvent, Decision};
 use crate::api::{self, ChatMessage, Role, TextDelta, ToolCall};
 use crate::attachments::{self, Attachment, AttachmentKind};
 use crate::config::Settings;
+use crate::remote::{self, Command, RemoteServer, Reply};
 use crate::tools::{ApprovalMode, FileChange, Workspace};
 use crate::widgets::{self, UiAction};
 
 const API_KEY_URL: &str = "https://build.nvidia.com/settings/api-keys";
 const NOT_RUN: &str = "Not run: the request was stopped before this tool ran.";
+const INTERRUPTED: &str = "Stopped by the user while running; it may have partly run. \
+     Check its effects before running it again.";
+/// Tool outputs of earlier answers are cut to this many characters in the
+/// history, so long sessions still fit the context.
+const OLD_TOOL_OUTPUT_CHARS: usize = 2_000;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Status {
@@ -36,6 +43,8 @@ pub enum ToolState {
     Done,
     Declined,
     NotRun,
+    /// Was running when the user pressed Stop.
+    Interrupted,
 }
 
 pub struct ToolView {
@@ -49,6 +58,31 @@ pub struct ToolView {
     pub preview: Option<FileChange>,
     /// Why this command always needs a yes (e.g. `sudo`).
     pub warning: Option<String>,
+    /// Unified diff of `change` or `preview`, computed once.
+    pub diff: String,
+    /// Added and removed lines of `change` or `preview`.
+    pub stats: Option<(usize, usize)>,
+}
+
+impl ToolView {
+    fn planned(call: ToolCall) -> Self {
+        Self {
+            call,
+            state: ToolState::Planned,
+            output: String::new(),
+            ok: false,
+            change: None,
+            preview: None,
+            warning: None,
+            diff: String::new(),
+            stats: None,
+        }
+    }
+
+    fn set_file_change(&mut self, change: Option<&FileChange>) {
+        self.diff = change.map(FileChange::diff).unwrap_or_default();
+        self.stats = change.map(FileChange::line_stats);
+    }
 }
 
 /// One model request within an answer: its thinking, text and tool calls.
@@ -60,12 +94,17 @@ pub struct Step {
     /// Set once so the thinking folds away when the answer or tools arrive.
     pub collapse_reasoning: bool,
     reasoning_collapsed: bool,
+    /// Thinking was requested; only then can `<think>` in the text be thinking.
+    thinking: bool,
 }
 
 impl Step {
     /// `(thinking, answer)`, also when the server sent the thinking inline.
     pub fn parts(&self) -> (Option<&str>, &str) {
         if self.reasoning.trim().is_empty() {
+            if !self.thinking {
+                return (None, &self.content);
+            }
             api::split_inline_thinking(&self.content)
         } else {
             (Some(self.reasoning.trim()), self.content.trim_start())
@@ -81,6 +120,9 @@ impl Step {
 }
 
 pub struct Message {
+    /// Identifies the message while its worker may still report, also after
+    /// other messages were added or removed.
+    id: u64,
     pub role: Role,
     /// The user's text.
     pub text: String,
@@ -90,11 +132,15 @@ pub struct Message {
     pub status: Status,
     pub finish_reason: Option<String>,
     pub notices: Vec<String>,
+    /// Thinking was on for this answer.
+    thinking: bool,
 }
 
 impl Message {
     fn user(text: String, attachments: Vec<Attachment>) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             role: Role::User,
             text,
             attachments,
@@ -102,14 +148,23 @@ impl Message {
             status: Status::Done,
             finish_reason: None,
             notices: Vec::new(),
+            thinking: false,
         }
     }
 
-    fn assistant() -> Self {
+    fn assistant(thinking: bool) -> Self {
         Self {
             role: Role::Assistant,
             status: Status::Streaming,
+            thinking,
             ..Self::user(String::new(), Vec::new())
+        }
+    }
+
+    fn new_step(&self) -> Step {
+        Step {
+            thinking: self.thinking,
+            ..Step::default()
         }
     }
 
@@ -131,16 +186,18 @@ impl Message {
             .find(|t| t.call.id == call_id)
     }
 
-    /// Marks tools that never got to run, after a stop or an error.
+    /// Marks tools that never got to run, or were cut short, after a stop,
+    /// an error or the end of the answer.
     fn settle_tools(&mut self) {
         for tool in self.steps.iter_mut().flat_map(|s| &mut s.tools) {
-            if matches!(
-                tool.state,
-                ToolState::Planned | ToolState::AwaitingApproval | ToolState::Running
-            ) {
-                tool.state = ToolState::NotRun;
-                tool.preview = None;
-            }
+            let state = match tool.state {
+                ToolState::Planned | ToolState::AwaitingApproval => ToolState::NotRun,
+                ToolState::Running => ToolState::Interrupted,
+                _ => continue,
+            };
+            tool.state = state;
+            tool.preview = None;
+            tool.set_file_change(None);
         }
     }
 }
@@ -152,11 +209,17 @@ pub struct TrackedChange {
     /// `None` if the agent created the file.
     pub original: Option<String>,
     pub current: String,
+    /// Added and removed lines against `original`, kept up to date.
+    pub stats: (usize, usize),
+    /// Someone else changed the file between two of the agent's edits;
+    /// undo would discard that too, so it asks first.
+    pub outside_edits: bool,
 }
 
 impl TrackedChange {
-    pub fn line_stats(&self) -> (usize, usize) {
-        crate::tools::line_stats(self.original.as_deref().unwrap_or(""), &self.current)
+    fn update_stats(&mut self) {
+        self.stats =
+            crate::tools::line_stats(self.original.as_deref().unwrap_or(""), &self.current);
     }
 
     pub fn diff(&self) -> String {
@@ -195,7 +258,7 @@ struct Notice {
 
 /// An undo whose file was changed again outside the agent; needs a yes.
 struct UndoConfirm {
-    index: usize,
+    abs: PathBuf,
 }
 
 pub struct NemotronApp {
@@ -214,9 +277,18 @@ pub struct NemotronApp {
     active: Option<ActiveRequest>,
     /// Workers that were stopped but may still report a file they wrote
     /// just before noticing; kept so the change can still be undone.
-    stopped: Vec<Receiver<AgentEvent>>,
+    /// With the id of the message they belong to.
+    stopped: Vec<(u64, Receiver<AgentEvent>)>,
     notice: Option<Notice>,
     diff_view: Option<(String, String)>,
+    remote: Option<RemoteServer>,
+    remote_error: Option<String>,
+    remote_window: bool,
+    /// The pairing payload and its QR code texture.
+    remote_qr: Option<(String, egui::TextureHandle)>,
+    remote_show_token: bool,
+    remote_published: Option<Instant>,
+    device_name: String,
     undo_confirm: Option<UndoConfirm>,
     markdown: CommonMarkCache,
     http: ureq::Agent,
@@ -249,6 +321,9 @@ impl NemotronApp {
             }
         }
         app.load_paths(files, &cc.egui_ctx);
+        if app.settings.remote_enabled {
+            app.start_remote(&cc.egui_ctx);
+        }
         app
     }
 
@@ -275,6 +350,13 @@ impl NemotronApp {
             stopped: Vec::new(),
             notice: None,
             diff_view: None,
+            remote: None,
+            remote_error: None,
+            remote_window: false,
+            remote_qr: None,
+            remote_show_token: false,
+            remote_published: None,
+            device_name: remote::device_name(),
             undo_confirm: None,
             markdown: CommonMarkCache::default(),
             http: api::agent(),
@@ -352,6 +434,7 @@ impl NemotronApp {
                 self.settings.workspace = Some(ws.root().to_path_buf());
                 self.workspace = Some(ws);
                 self.changes.clear();
+                self.undo_confirm = None;
                 self.save_settings();
                 self.update_title(ctx);
                 self.focus_input = true;
@@ -371,6 +454,7 @@ impl NemotronApp {
         }
         self.workspace = None;
         self.changes.clear();
+        self.undo_confirm = None;
         self.settings.workspace = None;
         self.save_settings();
         self.update_title(ctx);
@@ -378,14 +462,20 @@ impl NemotronApp {
 
     fn record_change(&mut self, change: &FileChange) {
         if let Some(tracked) = self.changes.iter_mut().find(|t| t.abs == change.abs) {
+            tracked.outside_edits |= change.before.as_deref() != Some(tracked.current.as_str());
             tracked.current = change.after.clone();
+            tracked.update_stats();
         } else {
-            self.changes.push(TrackedChange {
+            let mut tracked = TrackedChange {
                 path: change.path.clone(),
                 abs: change.abs.clone(),
                 original: change.before.clone(),
                 current: change.after.clone(),
-            });
+                stats: (0, 0),
+                outside_edits: false,
+            };
+            tracked.update_stats();
+            self.changes.push(tracked);
         }
     }
 
@@ -394,9 +484,10 @@ impl NemotronApp {
         let Some(tracked) = self.changes.get(index) else {
             return;
         };
-        let on_disk = std::fs::read_to_string(&tracked.abs).ok();
-        if !force && on_disk.as_deref() != Some(tracked.current.as_str()) {
-            self.undo_confirm = Some(UndoConfirm { index });
+        if !force && self.needs_undo_confirm(tracked) {
+            self.undo_confirm = Some(UndoConfirm {
+                abs: tracked.abs.clone(),
+            });
             return;
         }
         let tracked = self.changes.remove(index);
@@ -422,6 +513,13 @@ impl NemotronApp {
                 Notice { text, error: true }
             }
         });
+    }
+
+    /// True if undo would also discard changes not made by the agent.
+    fn needs_undo_confirm(&self, tracked: &TrackedChange) -> bool {
+        tracked.outside_edits
+            || std::fs::read_to_string(&tracked.abs).ok().as_deref()
+                != Some(tracked.current.as_str())
     }
 
     fn reveal_in_file_manager(path: &Path) {
@@ -484,7 +582,11 @@ impl NemotronApp {
     /// its result, so follow-up messages keep the context.
     fn api_history(&self) -> Vec<ChatMessage> {
         let mut out = Vec::new();
-        for msg in &self.messages {
+        let last_answer = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == Role::Assistant && m.status != Status::Streaming);
+        for (index, msg) in self.messages.iter().enumerate() {
             match msg.role {
                 Role::User => out.push(ChatMessage::User {
                     text: msg.text.clone(),
@@ -511,7 +613,15 @@ impl NemotronApp {
                         });
                         for tool in &step.tools {
                             let content = match tool.state {
-                                ToolState::Done | ToolState::Declined => tool.output.clone(),
+                                ToolState::Done | ToolState::Declined
+                                    if Some(index) == last_answer =>
+                                {
+                                    tool.output.clone()
+                                }
+                                ToolState::Done | ToolState::Declined => {
+                                    shorten_old_output(&tool.output)
+                                }
+                                ToolState::Interrupted => INTERRUPTED.to_owned(),
                                 _ => NOT_RUN.to_owned(),
                             };
                             out.push(ChatMessage::Tool {
@@ -528,7 +638,8 @@ impl NemotronApp {
 
     fn start_request(&mut self, ctx: &egui::Context) {
         let history = self.api_history();
-        self.messages.push(Message::assistant());
+        self.messages
+            .push(Message::assistant(self.settings.thinking));
         self.scroll_to_bottom = true;
 
         let (tx, rx) = mpsc::channel();
@@ -582,26 +693,51 @@ impl NemotronApp {
                 msg.status = Status::Cancelled;
                 msg.settle_tools();
             }
-            self.stopped.push(active.rx);
+            let id = self.messages.last().map_or(0, |m| m.id);
+            self.stopped.push((id, active.rx));
         }
     }
 
-    /// Records file changes that stopped workers still report.
+    /// Takes in what stopped workers still report: a tool that was running
+    /// at Stop finishes, maybe after writing a file.
     fn poll_stopped(&mut self) {
         let mut changes = Vec::new();
-        self.stopped.retain(|rx| {
+        let mut finished = Vec::new();
+        self.stopped.retain(|(id, rx)| {
             loop {
                 match rx.try_recv() {
                     Ok(AgentEvent::ToolFinished {
-                        change: Some(change),
-                        ..
-                    }) => changes.push(change),
+                        call_id,
+                        output,
+                        ok,
+                        change,
+                    }) => {
+                        if let Some(change) = &change {
+                            changes.push(change.clone());
+                        }
+                        finished.push((*id, call_id, output, ok, change));
+                    }
                     Ok(_) => {}
                     Err(TryRecvError::Empty) => break true,
                     Err(TryRecvError::Disconnected) => break false,
                 }
             }
         });
+        for (id, call_id, output, ok, change) in finished {
+            if let Some(tool) = self
+                .messages
+                .iter_mut()
+                .find(|m| m.id == id)
+                .and_then(|m| m.tool_mut(&call_id))
+                .filter(|t| t.state == ToolState::Interrupted)
+            {
+                tool.state = ToolState::Done;
+                tool.output = output;
+                tool.ok = ok;
+                tool.set_file_change(change.as_ref());
+                tool.change = change;
+            }
+        }
         for change in &changes {
             self.record_change(change);
         }
@@ -640,6 +776,7 @@ impl NemotronApp {
                 ToolState::Running
             };
             tool.preview = None;
+            tool.set_file_change(None);
         }
     }
 
@@ -790,6 +927,419 @@ impl NemotronApp {
         self.load_paths(files, ctx);
     }
 
+    // -------------------------------------------------------------- remote
+
+    fn start_remote(&mut self, ctx: &egui::Context) {
+        if self.settings.remote_token.trim().is_empty() {
+            self.settings.remote_token = remote::new_token();
+            self.save_settings();
+        }
+        // Free the port before binding it again.
+        self.remote = None;
+        self.remote_qr = None;
+        self.remote_published = None;
+        let wake = {
+            let ctx = ctx.clone();
+            move || ctx.request_repaint()
+        };
+        match RemoteServer::start(
+            self.settings.remote_port,
+            self.settings.remote_token.clone(),
+            self.device_name.clone(),
+            wake,
+        ) {
+            Ok(server) => {
+                self.remote = Some(server);
+                self.remote_error = None;
+            }
+            Err(e) => self.remote_error = Some(e),
+        }
+    }
+
+    fn set_remote_enabled(&mut self, on: bool, ctx: &egui::Context) {
+        self.settings.remote_enabled = on;
+        self.save_settings();
+        if on {
+            self.start_remote(ctx);
+        } else {
+            self.remote = None;
+            self.remote_error = None;
+            self.remote_qr = None;
+        }
+    }
+
+    /// Locks out every paired phone.
+    fn renew_remote_token(&mut self, ctx: &egui::Context) {
+        self.settings.remote_token = remote::new_token();
+        self.save_settings();
+        if self.remote.is_some() {
+            self.start_remote(ctx);
+        }
+    }
+
+    /// Runs what the phone asked for and publishes the new state.
+    fn handle_remote(&mut self, ctx: &egui::Context) {
+        let mut handled = false;
+        while let Some(request) = self.remote.as_ref().and_then(RemoteServer::next_command) {
+            let reply = self.remote_command(&request.command, ctx);
+            // Publish before answering, so the phone's next look sees the result.
+            self.remote_published = None;
+            self.publish_remote(ctx);
+            request.answer(reply);
+            handled = true;
+        }
+        if !handled {
+            self.publish_remote(ctx);
+        }
+    }
+
+    fn remote_command(&mut self, command: &Command, ctx: &egui::Context) -> Reply {
+        let busy = || {
+            (
+                409,
+                "Nemotron arbeitet noch. Erst stoppen oder warten.".to_owned(),
+            )
+        };
+        let ok = Ok(json!({ "ok": true }));
+        match command {
+            Command::Send { text, images } => {
+                if self.active.is_some() {
+                    return Err(busy());
+                }
+                if self.needs_api_key() {
+                    return Err((
+                        400,
+                        "Am Mac ist noch kein NVIDIA-API-Schlüssel eingetragen.".into(),
+                    ));
+                }
+                let mut attachments = Vec::with_capacity(images.len());
+                for (name, bytes) in images {
+                    let att =
+                        attachments::image_attachment(name, bytes, self.settings.max_image_dim)
+                            .map_err(|e| (400, e))?;
+                    attachments.push(att);
+                }
+                self.messages
+                    .push(Message::user(text.trim().to_owned(), attachments));
+                self.notice = None;
+                self.start_request(ctx);
+                ok
+            }
+            Command::Stop => {
+                self.stop();
+                ok
+            }
+            Command::Decide { call_id, decision } => {
+                let waiting = self.active.is_some()
+                    && self
+                        .messages
+                        .last_mut()
+                        .and_then(|m| m.tool_mut(call_id))
+                        .is_some_and(|t| t.state == ToolState::AwaitingApproval);
+                if !waiting {
+                    return Err((404, "Diese Freigabe ist nicht mehr offen.".into()));
+                }
+                self.decide(call_id, *decision);
+                ok
+            }
+            Command::NewChat => {
+                self.new_chat(ctx);
+                ok
+            }
+            Command::Retry => {
+                if self.active.is_some() {
+                    return Err(busy());
+                }
+                if self.messages.is_empty() {
+                    return Err((409, "Es gibt noch nichts zu wiederholen.".into()));
+                }
+                self.retry(ctx);
+                ok
+            }
+            Command::Settings { approval, thinking } => {
+                if let Some(mode) = approval {
+                    self.settings.approval = *mode;
+                }
+                if let Some(on) = thinking {
+                    self.settings.thinking = *on;
+                }
+                if let Some(draft) = &mut self.settings_draft {
+                    draft.settings.approval = self.settings.approval;
+                    draft.settings.thinking = self.settings.thinking;
+                }
+                self.save_settings();
+                ok
+            }
+            Command::Undo { path } => {
+                if self.active.is_some() {
+                    return Err(busy());
+                }
+                let Some(index) = self.changes.iter().position(|c| &c.path == path) else {
+                    return Err((404, format!("{path} steht nicht in der Änderungsliste.")));
+                };
+                if self.needs_undo_confirm(&self.changes[index]) {
+                    return Err((
+                        409,
+                        format!(
+                            "{path} wurde inzwischen anders verändert. Bitte am Mac zurücksetzen und bestätigen."
+                        ),
+                    ));
+                }
+                self.undo_change(index, true);
+                match &self.notice {
+                    Some(n) if n.error => Err((500, n.text.clone())),
+                    _ => ok,
+                }
+            }
+            Command::Diff { path } => match self.changes.iter().find(|c| &c.path == path) {
+                Some(change) => Ok(json!({ "path": path, "diff": change.diff() })),
+                None => Err((404, format!("{path} steht nicht in der Änderungsliste."))),
+            },
+        }
+    }
+
+    /// Hands the current state to the server, at most a few times a second.
+    fn publish_remote(&mut self, ctx: &egui::Context) {
+        const EVERY: Duration = Duration::from_millis(150);
+        if self.remote.is_none() {
+            return;
+        }
+        if let Some(last) = self.remote_published
+            && last.elapsed() < EVERY
+        {
+            ctx.request_repaint_after(EVERY - last.elapsed());
+            return;
+        }
+        let snapshot = self.remote_snapshot();
+        if let Some(server) = &self.remote {
+            server.publish(snapshot);
+        }
+        self.remote_published = Some(Instant::now());
+    }
+
+    /// What the phone shows, as described in docs/remote-api.md.
+    fn remote_snapshot(&self) -> Value {
+        let messages: Vec<Value> = self
+            .messages
+            .iter()
+            .map(|msg| match msg.role {
+                Role::User => json!({
+                    "role": "user",
+                    "text": msg.text,
+                    "attachments": msg.attachments.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(),
+                }),
+                Role::Assistant => {
+                    let (status, error) = match &msg.status {
+                        Status::Streaming => ("streaming", None),
+                        Status::Done => ("done", None),
+                        Status::Cancelled => ("cancelled", None),
+                        Status::Failed(e) => ("failed", Some(e.as_str())),
+                    };
+                    let steps: Vec<Value> = msg
+                        .steps
+                        .iter()
+                        .map(|step| {
+                            let (thinking, answer) = step.parts();
+                            let tools: Vec<Value> = step
+                                .tools
+                                .iter()
+                                .map(|t| {
+                                    json!({
+                                        "id": t.call.id,
+                                        "name": crate::tools::canonical_tool_name(&t.call.name),
+                                        "title": widgets::tool_title(t),
+                                        "state": match t.state {
+                                            ToolState::Planned => "planned",
+                                            ToolState::AwaitingApproval => "awaiting_approval",
+                                            ToolState::Running => "running",
+                                            ToolState::Done => "done",
+                                            ToolState::Declined => "declined",
+                                            ToolState::NotRun => "not_run",
+                                            ToolState::Interrupted => "interrupted",
+                                        },
+                                        "ok": t.ok,
+                                        "output": tail_chars(&t.output, 4_000),
+                                        "diff": head_chars(&t.diff, 8_000),
+                                        "added": t.stats.map_or(0, |s| s.0),
+                                        "removed": t.stats.map_or(0, |s| s.1),
+                                        "warning": t.warning,
+                                    })
+                                })
+                                .collect();
+                            json!({
+                                "reasoning": tail_chars(thinking.unwrap_or(""), 6_000),
+                                "content": answer,
+                                "tools": tools,
+                            })
+                        })
+                        .collect();
+                    json!({
+                        "role": "assistant",
+                        "status": status,
+                        "error": error,
+                        "finish_reason": msg.finish_reason,
+                        "notices": msg.notices,
+                        "steps": steps,
+                    })
+                }
+            })
+            .collect();
+        let changes: Vec<Value> = self
+            .changes
+            .iter()
+            .map(|c| json!({"path": c.path, "added": c.stats.0, "removed": c.stats.1, "created": c.original.is_none()}))
+            .collect();
+        json!({
+            "busy": self.active.is_some(),
+            "model": self.settings.model,
+            "thinking": self.settings.thinking,
+            "approval": match self.settings.approval {
+                ApprovalMode::AskAll => "AskAll",
+                ApprovalMode::AutoEdits => "AutoEdits",
+                ApprovalMode::AutoAll => "AutoAll",
+            },
+            "workspace": self.workspace.as_ref().map(|ws| json!({"name": ws.name(), "path": ws.root().display().to_string()})),
+            "notice": self.notice.as_ref().map(|n| json!({"text": n.text, "error": n.error})),
+            "changes": changes,
+            "messages": messages,
+        })
+    }
+
+    fn remote_window(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        if !self.remote_window {
+            return;
+        }
+        let mut open = true;
+        let mut enabled = self.remote.is_some();
+        let mut toggled = false;
+        let mut renew = false;
+        let mut restart = false;
+        let mut copy = None;
+        let addresses = remote::local_addresses();
+        let payload = remote::pairing_payload(
+            &self.device_name,
+            self.remote
+                .as_ref()
+                .map_or(self.settings.remote_port, RemoteServer::port),
+            &self.settings.remote_token,
+            &addresses,
+        );
+        if self.remote.is_some() && self.remote_qr.as_ref().is_none_or(|(p, _)| *p != payload) {
+            self.remote_qr = qr_texture(ctx, &payload).map(|t| (payload.clone(), t));
+        }
+        egui::Window::new("Fernzugriff fürs Handy")
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(screen.center())
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(620.0)
+            .show(ctx, |ui| {
+                toggled = ui
+                    .checkbox(&mut enabled, RichText::new("Fernzugriff an").strong())
+                    .on_hover_text("Die Android-App kann dann Aufträge schicken, Antworten sehen und Freigaben geben.")
+                    .changed();
+                if let Some(e) = &self.remote_error {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("⚠ {e}"));
+                }
+                let Some(server) = &self.remote else {
+                    ui.label("Schalte den Fernzugriff ein, um dein Handy zu koppeln. Er bleibt aus, bis du ihn einschaltest.");
+                    return;
+                };
+                ui.label(RichText::new(format!("Läuft auf Port {} · Gerät „{}“", server.port(), self.device_name)).weak());
+                ui.add_space(6.0);
+                ui.horizontal_top(|ui| {
+                    if let Some((_, texture)) = &self.remote_qr {
+                        ui.add(egui::Image::new(texture).fit_to_exact_size(egui::vec2(220.0, 220.0)));
+                    }
+                    ui.vertical(|ui| {
+                        ui.label(RichText::new("So koppelst du dein Handy").strong());
+                        ui.label("1. Android-App „Fadis Nemotron“ öffnen → Tab „Mac“.");
+                        ui.label("2. „QR-Code scannen“ tippen und diesen Code scannen.");
+                        ui.label("3. Fertig – Aufträge, Antworten und Freigaben laufen jetzt auch übers Handy.");
+                        ui.add_space(6.0);
+                        ui.label(RichText::new("Unterwegs").strong());
+                        ui.label("Installiere Tailscale auf Mac und Handy und melde dich bei beiden mit demselben Konto an. Dann klappt die Verbindung überall, verschlüsselt und ohne Router-Einstellungen.");
+                        ui.hyperlink_to("tailscale.com/download", "https://tailscale.com/download");
+                    });
+                });
+                ui.add_space(6.0);
+                ui.label(RichText::new("Adressen").strong());
+                if addresses.is_empty() {
+                    ui.label(RichText::new("Keine Netzwerkverbindung gefunden.").weak());
+                }
+                for addr in &addresses {
+                    let kind = if remote::is_tailscale(*addr) {
+                        "Tailscale (auch unterwegs)"
+                    } else if addr.is_private() {
+                        "Heimnetz / WLAN"
+                    } else {
+                        "anderes Netz"
+                    };
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new(format!("http://{addr}:{}", server.port())).monospace());
+                        ui.label(RichText::new(kind).small().weak());
+                    });
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("Schlüssel").strong());
+                    let shown = if self.remote_show_token {
+                        self.settings.remote_token.clone()
+                    } else {
+                        "•".repeat(12)
+                    };
+                    ui.label(RichText::new(shown).monospace());
+                    ui.checkbox(&mut self.remote_show_token, "anzeigen");
+                    if ui.small_button("📋 Kopieren").clicked() {
+                        copy = Some(self.settings.remote_token.clone());
+                    }
+                });
+                ui.horizontal(|ui| {
+                    renew = ui
+                        .button("Neuen Schlüssel erzeugen")
+                        .on_hover_text("Alle gekoppelten Handys müssen danach neu scannen.")
+                        .clicked();
+                    ui.label("Port");
+                    let port_changed = ui.add(egui::DragValue::new(&mut self.settings.remote_port).range(1024..=65535)).changed();
+                    restart = port_changed;
+                });
+                match server.last_seen() {
+                    Some((when, from)) => {
+                        ui.label(RichText::new(format!("Zuletzt verbunden: vor {} s von {from}", when.elapsed().as_secs())).weak());
+                    }
+                    None => {
+                        ui.label(RichText::new("Noch kein Handy verbunden.").weak());
+                    }
+                }
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "macOS fragt beim ersten Mal, ob eingehende Verbindungen erlaubt sind – „Erlauben“ wählen. \
+                         Nicht über eine Portfreigabe im Router ins Internet stellen; dafür ist Tailscale da.",
+                    )
+                    .small()
+                    .weak(),
+                );
+            });
+        if toggled {
+            self.set_remote_enabled(enabled, ctx);
+        }
+        if renew {
+            self.renew_remote_token(ctx);
+        }
+        if restart && self.remote.is_some() {
+            self.save_settings();
+            self.start_remote(ctx);
+        }
+        if let Some(token) = copy {
+            ctx.copy_text(token);
+        }
+        if !open {
+            self.remote_window = false;
+        }
+    }
+
     // ------------------------------------------------------------------ UI
 
     fn top_bar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -809,6 +1359,19 @@ impl NemotronApp {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("⚙").on_hover_text("Einstellungen (⌘ ,)").clicked() {
                         self.open_settings();
+                    }
+                    let phone = if self.remote.is_some() {
+                        RichText::new("📱 ●").color(widgets::accent(ui))
+                    } else {
+                        RichText::new("📱")
+                    };
+                    let hover = if self.remote.is_some() {
+                        "Fernzugriff ist an: Handy kann verbinden"
+                    } else {
+                        "Fernzugriff fürs Handy"
+                    };
+                    if ui.button(phone).on_hover_text(hover).clicked() {
+                        self.remote_window = true;
                     }
                     if ui
                         .add_enabled(!self.messages.is_empty(), egui::Button::new("💾"))
@@ -873,6 +1436,9 @@ impl NemotronApp {
                     ui.radio_value(&mut self.settings.approval, mode, mode.label());
                 }
                 if self.settings.approval != before {
+                    if let Some(draft) = &mut self.settings_draft {
+                        draft.settings.approval = self.settings.approval;
+                    }
                     self.save_settings();
                 }
                 ui.label(
@@ -888,7 +1454,7 @@ impl NemotronApp {
                     ui.label(RichText::new("Noch keine Dateien geändert.").weak());
                 }
                 for (i, change) in self.changes.iter().enumerate() {
-                    let (added, removed) = change.line_stats();
+                    let (added, removed) = change.stats;
                     ui.push_id(i, |ui| {
                         ui.horizontal(|ui| {
                             ui.add(
@@ -1151,11 +1717,12 @@ impl NemotronApp {
         let Some(confirm) = &self.undo_confirm else {
             return;
         };
-        let index = confirm.index;
-        let Some(path) = self.changes.get(index).map(|c| c.path.clone()) else {
+        let Some(index) = self.changes.iter().position(|c| c.abs == confirm.abs) else {
             self.undo_confirm = None;
             return;
         };
+        let path = self.changes[index].path.clone();
+        let busy = self.active.is_some();
         let mut yes = false;
         let mut no = false;
         egui::Window::new("Trotzdem rückgängig machen?")
@@ -1167,8 +1734,13 @@ impl NemotronApp {
                 ui.label(format!(
                     "{path} wurde nach Nemotrons Änderung noch einmal verändert. Rückgängig setzt die Datei auf den Stand vor Nemotron zurück; spätere Änderungen gehen verloren."
                 ));
+                if busy {
+                    ui.label(RichText::new("Erst wenn Nemotron fertig ist.").small().weak());
+                }
                 ui.horizontal(|ui| {
-                    yes = ui.button("Zurücksetzen").clicked();
+                    yes = ui
+                        .add_enabled(!busy, egui::Button::new("Zurücksetzen"))
+                        .clicked();
                     no = ui.button("Abbrechen").clicked();
                 });
             });
@@ -1338,8 +1910,11 @@ impl NemotronApp {
             settings.base_url = settings.base_url.trim().to_owned();
             settings.model = settings.model.trim().to_owned();
             settings.api_key = settings.api_key.trim().to_owned();
-            // The project folder is managed in the side panel, not here.
+            // The project folder and remote access are managed elsewhere.
             settings.workspace = self.settings.workspace.clone();
+            settings.remote_enabled = self.settings.remote_enabled;
+            settings.remote_port = self.settings.remote_port;
+            settings.remote_token = self.settings.remote_token.clone();
             self.settings = settings;
             self.settings_draft = None;
             self.save_settings();
@@ -1409,10 +1984,10 @@ impl NemotronApp {
 /// request is over. File changes are collected for the change list.
 fn apply_event(msg: &mut Message, event: AgentEvent, changes: &mut Vec<FileChange>) -> bool {
     match event {
-        AgentEvent::StepStarted => msg.steps.push(Step::default()),
+        AgentEvent::StepStarted => msg.steps.push(msg.new_step()),
         AgentEvent::Text(delta) => {
             if msg.steps.is_empty() {
-                msg.steps.push(Step::default());
+                msg.steps.push(msg.new_step());
             }
             let step = msg.steps.last_mut().expect("step exists");
             match delta {
@@ -1432,23 +2007,12 @@ fn apply_event(msg: &mut Message, event: AgentEvent, changes: &mut Vec<FileChang
             tool_calls,
         } => {
             if msg.steps.is_empty() {
-                msg.steps.push(Step::default());
+                msg.steps.push(msg.new_step());
             }
             let step = msg.steps.last_mut().expect("step exists");
             step.content = content;
             step.reasoning = reasoning;
-            step.tools = tool_calls
-                .into_iter()
-                .map(|call| ToolView {
-                    call,
-                    state: ToolState::Planned,
-                    output: String::new(),
-                    ok: false,
-                    change: None,
-                    preview: None,
-                    warning: None,
-                })
-                .collect();
+            step.tools = tool_calls.into_iter().map(ToolView::planned).collect();
             if !step.tools.is_empty() || !step.parts().1.is_empty() {
                 step.collapse_once();
             }
@@ -1460,6 +2024,7 @@ fn apply_event(msg: &mut Message, event: AgentEvent, changes: &mut Vec<FileChang
         } => {
             if let Some(tool) = msg.tool_mut(&call_id) {
                 tool.state = ToolState::AwaitingApproval;
+                tool.set_file_change(preview.as_ref());
                 tool.preview = preview;
                 tool.warning = warning;
             }
@@ -1482,6 +2047,7 @@ fn apply_event(msg: &mut Message, event: AgentEvent, changes: &mut Vec<FileChang
                 tool.output = output;
                 tool.ok = ok;
                 tool.preview = None;
+                tool.set_file_change(change.as_ref());
                 if let Some(change) = &change {
                     changes.push(change.clone());
                 }
@@ -1492,6 +2058,7 @@ fn apply_event(msg: &mut Message, event: AgentEvent, changes: &mut Vec<FileChang
         AgentEvent::Finished { finish_reason } => {
             msg.status = Status::Done;
             msg.finish_reason = finish_reason;
+            msg.settle_tools();
             return true;
         }
         AgentEvent::Failed(e) => {
@@ -1509,13 +2076,31 @@ fn apply_event(msg: &mut Message, event: AgentEvent, changes: &mut Vec<FileChang
 }
 
 impl eframe::App for NemotronApp {
+    /// Commands still running would otherwise live on without the app.
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(active) = &self.active {
+            active.cancel.store(true, Ordering::Relaxed);
+        }
+        crate::tools::kill_running_commands();
+    }
+
+    /// Also runs while the window is hidden, so the phone keeps working
+    /// when the Mac app is minimised.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_agent();
+        self.poll_stopped();
+        self.poll_attachments();
+        self.handle_remote(ctx);
+        if self.active.is_some() || self.loading_attachments > 0 {
+            // Keeps spinners moving even when no tokens arrive (long thinking).
+            ctx.request_repaint_after(Duration::from_millis(200));
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         let full_rect = ui.max_rect();
 
-        self.poll_agent();
-        self.poll_stopped();
-        self.poll_attachments();
         self.handle_global_input(&ctx);
 
         self.top_bar(ui, &ctx);
@@ -1526,13 +2111,61 @@ impl eframe::App for NemotronApp {
         self.url_window(&ctx, full_rect);
         self.diff_window(&ctx, full_rect);
         self.undo_confirm_window(&ctx, full_rect);
+        self.remote_window(&ctx, full_rect);
         widgets::drop_overlay(&ctx, full_rect);
+    }
+}
 
-        if self.active.is_some() || self.loading_attachments > 0 {
-            // Keeps spinners moving even when no tokens arrive (long thinking).
-            ctx.request_repaint_after(Duration::from_millis(200));
+/// A tool output from an earlier answer: its start, enough to remember
+/// what happened.
+fn shorten_old_output(output: &str) -> String {
+    if output.chars().count() <= OLD_TOOL_OUTPUT_CHARS {
+        return output.to_owned();
+    }
+    format!(
+        "{}\n[… output shortened in the history; run the tool again if you need it …]",
+        head_chars(output, OLD_TOOL_OUTPUT_CHARS)
+    )
+}
+
+fn tail_chars(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        text.to_owned()
+    } else {
+        format!("…{}", text.chars().skip(count - max).collect::<String>())
+    }
+}
+
+fn head_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        text.to_owned()
+    } else {
+        format!("{}…", text.chars().take(max).collect::<String>())
+    }
+}
+
+/// The pairing QR code as a crisp texture (4-module quiet zone, 6 px per module).
+fn qr_texture(ctx: &egui::Context, payload: &str) -> Option<egui::TextureHandle> {
+    const QUIET: usize = 4;
+    const SCALE: usize = 6;
+    let code =
+        qrcode::QrCode::with_error_correction_level(payload.as_bytes(), qrcode::EcLevel::M).ok()?;
+    let width = code.width();
+    let colors = code.to_colors();
+    let size = (width + 2 * QUIET) * SCALE;
+    let mut pixels = vec![Color32::WHITE; size * size];
+    for (i, color) in colors.iter().enumerate() {
+        if *color != qrcode::Color::Dark {
+            continue;
+        }
+        let (mx, my) = (i % width + QUIET, i / width + QUIET);
+        for y in my * SCALE..(my + 1) * SCALE {
+            pixels[y * size + mx * SCALE..y * size + (mx + 1) * SCALE].fill(Color32::BLACK);
         }
     }
+    let image = egui::ColorImage::new([size, size], pixels);
+    Some(ctx.load_texture("kopplung", image, egui::TextureOptions::NEAREST))
 }
 
 /// The conversation as Markdown, for export.
@@ -1600,7 +2233,7 @@ mod tests {
     }
 
     fn run_events(events: Vec<AgentEvent>) -> (Message, Vec<FileChange>) {
-        let mut msg = Message::assistant();
+        let mut msg = Message::assistant(true);
         let mut changes = Vec::new();
         for e in events {
             apply_event(&mut msg, e, &mut changes);
@@ -1795,6 +2428,181 @@ mod tests {
         assert!(md.contains("Eine Katze."));
     }
 
+    /// Pumps the app like eframe would until `done` returns true.
+    fn pump(app: &mut NemotronApp, ctx: &egui::Context, mut done: impl FnMut() -> bool) {
+        let until = Instant::now() + Duration::from_secs(15);
+        while !done() && Instant::now() < until {
+            app.poll_agent();
+            app.handle_remote(ctx);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn remote_client() -> ureq::Agent {
+        ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .proxy(None)
+            .timeout_global(Some(Duration::from_secs(20)))
+            .build()
+            .into()
+    }
+
+    fn call(agent: &ureq::Agent, method: &str, url: &str, body: Option<Value>) -> (u16, Value) {
+        let mut res = match (method, body) {
+            ("GET", _) => agent.get(url).header("Authorization", "Bearer tok").call(),
+            (_, body) => agent
+                .post(url)
+                .header("Authorization", "Bearer tok")
+                .send(body.unwrap_or(json!({})).to_string()),
+        }
+        .unwrap();
+        let text = res.body_mut().read_to_string().unwrap_or_default();
+        (
+            res.status().as_u16(),
+            serde_json::from_str(&text).unwrap_or(Value::Null),
+        )
+    }
+
+    #[test]
+    fn phone_sends_a_message_and_sees_the_answer() {
+        use crate::api::tests::mock_server;
+        let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"Hallo vom Mac!\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let (base_url, nvidia) =
+            mock_server(vec![("200 OK", "text/event-stream", answer.to_owned())]);
+        let settings = Settings {
+            base_url,
+            api_key: "k".into(),
+            remote_port: 0,
+            remote_token: "tok".into(),
+            ..Settings::default()
+        };
+        let mut app = NemotronApp::with_settings(settings, None);
+        let ctx = egui::Context::default();
+        app.start_remote(&ctx);
+        let base = format!(
+            "http://127.0.0.1:{}/api/v1",
+            app.remote.as_ref().unwrap().port()
+        );
+
+        let phone = std::thread::spawn(move || {
+            let agent = remote_client();
+            let (status, _) = call(
+                &agent,
+                "POST",
+                &format!("{base}/send"),
+                Some(json!({"text": "Hi vom Handy"})),
+            );
+            assert_eq!(status, 200);
+            let (status, body) = call(
+                &agent,
+                "POST",
+                &format!("{base}/send"),
+                Some(json!({"text": "noch was"})),
+            );
+            // Either still busy, or already done and accepted: both are valid answers.
+            assert!(status == 409 || status == 200, "{status} {body}");
+            let mut version = 0;
+            for _ in 0..20 {
+                let (_, state) = call(
+                    &agent,
+                    "GET",
+                    &format!("{base}/state?after={version}&wait=5"),
+                    None,
+                );
+                version = state["version"].as_u64().unwrap();
+                let done = state["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["role"] == "assistant" && m["status"] == "done");
+                if done {
+                    return state;
+                }
+            }
+            panic!("no answer arrived");
+        });
+        pump(&mut app, &ctx, || phone.is_finished());
+        let state = phone.join().unwrap();
+        nvidia.join().unwrap();
+
+        assert_eq!(state["messages"][0]["text"], "Hi vom Handy");
+        assert_eq!(
+            state["messages"][1]["steps"][0]["content"],
+            "Hallo vom Mac!"
+        );
+        assert_eq!(state["workspace"], Value::Null);
+        assert_eq!(state["approval"], "AutoEdits");
+        assert_eq!(app.messages[0].text, "Hi vom Handy");
+    }
+
+    #[test]
+    fn phone_changes_settings_and_undoes_files() {
+        let dir = std::env::temp_dir().join(format!("fadis-remote-undo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "neu\n").unwrap();
+        let settings = Settings {
+            remote_port: 0,
+            remote_token: "tok".into(),
+            ..Settings::default()
+        };
+        let mut app = NemotronApp::with_settings(settings, None);
+        app.record_change(&FileChange {
+            path: "a.txt".into(),
+            abs: file.clone(),
+            before: Some("alt\n".into()),
+            after: "neu\n".into(),
+        });
+        let ctx = egui::Context::default();
+        app.start_remote(&ctx);
+        let base = format!(
+            "http://127.0.0.1:{}/api/v1",
+            app.remote.as_ref().unwrap().port()
+        );
+
+        let phone = std::thread::spawn(move || {
+            let agent = remote_client();
+            let settings = call(
+                &agent,
+                "POST",
+                &format!("{base}/settings"),
+                Some(json!({"approval": "AskAll", "thinking": false})),
+            );
+            let diff = call(&agent, "GET", &format!("{base}/diff?path=a.txt"), None);
+            let missing = call(&agent, "GET", &format!("{base}/diff?path=b.txt"), None);
+            let decide = call(
+                &agent,
+                "POST",
+                &format!("{base}/decide"),
+                Some(json!({"call_id": "x", "decision": "allow"})),
+            );
+            let undo = call(
+                &agent,
+                "POST",
+                &format!("{base}/undo"),
+                Some(json!({"path": "a.txt"})),
+            );
+            let (_, state) = call(&agent, "GET", &format!("{base}/state"), None);
+            (settings, diff, missing, decide, undo, state)
+        });
+        pump(&mut app, &ctx, || phone.is_finished());
+        let (settings, diff, missing, decide, undo, state) = phone.join().unwrap();
+
+        assert_eq!(settings.0, 200);
+        assert_eq!(app.settings.approval, ApprovalMode::AskAll);
+        assert!(!app.settings.thinking);
+        assert_eq!(diff.0, 200);
+        assert!(diff.1["diff"].as_str().unwrap().contains("-alt\n+neu"));
+        assert_eq!(missing.0, 404);
+        assert_eq!(decide.0, 404, "nothing is waiting for approval");
+        assert_eq!(undo.0, 200);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alt\n");
+        assert_eq!(state["changes"], json!([]));
+        assert_eq!(state["approval"], "AskAll");
+        assert_eq!(state["thinking"], false);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn undo_restores_and_deletes() {
         let dir = std::env::temp_dir().join(format!("fadis-undo-{}", std::process::id()));
@@ -1845,6 +2653,131 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&edited).unwrap(), "von Hand");
         app.undo_change(0, true);
         assert_eq!(std::fs::read_to_string(&edited).unwrap(), "vorher");
+
+        // Changed by hand between two agent edits: undo would lose that.
+        app.record_change(&FileChange {
+            path: "alt.txt".into(),
+            abs: edited.clone(),
+            before: Some("vorher".into()),
+            after: "agent 1".into(),
+        });
+        app.record_change(&FileChange {
+            path: "alt.txt".into(),
+            abs: edited.clone(),
+            before: Some("agent 1 und Hand".into()),
+            after: "agent 2".into(),
+        });
+        std::fs::write(&edited, "agent 2").unwrap();
+        app.undo_change(0, false);
+        assert!(app.undo_confirm.as_ref().is_some_and(|c| c.abs == edited));
+        assert_eq!(std::fs::read_to_string(&edited).unwrap(), "agent 2");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stop_while_a_tool_runs_marks_it_interrupted_until_it_reports() {
+        let mut app = NemotronApp::with_settings(Settings::default(), None);
+        app.messages.push(Message::user("Bau".into(), Vec::new()));
+        let mut msg = Message::assistant(true);
+        for e in [
+            AgentEvent::StepStarted,
+            AgentEvent::StepFinished {
+                content: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![
+                    tool("c1", "run_command", r#"{"command":"make"}"#),
+                    tool("c2", "read_file", "{}"),
+                ],
+            },
+            AgentEvent::ToolStarted {
+                call_id: "c1".into(),
+            },
+        ] {
+            apply_event(&mut msg, e, &mut Vec::new());
+        }
+        app.messages.push(msg);
+        let (tx, rx) = mpsc::channel();
+        let (decisions, _) = mpsc::channel();
+        app.active = Some(ActiveRequest {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            decisions,
+        });
+        app.stop();
+        let tools = &app.messages[1].steps[0].tools;
+        assert_eq!(tools[0].state, ToolState::Interrupted);
+        assert_eq!(tools[1].state, ToolState::NotRun);
+        let history = app.api_history();
+        assert!(matches!(&history[2], ChatMessage::Tool { content, .. } if content == INTERRUPTED));
+        assert!(matches!(&history[3], ChatMessage::Tool { content, .. } if content == NOT_RUN));
+
+        // The command ends after the stop and reports what it did.
+        tx.send(AgentEvent::ToolFinished {
+            call_id: "c1".into(),
+            output: "$ make\nstopped by the user".into(),
+            ok: false,
+            change: None,
+        })
+        .unwrap();
+        tx.send(AgentEvent::Cancelled).unwrap();
+        drop(tx);
+        app.poll_stopped();
+        let tool = &app.messages[1].steps[0].tools[0];
+        assert_eq!(tool.state, ToolState::Done);
+        assert!(tool.output.contains("stopped by the user"));
+        assert!(app.stopped.is_empty());
+    }
+
+    #[test]
+    fn old_tool_outputs_are_shortened_in_the_history() {
+        let long = "x".repeat(10_000);
+        let answer = |id: &str| {
+            run_events(vec![
+                AgentEvent::StepStarted,
+                AgentEvent::StepFinished {
+                    content: String::new(),
+                    reasoning: String::new(),
+                    tool_calls: vec![tool(id, "read_file", "{}")],
+                },
+                AgentEvent::ToolFinished {
+                    call_id: id.into(),
+                    output: long.clone(),
+                    ok: true,
+                    change: None,
+                },
+                AgentEvent::Finished {
+                    finish_reason: Some("stop".into()),
+                },
+            ])
+            .0
+        };
+        let history = HistoryOnly(vec![
+            Message::user("eins".into(), Vec::new()),
+            answer("c1"),
+            Message::user("zwei".into(), Vec::new()),
+            answer("c2"),
+        ])
+        .history();
+        let outputs: Vec<usize> = history
+            .iter()
+            .filter_map(|m| match m {
+                ChatMessage::Tool { content, .. } => Some(content.len()),
+                _ => None,
+            })
+            .collect();
+        assert!(outputs[0] < 2_200, "{outputs:?}");
+        assert_eq!(outputs[1], 10_000);
+    }
+
+    #[test]
+    fn think_tags_are_text_when_thinking_is_off() {
+        let mut msg = Message::assistant(false);
+        for e in [
+            AgentEvent::StepStarted,
+            AgentEvent::Text(TextDelta::Content("Schreib </think> nie so.".into())),
+        ] {
+            apply_event(&mut msg, e, &mut Vec::new());
+        }
+        assert_eq!(msg.steps[0].parts(), (None, "Schreib </think> nie so."));
     }
 }

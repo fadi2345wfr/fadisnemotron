@@ -370,6 +370,10 @@ fn tool_card(ui: &mut egui::Ui, tool: &ToolView, actions: &mut Vec<UiAction>) {
                         ui.label(RichText::new("–").weak())
                             .on_hover_text("nicht ausgeführt");
                     }
+                    ToolState::Interrupted => {
+                        ui.label(RichText::new("⏹").color(ui.visuals().warn_fg_color))
+                            .on_hover_text("beim Stopp abgebrochen – kann teilweise gelaufen sein");
+                    }
                     ToolState::Planned => {
                         ui.label(RichText::new("○").weak());
                     }
@@ -387,8 +391,7 @@ fn tool_card(ui: &mut egui::Ui, tool: &ToolView, actions: &mut Vec<UiAction>) {
                 };
                 ui.add(egui::Label::new(text).truncate())
                     .on_hover_text(title);
-                if let Some(change) = tool.change.as_ref().or(tool.preview.as_ref()) {
-                    let (added, removed) = change.line_stats();
+                if let Some((added, removed)) = tool.stats {
                     ui.label(RichText::new(format!("+{added}")).color(ADDED).small());
                     ui.label(RichText::new(format!("−{removed}")).color(REMOVED).small());
                 }
@@ -412,7 +415,7 @@ fn tool_card(ui: &mut egui::Ui, tool: &ToolView, actions: &mut Vec<UiAction>) {
                     );
                 }
                 match (&tool.preview, canonical_tool_name(&tool.call.name)) {
-                    (Some(preview), _) => diff_label(ui, &preview.diff(), INLINE_DIFF_LINES),
+                    (Some(_), _) => diff_label(ui, &tool.diff, INLINE_DIFF_LINES),
                     (None, "run_command") => {
                         let args: Value =
                             serde_json::from_str(&tool.call.arguments).unwrap_or(Value::Null);
@@ -477,12 +480,11 @@ fn tool_card(ui: &mut egui::Ui, tool: &ToolView, actions: &mut Vec<UiAction>) {
                 .default_open(false)
                 .show(ui, |ui| {
                     if let Some(change) = &tool.change {
-                        let diff = change.diff();
-                        diff_label(ui, &diff, INLINE_DIFF_LINES);
+                        diff_label(ui, &tool.diff, INLINE_DIFF_LINES);
                         if ui.small_button("Ganzen Diff im Fenster zeigen").clicked() {
                             actions.push(UiAction::ShowDiff {
                                 title: change.path.clone(),
-                                diff,
+                                diff: tool.diff.clone(),
                             });
                         }
                     } else {
@@ -639,6 +641,8 @@ mod tests {
             change: None,
             preview: None,
             warning: None,
+            diff: String::new(),
+            stats: None,
         }
     }
 
