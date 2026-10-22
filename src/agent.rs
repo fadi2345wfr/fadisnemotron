@@ -694,7 +694,7 @@ mod tests {
                 .unwrap()
                 .contains("src/")
         );
-        assert_eq!(first["tools"].as_array().unwrap().len(), 7);
+        assert_eq!(first["tools"].as_array().unwrap().len(), 8);
         // Third request carries both rounds, in order, with the thinking.
         let third: serde_json::Value =
             serde_json::from_str(requests[2].split("\r\n\r\n").nth(1).unwrap()).unwrap();
