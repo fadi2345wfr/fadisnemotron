@@ -7,40 +7,39 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.consumeWindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.lazy.itemsIndexed
-import androidx.compose.material3.Checkbox
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.RadioButton
+import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleStartEffect
@@ -49,14 +48,15 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import de.fadi.nemotron.R
-import de.fadi.nemotron.data.ApprovalMode
-import de.fadi.nemotron.data.Notice
+import de.fadi.nemotron.data.RemoteApi
 import de.fadi.nemotron.data.RemoteState
 import de.fadi.nemotron.ui.common.ChatList
 import de.fadi.nemotron.ui.common.Composer
 import de.fadi.nemotron.ui.common.UserBubble
 import de.fadi.nemotron.ui.common.rememberChatListState
+import kotlinx.coroutines.launch
 
+/** The whole app: pairing until a Mac is known, then its chats. */
 @Composable
 fun MacScreen(viewModel: MacViewModel) {
     val state by viewModel.state.collectAsStateWithLifecycle()
@@ -94,15 +94,12 @@ private fun scanQrCode(context: Context, onCode: (String) -> Unit, onError: () -
         .addOnFailureListener { onError() }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun RemoteChat(viewModel: MacViewModel, state: MacUiState, macName: String) {
     val remote = state.remote
-    val busy = remote?.busy == true
-    val photos by viewModel.attachments.photos.collectAsStateWithLifecycle()
+    val drawer = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
     val snackbar = remember { SnackbarHostState() }
-    val chat = rememberChatListState()
-    var showChanges by rememberSaveable { mutableStateOf(false) }
 
     state.message?.let { message ->
         LaunchedEffect(message) {
@@ -111,44 +108,64 @@ private fun RemoteChat(viewModel: MacViewModel, state: MacUiState, macName: Stri
         }
     }
 
+    // Outside the drawer, so a message about the chat list stays readable while the list is open.
+    Box(Modifier.fillMaxSize()) {
+        ModalNavigationDrawer(
+            drawerState = drawer,
+            // Swiping only closes it: an edge swipe to open would fight with code blocks scrolling sideways.
+            gesturesEnabled = drawer.isOpen,
+            drawerContent = {
+                ChatDrawer(
+                    drawerState = drawer,
+                    chats = remote?.chats.orEmpty(),
+                    openChatId = remote?.chat?.id,
+                    onNewChat = {
+                        scope.launch { drawer.close() }
+                        viewModel.newChat()
+                    },
+                    onOpen = { id ->
+                        scope.launch { drawer.close() }
+                        viewModel.openChat(id)
+                    },
+                    onDelete = viewModel::deleteChat,
+                )
+            },
+        ) {
+            ChatScaffold(viewModel, state, macName, onOpenDrawer = { scope.launch { drawer.open() } })
+        }
+        SnackbarHost(snackbar, Modifier.align(Alignment.BottomCenter).safeDrawingPadding())
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun ChatScaffold(viewModel: MacViewModel, state: MacUiState, macName: String, onOpenDrawer: () -> Unit) {
+    val remote = state.remote
+    val busy = remote?.busy == true
+    var showChanges by rememberSaveable { mutableStateOf(false) }
+
     Scaffold(
         topBar = {
             TopAppBar(
-                title = {
-                    Column {
-                        Text(
-                            when {
-                                remote == null -> macName
-                                remote.workspace == null -> stringResource(R.string.chat_only)
-                                else -> remote.workspace.name
-                            },
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        if (remote != null) {
-                            Text(
-                                macName,
-                                style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            )
-                        }
+                navigationIcon = {
+                    IconButton(onClick = onOpenDrawer, enabled = remote != null) {
+                        Icon(painterResource(R.drawable.ic_menu), contentDescription = stringResource(R.string.chats))
                     }
                 },
+                title = { ChatTitle(remote, macName) },
                 actions = {
                     if (busy) CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
                     MacMenu(
                         remote = remote,
-                        onNewChat = viewModel::newChat,
                         onRetry = viewModel::retry,
                         onChanges = { showChanges = true },
                         onApproval = viewModel::setApproval,
                         onThinking = viewModel::setThinking,
-                        onDisconnect = viewModel::disconnect,
+                        onUnpair = viewModel::unpair,
                     )
                 },
             )
         },
-        snackbarHost = { SnackbarHost(snackbar) },
     ) { padding ->
         Column(
             Modifier
@@ -157,50 +174,11 @@ private fun RemoteChat(viewModel: MacViewModel, state: MacUiState, macName: Stri
                 .consumeWindowInsets(padding)
                 .imePadding(),
         ) {
-            if (state.connectionLost) {
-                Banner(stringResource(R.string.connection_lost), MaterialTheme.colorScheme.errorContainer)
+            if (state.macTooOld) {
+                MacTooOld(onCheckAgain = viewModel::checkAgain)
+            } else {
+                Conversation(viewModel, state, macName, Modifier.weight(1f))
             }
-            remote?.notice?.let { NoticeBanner(it) }
-            Box(Modifier.weight(1f)) {
-                when {
-                    remote == null -> Row(
-                        Modifier.align(Alignment.Center),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
-                        Text(stringResource(R.string.connecting_to, macName))
-                    }
-                    remote.messages.isEmpty() -> Text(
-                        stringResource(if (remote.workspace == null) R.string.empty_chat else R.string.empty_project),
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier.align(Alignment.Center).padding(32.dp),
-                    )
-                    else -> ChatList(chat, contentKey = remote.version, Modifier.fillMaxSize()) {
-                        itemsIndexed(remote.messages, key = { index, _ -> index }) { _, message ->
-                            if (message.isUser) {
-                                UserBubble(message.text, attachments = message.attachments)
-                            } else {
-                                RemoteAssistantMessage(message, state.deciding, viewModel::decide)
-                            }
-                        }
-                    }
-                }
-            }
-            Composer(
-                text = viewModel.draft,
-                onTextChange = { viewModel.draft = it },
-                photos = photos,
-                onAddPhotos = viewModel.attachments::add,
-                onRemovePhoto = viewModel.attachments::remove,
-                busy = busy,
-                sending = state.sending,
-                onSend = {
-                    chat.jumpToEnd()
-                    viewModel.send()
-                },
-                onStop = viewModel::stop,
-            )
         }
     }
 
@@ -216,96 +194,96 @@ private fun RemoteChat(viewModel: MacViewModel, state: MacUiState, macName: Stri
     state.diff?.let { DiffDialog(it.path, it.diff, viewModel::closeDiff) }
 }
 
+/** The open chat's title, and below it where Nemotron works and on which Mac. */
 @Composable
-private fun MacMenu(
-    remote: RemoteState?,
-    onNewChat: () -> Unit,
-    onRetry: () -> Unit,
-    onChanges: () -> Unit,
-    onApproval: (ApprovalMode) -> Unit,
-    onThinking: (Boolean) -> Unit,
-    onDisconnect: () -> Unit,
-) {
-    var open by remember { mutableStateOf(false) }
-    val connected = remote != null
-    val busy = remote?.busy == true
-    IconButton(onClick = { open = true }) {
-        Icon(painterResource(R.drawable.ic_more_vert), contentDescription = stringResource(R.string.menu))
+private fun ChatTitle(remote: RemoteState?, macName: String) {
+    if (remote == null) {
+        Text(macName, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        return
     }
-    DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-        fun item(action: () -> Unit): () -> Unit = {
-            open = false
-            action()
-        }
-        DropdownMenuItem(text = { Text(stringResource(R.string.new_chat)) }, onClick = item(onNewChat), enabled = connected)
-        DropdownMenuItem(
-            text = { Text(stringResource(R.string.retry)) },
-            onClick = item(onRetry),
-            enabled = connected && !busy && remote.messages.isNotEmpty(),
-        )
-        DropdownMenuItem(
-            text = { Text(stringResource(R.string.changes_menu, remote?.changes?.size ?: 0)) },
-            onClick = item(onChanges),
-            enabled = remote?.workspace != null,
-        )
-        HorizontalDivider()
+    val workspace = remote.workspace?.let { if (it.home) stringResource(R.string.home_folder) else it.name }
+    Column {
         Text(
-            stringResource(R.string.approval_title),
-            style = MaterialTheme.typography.labelLarge,
-            color = MaterialTheme.colorScheme.primary,
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+            remote.chat?.title?.ifBlank { null } ?: stringResource(R.string.new_chat),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
-        for (mode in ApprovalMode.entries) {
-            DropdownMenuItem(
-                text = { Text(stringResource(mode.label)) },
-                onClick = item { onApproval(mode) },
-                trailingIcon = { RadioButton(selected = remote?.approval == mode, onClick = null) },
-                enabled = connected,
-            )
-        }
-        HorizontalDivider()
-        DropdownMenuItem(
-            text = { Text(stringResource(R.string.thinking_mode)) },
-            onClick = item { onThinking(remote?.thinking != true) },
-            trailingIcon = { Checkbox(checked = remote?.thinking == true, onCheckedChange = null) },
-            enabled = connected,
+        Text(
+            listOfNotNull(workspace, macName).joinToString(" · "),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
         )
-        HorizontalDivider()
-        DropdownMenuItem(text = { Text(stringResource(R.string.disconnect)) }, onClick = item(onDisconnect))
     }
 }
 
-private val ApprovalMode.label: Int
-    get() = when (this) {
-        ApprovalMode.AskAll -> R.string.approval_ask_all
-        ApprovalMode.AutoEdits -> R.string.approval_auto_edits
-        ApprovalMode.AutoAll -> R.string.approval_auto_all
-    }
-
 @Composable
-private fun NoticeBanner(notice: Notice) {
-    var dismissed by rememberSaveable { mutableStateOf<String?>(null) }
-    if (notice.text.isBlank() || notice.text == dismissed) return
-    Banner(
-        notice.text,
-        if (notice.error) MaterialTheme.colorScheme.errorContainer else MaterialTheme.colorScheme.secondaryContainer,
-        onDismiss = { dismissed = notice.text },
+private fun Conversation(viewModel: MacViewModel, state: MacUiState, macName: String, modifier: Modifier) {
+    val remote = state.remote
+    val attachments by viewModel.attachments.items.collectAsStateWithLifecycle()
+    val chat = rememberChatListState()
+    val chatId = remote?.chat?.id
+    // The Mac may switch chats too; the phone follows and starts at the end of the new one.
+    LaunchedEffect(chatId) { chat.jumpToEnd() }
+
+    if (state.connectionLost) {
+        Banner(stringResource(R.string.connection_lost), MaterialTheme.colorScheme.errorContainer)
+    }
+    remote?.notice?.let { NoticeBanner(it) }
+    Box(modifier) {
+        when {
+            remote == null -> Row(
+                Modifier.align(Alignment.Center),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                CircularProgressIndicator(Modifier.size(20.dp), strokeWidth = 2.dp)
+                Text(stringResource(R.string.connecting_to, macName))
+            }
+            remote.messages.isEmpty() -> Text(
+                stringResource(if (remote.workspace?.home == false) R.string.empty_project else R.string.empty_home),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.align(Alignment.Center).padding(32.dp),
+            )
+            else -> ChatList(chat, contentKey = remote.version, Modifier.fillMaxSize()) {
+                // Keyed by chat too, so folded thinking or tool details do not carry over to another chat.
+                itemsIndexed(remote.messages, key = { index, _ -> "$chatId/$index" }) { _, message ->
+                    if (message.isUser) {
+                        UserBubble(message.text, message.attachments)
+                    } else {
+                        RemoteAssistantMessage(message, state.deciding, viewModel::decide)
+                    }
+                }
+            }
+        }
+    }
+    Composer(
+        text = viewModel.draft,
+        onTextChange = { viewModel.draft = it },
+        attachments = attachments,
+        onAddMedia = viewModel.attachments::add,
+        onRemoveAttachment = { viewModel.attachments.remove(it.key) },
+        busy = remote?.busy == true,
+        sending = state.sending,
+        upload = state.upload,
+        onSend = {
+            chat.jumpToEnd()
+            viewModel.send()
+        },
+        onStop = viewModel::stop,
     )
 }
 
 @Composable
-private fun Banner(text: String, color: Color, onDismiss: (() -> Unit)? = null) {
-    Surface(color = color, modifier = Modifier.fillMaxWidth()) {
-        Row(
-            verticalAlignment = Alignment.CenterVertically,
-            modifier = Modifier.padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
-        ) {
-            Text(text, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.weight(1f).padding(vertical = 4.dp))
-            if (onDismiss != null) {
-                IconButton(onClick = onDismiss) {
-                    Icon(painterResource(R.drawable.ic_close), contentDescription = stringResource(R.string.close))
-                }
-            }
-        }
+private fun MacTooOld(onCheckAgain: () -> Unit) {
+    Column(
+        Modifier.fillMaxSize().padding(32.dp),
+        verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        Text(RemoteApi.MAC_TOO_OLD, style = MaterialTheme.typography.titleMedium, textAlign = TextAlign.Center)
+        Button(onClick = onCheckAgain) { Text(stringResource(R.string.check_again)) }
     }
 }

@@ -18,14 +18,22 @@ class RemoteModelsTest {
         assertTrue(state.busy)
         assertTrue(state.thinking)
         assertEquals(ApprovalMode.AutoEdits, state.approval)
-        assertEquals("proj", state.workspace?.name)
+        assertEquals(Workspace("proj", "/Users/fadi/proj", home = false), state.workspace)
         assertEquals(Notice("README.md wiederhergestellt.", error = false), state.notice)
+        assertEquals(OpenChat("c-20261022-104512-3f9a", "Ändere die README"), state.chat)
+        assertEquals(
+            listOf(
+                ChatSummary("c-20261022-104512-3f9a", "Ändere die README", updated = 1792658712, messages = 2),
+                ChatSummary("c-20261021-180301-b7c1", "Ordner auf dem Schreibtisch anlegen", updated = 1792605781, messages = 6),
+            ),
+            state.chats,
+        )
         assertEquals(listOf(Change("README.md", added = 1, removed = 1, created = false)), state.changes)
 
         val (user, assistant) = state.messages
         assertTrue(user.isUser)
         assertEquals("Ändere die README", user.text)
-        assertEquals(listOf("foto.jpg"), user.attachments)
+        assertEquals(listOf("foto.jpg", "clip.mp4"), user.attachments)
 
         assertFalse(assistant.isUser)
         assertEquals(MessageStatus.Streaming, assistant.status)
@@ -48,11 +56,37 @@ class RemoteModelsTest {
     }
 
     @Test
-    fun `a chat without project folder has no workspace`() {
-        val state = parse("""{"version": 3, "busy": false, "workspace": null, "approval": "AskAll", "messages": []}""")
-        assertNull(state.workspace)
+    fun `without a project Nemotron works in the home folder`() {
+        val state = parse(
+            """
+            {"version": 3, "busy": false, "approval": "AskAll", "messages": [],
+             "workspace": {"name": "fadi", "path": "/Users/fadi", "home": true},
+             "chat": {"id": "c-1", "title": "Neuer Chat"}, "chats": [{"id": "c-1", "title": "Neuer Chat", "updated": 1792658712, "messages": 0}]}
+            """,
+        )
+        assertEquals(Workspace("fadi", "/Users/fadi", home = true), state.workspace)
         assertEquals(ApprovalMode.AskAll, state.approval)
+        assertEquals("c-1", state.chat?.id)
+        assertEquals(listOf("c-1"), state.chats.map { it.id })
         assertTrue(state.messages.isEmpty())
+    }
+
+    @Test
+    fun `an older Mac app without chats still parses`() {
+        val state = parse("""{"version": 3, "workspace": {"name": "proj", "path": "/Users/fadi/proj"}, "messages": []}""")
+        assertNull(state.chat)
+        assertTrue(state.chats.isEmpty())
+        assertFalse(state.workspace!!.home)
+    }
+
+    @Test
+    fun `chat entries fall back to defaults`() {
+        val state = parse(
+            """{"chat": null, "chats": [{"id": "c-2", "title": null, "updated": null, "pinned": true}, {"title": "ohne Zeit"}]}""",
+        )
+        assertNull(state.chat)
+        assertEquals(ChatSummary("c-2", "", updated = 0, messages = 0), state.chats[0])
+        assertEquals("ohne Zeit", state.chats[1].title)
     }
 
     @Test
@@ -131,11 +165,16 @@ class RemoteModelsTest {
   "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
   "thinking": true,
   "approval": "AutoEdits",
-  "workspace": {"name": "proj", "path": "/Users/fadi/proj"},
+  "workspace": {"name": "proj", "path": "/Users/fadi/proj", "home": false},
   "notice": {"text": "README.md wiederhergestellt.", "error": false},
+  "chat": {"id": "c-20261022-104512-3f9a", "title": "Ändere die README"},
+  "chats": [
+    {"id": "c-20261022-104512-3f9a", "title": "Ändere die README", "updated": 1792658712, "messages": 2},
+    {"id": "c-20261021-180301-b7c1", "title": "Ordner auf dem Schreibtisch anlegen", "updated": 1792605781, "messages": 6}
+  ],
   "changes": [{"path": "README.md", "added": 1, "removed": 1, "created": false}],
   "messages": [
-    {"role": "user", "text": "Ändere die README", "attachments": ["foto.jpg"]},
+    {"role": "user", "text": "Ändere die README", "attachments": ["foto.jpg", "clip.mp4"]},
     {
       "role": "assistant",
       "status": "streaming",

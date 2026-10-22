@@ -7,21 +7,19 @@ import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.Matrix
 import android.net.Uri
-import android.provider.OpenableColumns
 import androidx.core.graphics.createBitmap
 import androidx.core.graphics.scale
 import androidx.exifinterface.media.ExifInterface
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
-import java.util.Base64
 import kotlin.math.max
 import kotlin.math.min
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-/** A photo ready to send: JPEG, base64, with a small preview. */
-class Photo(val name: String, val base64: String, val thumbnail: Bitmap)
+/** A photo ready to upload: JPEG bytes and a small preview. */
+class Photo(val name: String, val jpeg: ByteArray, val thumbnail: Bitmap)
 
 /** Turns picked images into [Photo]s: upright, at most [MAX_SIDE] px, JPEG quality [QUALITY]. */
 class PhotoEncoder(private val resolver: ContentResolver) {
@@ -47,7 +45,8 @@ class PhotoEncoder(private val resolver: ContentResolver) {
         }
         val scale = min(1f, THUMBNAIL_SIDE.toFloat() / max(image.width, image.height))
         val thumbnail = image.scale(max(1, (image.width * scale).toInt()), max(1, (image.height * scale).toInt()))
-        Photo(displayName(uri), Base64.getEncoder().encodeToString(jpeg), thumbnail)
+        val name = resolver.displayName(uri)?.substringBeforeLast('.')?.takeIf { it.isNotBlank() } ?: "foto"
+        Photo("$name.jpg", jpeg, thumbnail)
     }
 
     private fun open(uri: Uri): InputStream =
@@ -77,16 +76,11 @@ class PhotoEncoder(private val resolver: ContentResolver) {
         0f
     }
 
-    private fun displayName(uri: Uri): String {
-        val name = resolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)?.use { cursor ->
-            if (cursor.moveToFirst()) cursor.getString(0) else null
-        }
-        return "${name?.substringBeforeLast('.')?.takeIf { it.isNotBlank() } ?: "foto"}.jpg"
-    }
-
     companion object {
         const val MAX_SIDE = 1536
         const val QUALITY = 85
-        private const val THUMBNAIL_SIDE = 192
     }
 }
+
+/** Longest side of the previews in the composer, in pixels. */
+internal const val THUMBNAIL_SIDE = 192

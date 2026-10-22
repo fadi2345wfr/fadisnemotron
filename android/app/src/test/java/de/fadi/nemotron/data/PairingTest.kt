@@ -58,7 +58,7 @@ class PairingTest {
 
     @Test
     fun `keeps the first address that answers`() = runBlocking {
-        mac.enqueue(MockResponse.Builder().body("""{"ok": true, "name": "Fadis MacBook", "protocol": 1}""").build())
+        mac.enqueue(MockResponse.Builder().body("""{"ok": true, "name": "Fadis MacBook", "protocol": 2}""").build())
         val unreachable = "http://127.0.0.1:1"
         val reachable = mac.url("/").toString().trimEnd('/')
 
@@ -76,6 +76,17 @@ class PairingTest {
             runBlocking { connect(PairingCode(1, "MacBook", listOf(first, "http://127.0.0.1:1"), "falsch"), http) }
         }
         assertEquals(401, error.status)
+        assertEquals(1, mac.requestCount)
+    }
+
+    @Test
+    fun `refuses a Mac app that is too old`() {
+        mac.enqueue(MockResponse.Builder().body("""{"ok": true, "name": "MacBook", "protocol": 1}""").build())
+        val first = mac.url("/").toString()
+        val error = assertThrows(RemoteException::class.java) {
+            runBlocking { connect(PairingCode(1, "MacBook", listOf(first, "http://127.0.0.1:1"), "abc"), http) }
+        }
+        assertEquals(RemoteApi.MAC_TOO_OLD, error.message)
         assertEquals(1, mac.requestCount)
     }
 

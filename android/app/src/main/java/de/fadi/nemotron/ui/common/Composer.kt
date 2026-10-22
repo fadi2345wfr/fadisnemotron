@@ -13,7 +13,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.CircularProgressIndicator
@@ -21,11 +20,13 @@ import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.key
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.res.painterResource
@@ -33,66 +34,56 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
 import de.fadi.nemotron.R
-import de.fadi.nemotron.data.Photo
 
 /**
- * The input row: text, photos, and Send, which turns into Stop while
- * Nemotron is busy. [sending] shows a request on its way.
+ * The input row: text, photos and videos, and Send, which turns into Stop
+ * while Nemotron is busy. [sending] shows a message on its way, with the
+ * [upload] progress of its attachments.
  */
 @Composable
 fun Composer(
     text: String,
     onTextChange: (String) -> Unit,
-    photos: List<Photo>,
-    onAddPhotos: (List<Uri>) -> Unit,
-    onRemovePhoto: (Photo) -> Unit,
+    attachments: List<Attachment>,
+    onAddMedia: (List<Uri>) -> Unit,
+    onRemoveAttachment: (Attachment) -> Unit,
     busy: Boolean,
     sending: Boolean,
+    upload: UploadProgress?,
     onSend: () -> Unit,
     onStop: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val picker = rememberLauncherForActivityResult(
-        ActivityResultContracts.PickMultipleVisualMedia(Attachments.MAX_PHOTOS),
-    ) { uris -> if (uris.isNotEmpty()) onAddPhotos(uris) }
-    val canSend = !busy && !sending && (text.isNotBlank() || photos.isNotEmpty())
+        ActivityResultContracts.PickMultipleVisualMedia(Attachments.MAX_ITEMS),
+    ) { uris -> if (uris.isNotEmpty()) onAddMedia(uris) }
+    val shrinking = attachments.any { it.upload == null }
+    val canSend = !busy && !sending && !shrinking && (text.isNotBlank() || attachments.isNotEmpty())
 
     Surface(color = MaterialTheme.colorScheme.surfaceContainerLow, modifier = modifier.fillMaxWidth()) {
         Column(Modifier.padding(horizontal = 8.dp, vertical = 8.dp)) {
-            if (photos.isNotEmpty()) {
+            if (attachments.isNotEmpty()) {
                 Row(
                     Modifier.horizontalScroll(rememberScrollState()).padding(start = 8.dp, bottom = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    for (photo in photos) {
-                        Box {
-                            Thumbnail(photo, 64)
-                            Surface(
-                                onClick = { onRemovePhoto(photo) },
-                                shape = CircleShape,
-                                color = MaterialTheme.colorScheme.inverseSurface,
-                                modifier = Modifier.align(Alignment.TopEnd).padding(2.dp).size(22.dp),
-                            ) {
-                                Icon(
-                                    painterResource(R.drawable.ic_close),
-                                    contentDescription = stringResource(R.string.remove_photo, photo.name),
-                                    tint = MaterialTheme.colorScheme.inverseOnSurface,
-                                    modifier = Modifier.padding(3.dp),
-                                )
-                            }
+                    for (attachment in attachments) {
+                        key(attachment.key) {
+                            AttachmentChip(attachment, removable = !sending, onRemove = { onRemoveAttachment(attachment) })
                         }
                     }
                 }
             }
+            if (upload != null) UploadStatus(upload)
             Row(verticalAlignment = Alignment.Bottom) {
                 IconButton(
                     onClick = {
-                        picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                        picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageAndVideo))
                     },
-                    enabled = photos.size < Attachments.MAX_PHOTOS,
+                    enabled = !sending && attachments.size < Attachments.MAX_ITEMS,
                     modifier = Modifier.padding(bottom = 4.dp),
                 ) {
-                    Icon(painterResource(R.drawable.ic_image), contentDescription = stringResource(R.string.add_photos))
+                    Icon(painterResource(R.drawable.ic_image), contentDescription = stringResource(R.string.add_media))
                 }
                 OutlinedTextField(
                     value = text,
@@ -125,5 +116,20 @@ fun Composer(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun UploadStatus(upload: UploadProgress) {
+    Column(Modifier.padding(start = 8.dp, end = 8.dp, bottom = 8.dp)) {
+        Text(
+            stringResource(R.string.uploading, formatMegabytes(upload.sent, upload.total)),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+        LinearProgressIndicator(
+            progress = { if (upload.total > 0) upload.sent.toFloat() / upload.total else 0f },
+            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+        )
     }
 }

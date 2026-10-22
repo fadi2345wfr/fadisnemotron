@@ -25,12 +25,29 @@ data class RemoteState(
     val approval: ApprovalMode = ApprovalMode.AutoEdits,
     val workspace: Workspace? = null,
     val notice: Notice? = null,
+    /** The chat open on the Mac (and so on the phone); [messages] belong to it. */
+    val chat: OpenChat? = null,
+    /** All saved chats, newest first. */
+    val chats: List<ChatSummary> = emptyList(),
     val changes: List<Change> = emptyList(),
     val messages: List<RemoteMessage> = emptyList(),
 )
 
+/** The agent's working folder; [home] when no project is open and it works in the Mac's home folder. */
 @Serializable
-data class Workspace(val name: String = "")
+data class Workspace(val name: String = "", val path: String = "", val home: Boolean = false)
+
+@Serializable
+data class OpenChat(val id: String = "", val title: String = "")
+
+@Serializable
+data class ChatSummary(
+    val id: String = "",
+    val title: String = "",
+    /** Unix time in seconds. */
+    val updated: Long = 0,
+    val messages: Int = 0,
+)
 
 @Serializable
 data class Notice(val text: String = "", val error: Boolean = false)
@@ -102,4 +119,4 @@ enum class Decision {
 }
 
 @Serializable
-data class ImageUpload(val name: String, val data: String)
+data class UploadResult(val id: String = "", val kind: String = "", val size: Long = 0)

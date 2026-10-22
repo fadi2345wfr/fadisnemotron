@@ -51,19 +51,22 @@ fun normalizeAddress(input: String): String? {
 
 /**
  * Tries the Mac's addresses in order and keeps the first that answers.
- * A wrong key stops at once, since every address would reject it.
+ * A wrong key or a Mac app that is too old stops at once, since every
+ * address would give the same answer.
  */
 suspend fun connect(code: PairingCode, http: OkHttpClient): Pairing {
     if (!code.token.isHeaderSafe()) throw RemoteException(null, "Der Schlüssel enthält ungültige Zeichen.")
     var lastError: RemoteException? = null
     for (url in code.urls.mapNotNull(::normalizeAddress)) {
-        try {
-            val ping = RemoteApi(url, code.token, http).ping()
-            return Pairing(url, code.token, ping.name.ifBlank { code.name.ifBlank { "Mac" } })
+        val ping = try {
+            RemoteApi(url, code.token, http).ping()
         } catch (e: RemoteException) {
             if (e.status == 401) throw e
             lastError = e
+            continue
         }
+        if (!ping.supported) throw RemoteException(null, RemoteApi.MAC_TOO_OLD)
+        return Pairing(url, code.token, ping.name.ifBlank { code.name.ifBlank { "Mac" } })
     }
     throw lastError ?: RemoteException(null, "Der QR-Code enthält keine gültige Adresse.")
 }

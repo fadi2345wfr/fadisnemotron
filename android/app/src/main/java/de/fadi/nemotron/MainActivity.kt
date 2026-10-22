@@ -6,8 +6,9 @@ import androidx.activity.ComponentActivity
 import androidx.activity.SystemBarStyle
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
-import de.fadi.nemotron.ui.AppScreen
-import de.fadi.nemotron.ui.Tab
+import androidx.lifecycle.viewmodel.compose.viewModel
+import de.fadi.nemotron.ui.mac.MacScreen
+import de.fadi.nemotron.ui.mac.MacViewModel
 import de.fadi.nemotron.ui.theme.FadisTheme
 import de.fadi.nemotron.ui.theme.usesDarkTheme
 
@@ -17,11 +18,9 @@ class MainActivity : ComponentActivity() {
         val barStyle = SystemBarStyle.auto(Color.TRANSPARENT, Color.TRANSPARENT, ::usesDarkTheme)
         enableEdgeToEdge(barStyle, barStyle)
         super.onCreate(savedInstanceState)
-        val prefs = (application as FadisApplication).prefs
-        val initialTab = Tab.entries.find { it.name == prefs.lastTab } ?: Tab.Mac
         setContent {
             FadisTheme(dark = usesDarkTheme(resources)) {
-                AppScreen(initialTab, onTabChange = { prefs.lastTab = it.name })
+                MacScreen(viewModel(factory = MacViewModel.Factory))
             }
         }
     }

@@ -3,7 +3,7 @@ package de.fadi.nemotron.data
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
-/** Where an answer stands; shared by both modes. */
+/** Where an answer stands. */
 @Serializable
 enum class MessageStatus {
     @SerialName("streaming") Streaming,

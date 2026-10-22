@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- The API key and the Mac's pairing key stay on this phone: no cloud backup, no device transfer. -->
+<!-- The Mac's pairing key stays on this phone: no cloud backup, no device transfer. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="root" />

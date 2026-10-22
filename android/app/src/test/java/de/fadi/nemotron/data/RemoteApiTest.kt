@@ -11,7 +11,9 @@ import mockwebserver3.MockWebServer
 import mockwebserver3.RecordedRequest
 import okhttp3.OkHttpClient
 import org.junit.After
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
@@ -38,20 +40,34 @@ class RemoteApiTest {
 
     @Test
     fun `every request carries the key`() = runBlocking {
-        answer(body = """{"ok": true, "app": "Fadis Nemotron", "version": "0.3.0", "protocol": 1, "name": "MacBook"}""")
+        answer(body = """{"ok": true, "app": "Fadis Nemotron", "version": "0.4.0", "protocol": 2, "name": "MacBook"}""")
         answer()
 
-        assertEquals("MacBook", api.ping().name)
+        val ping = api.ping()
+        assertEquals("MacBook", ping.name)
+        assertEquals(2, ping.protocol)
+        assertTrue(ping.supported)
         api.stop()
 
-        val ping = mac.takeRequest()
-        assertEquals("GET", ping.method)
-        assertEquals("/api/v1/ping", ping.url.encodedPath)
-        assertEquals("Bearer geheim123", ping.headers["Authorization"])
+        val request = mac.takeRequest()
+        assertEquals("GET", request.method)
+        assertEquals("/api/v1/ping", request.url.encodedPath)
+        assertEquals("Bearer geheim123", request.headers["Authorization"])
         val stop = mac.takeRequest()
         assertEquals("POST", stop.method)
         assertEquals("/api/v1/stop", stop.url.encodedPath)
         assertEquals("Bearer geheim123", stop.headers["Authorization"])
+    }
+
+    @Test
+    fun `a Mac app without protocol 2 is too old`() = runBlocking {
+        answer(body = """{"ok": true, "app": "Fadis Nemotron", "version": "0.3.0", "protocol": 1, "name": "MacBook"}""")
+        answer(body = """{"ok": true, "name": "MacBook"}""")
+        answer(body = """{"ok": true, "protocol": 3}""")
+
+        assertFalse(api.ping().supported)
+        assertFalse(api.ping().supported)
+        assertTrue(api.ping().supported)
     }
 
     @Test
@@ -68,19 +84,92 @@ class RemoteApiTest {
     }
 
     @Test
-    fun `sends text and photos`() = runBlocking {
+    fun `uploads raw bytes with name and type`() = runBlocking {
+        answer(body = """{"id": "up-7f3a9c", "kind": "video", "size": 200000}""")
+        val bytes = ByteArray(200_000) { (it % 251).toByte() }
+        val progress = mutableListOf<Long>()
+
+        val result = api.upload("Urlaub am Meer.mp4", "video/mp4", UploadBody.of(bytes)) { progress += it }
+
+        assertEquals(UploadResult("up-7f3a9c", "video", 200_000), result)
+        val request = mac.takeRequest()
+        assertEquals("POST", request.method)
+        assertEquals("/api/v1/upload", request.url.encodedPath)
+        assertEquals("Urlaub am Meer.mp4", request.url.queryParameter("name"))
+        assertEquals("video/mp4", request.headers["Content-Type"])
+        assertEquals("200000", request.headers["Content-Length"])
+        assertEquals("Bearer geheim123", request.headers["Authorization"])
+        assertArrayEquals(bytes, request.body!!.toByteArray())
+        assertEquals(200_000L, progress.last())
+        assertEquals(progress.sorted(), progress)
+    }
+
+    @Test
+    fun `an upload the Mac refuses shows its reason`() {
+        answer(413, """{"error": "Das Video ist größer als 100 MB."}""")
+        val error = assertThrows(RemoteException::class.java) {
+            runBlocking { api.upload("clip.mp4", "video/mp4", UploadBody.of(ByteArray(10))) }
+        }
+        assertEquals(413, error.status)
+        assertEquals("Das Video ist größer als 100 MB.", error.message)
+    }
+
+    @Test
+    fun `sends text with the upload ids`() = runBlocking {
         answer()
 
-        api.send("Bau das Projekt", listOf(ImageUpload("foto.jpg", "AAEC"), ImageUpload("bild.jpg", "/9j/")))
+        api.send("Was passiert in dem Video?", listOf("up-7f3a9c", "up-0b1d2e"))
 
         val request = mac.takeRequest()
         assertEquals("/api/v1/send", request.url.encodedPath)
         assertTrue(request.headers["Content-Type"]!!.startsWith("application/json"))
         val body = request.json()
-        assertEquals("Bau das Projekt", body["text"]!!.jsonPrimitive.content)
-        val images = body["images"]!!.jsonArray.map { it.jsonObject }
-        assertEquals(listOf("foto.jpg", "bild.jpg"), images.map { it["name"]!!.jsonPrimitive.content })
-        assertEquals(listOf("AAEC", "/9j/"), images.map { it["data"]!!.jsonPrimitive.content })
+        assertEquals(setOf("text", "uploads"), body.keys)
+        assertEquals("Was passiert in dem Video?", body["text"]!!.jsonPrimitive.content)
+        assertEquals(listOf("up-7f3a9c", "up-0b1d2e"), body["uploads"]!!.jsonArray.map { it.jsonPrimitive.content })
+    }
+
+    @Test
+    fun `opens, deletes and starts chats`() = runBlocking {
+        repeat(3) { answer() }
+
+        api.openChat("c-20261021-180301-b7c1")
+        api.deleteChat("c-20261022-104512-3f9a")
+        api.newChat()
+
+        val open = mac.takeRequest()
+        assertEquals("/api/v1/open_chat", open.url.encodedPath)
+        assertEquals(mapOf("id" to "c-20261021-180301-b7c1"), open.json().mapValues { it.value.jsonPrimitive.content })
+        val delete = mac.takeRequest()
+        assertEquals("/api/v1/delete_chat", delete.url.encodedPath)
+        assertEquals(mapOf("id" to "c-20261022-104512-3f9a"), delete.json().mapValues { it.value.jsonPrimitive.content })
+        val new = mac.takeRequest()
+        assertEquals("POST", new.method)
+        assertEquals("/api/v1/new_chat", new.url.encodedPath)
+    }
+
+    @Test
+    fun `chat actions explain a missing chat and a busy Mac`() {
+        answer(404, """{"error": "Not found"}""")
+        answer(409, """{"error": "Conflict"}""")
+        answer(409, "")
+
+        val missing = assertThrows(RemoteException::class.java) { runBlocking { api.openChat("weg") } }
+        assertEquals(404, missing.status)
+        assertEquals("Chat nicht gefunden.", missing.message)
+        val busy = assertThrows(RemoteException::class.java) { runBlocking { api.deleteChat("c-1") } }
+        assertEquals(409, busy.status)
+        assertEquals("Nemotron arbeitet noch.", busy.message)
+        val busyNew = assertThrows(RemoteException::class.java) { runBlocking { api.newChat() } }
+        assertEquals("Nemotron arbeitet noch.", busyNew.message)
+    }
+
+    @Test
+    fun `an expired upload shows the Mac's reason`() {
+        answer(404, """{"error": "Der Upload ist abgelaufen. Bitte noch einmal senden."}""")
+        val error = assertThrows(RemoteException::class.java) { runBlocking { api.send("Hallo", listOf("up-alt")) } }
+        assertEquals(404, error.status)
+        assertEquals("Der Upload ist abgelaufen. Bitte noch einmal senden.", error.message)
     }
 
     @Test
@@ -118,7 +207,7 @@ class RemoteApiTest {
     @Test
     fun `sending while Nemotron works says so`() {
         answer(409, """{"error": "Conflict"}""")
-        val error = assertThrows(RemoteException::class.java) { runBlocking { api.send("Hallo", emptyList()) } }
+        val error = assertThrows(RemoteException::class.java) { runBlocking { api.send("Hallo") } }
         assertEquals(409, error.status)
         assertEquals("Nemotron arbeitet noch.", error.message)
     }

@@ -1,5 +1,5 @@
 [versions]
-# compileSdk is 36. Compose 1.12 (BOM 2026.08+), core 1.19, lifecycle 2.11 and
+# compileSdk is 36. Compose 1.12 (BOM 2026.08+), core 1.19, lifecycle 2.11, media3 1.12 and
 # OkHttp 5.5 need compileSdk 37, so these are the newest releases that build against 36.
 agp = "9.4.1"
 kotlin = "2.4.21"
@@ -8,6 +8,7 @@ activityCompose = "1.13.0"
 lifecycle = "2.10.0"
 coreKtx = "1.18.0"
 exifinterface = "1.4.2"
+media3 = "1.11.1"
 codeScanner = "16.1.0"
 serialization = "1.12.0"
 coroutines = "1.11.0"
@@ -17,6 +18,9 @@ junit = "4.13.2"
 [libraries]
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "coreKtx" }
 androidx-exifinterface = { module = "androidx.exifinterface:exifinterface", version.ref = "exifinterface" }
+media3-transformer = { module = "androidx.media3:media3-transformer", version.ref = "media3" }
+media3-effect = { module = "androidx.media3:media3-effect", version.ref = "media3" }
+media3-common = { module = "androidx.media3:media3-common", version.ref = "media3" }
 androidx-activity-compose = { module = "androidx.activity:activity-compose", version.ref = "activityCompose" }
 androidx-lifecycle-viewmodel-compose = { module = "androidx.lifecycle:lifecycle-viewmodel-compose", version.ref = "lifecycle" }
 androidx-lifecycle-runtime-compose = { module = "androidx.lifecycle:lifecycle-runtime-compose", version.ref = "lifecycle" }

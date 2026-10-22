@@ -1,9 +1,7 @@
 package de.fadi.nemotron.ui.common
 
 import android.content.ClipData
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,7 +10,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.CircularProgressIndicator
@@ -23,7 +20,6 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
@@ -31,8 +27,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.ClipEntry
 import androidx.compose.ui.platform.LocalClipboard
 import androidx.compose.ui.res.painterResource
@@ -43,27 +37,18 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import de.fadi.nemotron.R
 import de.fadi.nemotron.data.MessageStatus
-import de.fadi.nemotron.data.Photo
 import de.fadi.nemotron.ui.theme.FadisTheme
 import kotlinx.coroutines.launch
 
 /** The user's message: a green-tinted bubble on the right. */
 @Composable
-fun UserBubble(text: String, attachments: List<String> = emptyList(), photos: List<Photo> = emptyList()) {
+fun UserBubble(text: String, attachments: List<String>) {
     Box(Modifier.fillMaxWidth().padding(start = 40.dp), contentAlignment = Alignment.CenterEnd) {
         Surface(
             color = MaterialTheme.colorScheme.primary.copy(alpha = 0.16f),
             shape = RoundedCornerShape(18.dp, 18.dp, 4.dp, 18.dp),
         ) {
             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                if (photos.isNotEmpty()) {
-                    Row(
-                        Modifier.horizontalScroll(rememberScrollState()),
-                        horizontalArrangement = Arrangement.spacedBy(6.dp),
-                    ) {
-                        for (photo in photos) Thumbnail(photo, 72)
-                    }
-                }
                 for (name in attachments) {
                     Text(
                         stringResource(R.string.attachment, name),
@@ -77,17 +62,6 @@ fun UserBubble(text: String, attachments: List<String> = emptyList(), photos: Li
             }
         }
     }
-}
-
-@Composable
-fun Thumbnail(photo: Photo, sizeDp: Int, modifier: Modifier = Modifier) {
-    val bitmap = remember(photo) { photo.thumbnail.asImageBitmap() }
-    Image(
-        bitmap = bitmap,
-        contentDescription = photo.name,
-        contentScale = ContentScale.Crop,
-        modifier = modifier.size(sizeDp.dp).clip(RoundedCornerShape(8.dp)),
-    )
 }
 
 /**

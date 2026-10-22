@@ -13,6 +13,7 @@ import kotlinx.serialization.json.contentOrNull
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
@@ -30,6 +31,13 @@ class RemoteApi(baseUrl: String, private val token: String, http: OkHttpClient) 
         .build()
     private val pingClient = client.newBuilder().callTimeout(4, TimeUnit.SECONDS).build()
 
+    // Room for 100 MB over a slow mobile link; a stalled one still fails after two minutes.
+    private val uploadClient = client.newBuilder()
+        .writeTimeout(2, TimeUnit.MINUTES)
+        .readTimeout(2, TimeUnit.MINUTES)
+        .callTimeout(10, TimeUnit.MINUTES)
+        .build()
+
     suspend fun ping(): Ping = decode(execute(pingClient, request("ping")))
 
     /** The current state; waits up to [wait] seconds for a newer one than [after]. */
@@ -44,20 +52,36 @@ class RemoteApi(baseUrl: String, private val token: String, http: OkHttpClient) 
     suspend fun diff(path: String): String =
         decode<DiffResponse>(execute(client, request("diff") { addQueryParameter("path", path) })).diff
 
-    suspend fun send(text: String, images: List<ImageUpload>) {
-        try {
-            post("send", remoteJson.encodeToString(SendRequest(text, images)))
-        } catch (e: RemoteException) {
-            throw if (e.status == 409) RemoteException(409, BUSY) else e
-        }
+    /** Sends a photo or video as raw bytes; [onProgress] gets the bytes sent so far. */
+    suspend fun upload(
+        name: String,
+        contentType: String,
+        body: UploadBody,
+        onProgress: (sent: Long) -> Unit = {},
+    ): UploadResult {
+        val request = request("upload") { addQueryParameter("name", name) }
+            .post(ProgressRequestBody(contentType.toMediaTypeOrNull(), body, onProgress))
+        val result = decode<UploadResult>(execute(uploadClient, request))
+        if (result.id.isBlank()) throw RemoteException(null, UNREADABLE)
+        return result
     }
+
+    /** Sends a message in the open chat, with the ids of earlier [upload]s. */
+    suspend fun send(text: String, uploads: List<String> = emptyList()) =
+        postWhenIdle("send", remoteJson.encodeToString(SendRequest(text, uploads)))
 
     suspend fun stop() = post("stop")
 
     suspend fun decide(callId: String, decision: Decision) =
         post("decide", remoteJson.encodeToString(DecideRequest(callId, decision)))
 
-    suspend fun newChat() = post("new_chat")
+    suspend fun newChat() = postWhenIdle("new_chat")
+
+    suspend fun openChat(id: String) =
+        postWhenIdle("open_chat", remoteJson.encodeToString(ChatRequest(id)), notFound = CHAT_NOT_FOUND)
+
+    suspend fun deleteChat(id: String) =
+        postWhenIdle("delete_chat", remoteJson.encodeToString(ChatRequest(id)), notFound = CHAT_NOT_FOUND)
 
     suspend fun retry() = post("retry")
 
@@ -73,6 +97,17 @@ class RemoteApi(baseUrl: String, private val token: String, http: OkHttpClient) 
 
     private suspend fun post(endpoint: String, json: String = "{}") {
         execute(client, request(endpoint).post(json.toRequestBody(JSON)))
+    }
+
+    /** For requests the Mac refuses while an answer runs; [notFound] replaces its text for a 404. */
+    private suspend fun postWhenIdle(endpoint: String, json: String = "{}", notFound: String? = null) = try {
+        post(endpoint, json)
+    } catch (e: RemoteException) {
+        throw when {
+            e.status == 409 -> RemoteException(409, BUSY)
+            e.status == 404 && notFound != null -> RemoteException(404, notFound)
+            else -> e
+        }
     }
 
     private suspend fun execute(client: OkHttpClient, request: Request.Builder): String = try {
@@ -97,6 +132,8 @@ class RemoteApi(baseUrl: String, private val token: String, http: OkHttpClient) 
     companion object {
         const val LONG_POLL_SECONDS = 25
         const val BUSY = "Nemotron arbeitet noch."
+        const val CHAT_NOT_FOUND = "Chat nicht gefunden."
+        const val MAC_TOO_OLD = "Die Mac-App ist zu alt – bitte auf Version 0.4 aktualisieren."
         const val UNREACHABLE =
             "Mac nicht erreichbar. Gleiches WLAN oder Tailscale prüfen – ist der Fernzugriff am Mac an?"
         private const val UNREADABLE = "Die Antwort des Macs ist unverständlich. Sind beide Apps aktuell?"
@@ -110,7 +147,7 @@ private fun remoteError(status: Int, body: String): RemoteException {
         401 -> "Falscher Schlüssel. Koppel das Handy neu: QR-Code in der Mac-App scannen."
         else -> errorText(body) ?: when (status) {
             409 -> RemoteApi.BUSY
-            413 -> "Zu groß für den Mac (höchstens 20 MB). Weniger oder kleinere Fotos anhängen."
+            413 -> "Zu groß für den Mac (Videos höchstens 100 MB)."
             503 -> "Die Mac-App antwortet nicht. Ist sie geöffnet?"
             else -> "Der Mac meldet Fehler $status."
         }
@@ -125,14 +162,23 @@ private fun errorText(body: String): String? = try {
     null
 }
 
+/** The protocol version (docs/remote-api.md) this app speaks. */
+const val PROTOCOL_VERSION = 2
+
 @Serializable
-data class Ping(val name: String = "")
+data class Ping(val name: String = "", val protocol: Int = 0) {
+    /** False for a Mac app too old for chats and uploads; version 1 did not send [protocol] at all. */
+    val supported: Boolean get() = protocol >= PROTOCOL_VERSION
+}
 
 @Serializable
 private class DiffResponse(val diff: String = "")
 
 @Serializable
-private class SendRequest(val text: String, val images: List<ImageUpload>)
+private class SendRequest(val text: String, val uploads: List<String>)
+
+@Serializable
+private class ChatRequest(val id: String)
 
 @Serializable
 private class DecideRequest(@SerialName("call_id") val callId: String, val decision: Decision)

@@ -11,7 +11,6 @@ import androidx.lifecycle.viewmodel.viewModelFactory
 import de.fadi.nemotron.FadisApplication
 import de.fadi.nemotron.data.ApprovalMode
 import de.fadi.nemotron.data.Decision
-import de.fadi.nemotron.data.ImageUpload
 import de.fadi.nemotron.data.Pairing
 import de.fadi.nemotron.data.PairingCode
 import de.fadi.nemotron.data.PhotoEncoder
@@ -19,10 +18,13 @@ import de.fadi.nemotron.data.Prefs
 import de.fadi.nemotron.data.RemoteApi
 import de.fadi.nemotron.data.RemoteException
 import de.fadi.nemotron.data.RemoteState
+import de.fadi.nemotron.data.Upload
+import de.fadi.nemotron.data.VideoEncoder
 import de.fadi.nemotron.data.connect
 import de.fadi.nemotron.data.normalizeAddress
 import de.fadi.nemotron.data.parsePairingCode
 import de.fadi.nemotron.ui.common.Attachments
+import de.fadi.nemotron.ui.common.UploadProgress
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -36,9 +38,13 @@ data class MacUiState(
     val pairing: Pairing? = null,
     val remote: RemoteState? = null,
     val connectionLost: Boolean = false,
+    /** The Mac app answers, but speaks an older protocol than this app needs. */
+    val macTooOld: Boolean = false,
     val pairingInProgress: Boolean = false,
     val pairingError: String? = null,
     val sending: Boolean = false,
+    /** Set while the attachments of the message being sent are uploaded. */
+    val upload: UploadProgress? = null,
     /** Tool calls whose decision is on its way to the Mac. */
     val deciding: Set<String> = emptySet(),
     val diff: DiffView? = null,
@@ -47,11 +53,12 @@ data class MacUiState(
 
 data class DiffView(val path: String, val diff: String)
 
-/** Remote control of the Mac app: pairing, the long-poll loop and the actions. */
+/** The Mac app on the phone: pairing, the long-poll loop and the actions. */
 class MacViewModel(
     private val prefs: Prefs,
     private val http: OkHttpClient,
     photos: PhotoEncoder,
+    videos: VideoEncoder,
 ) : ViewModel() {
     private val _state = MutableStateFlow(MacUiState(pairing = prefs.pairing))
     val state: StateFlow<MacUiState> = _state.asStateFlow()
@@ -59,7 +66,7 @@ class MacViewModel(
     /** The message being typed; plain Compose state so the text field never lags. */
     var draft by mutableStateOf("")
 
-    val attachments = Attachments(viewModelScope, photos, ::showMessage)
+    val attachments = Attachments(viewModelScope, photos, videos, ::showMessage)
 
     private var api: RemoteApi? = prefs.pairing?.let { RemoteApi(it.url, it.token, http) }
     private var visible = false
@@ -83,8 +90,18 @@ class MacViewModel(
 
     private suspend fun poll(api: RemoteApi) {
         var backoff = MIN_BACKOFF_MS
+        // Checked again after every lost connection: the Mac app may have been replaced meanwhile.
+        var checked = false
         while (true) {
             try {
+                if (!checked) {
+                    if (!api.ping().supported) {
+                        _state.update { it.copy(macTooOld = true, remote = null, connectionLost = false) }
+                        return
+                    }
+                    _state.update { it.copy(macTooOld = false) }
+                    checked = true
+                }
                 val remote = api.state(after = _state.value.remote?.version ?: 0)
                 _state.update { it.copy(remote = remote, connectionLost = false) }
                 backoff = MIN_BACKOFF_MS
@@ -94,11 +111,18 @@ class MacViewModel(
                     forget(e.message)
                     return
                 }
+                checked = false
                 _state.update { it.copy(connectionLost = true) }
                 delay(backoff)
                 backoff = (backoff * 2).coerceAtMost(MAX_BACKOFF_MS)
             }
         }
+    }
+
+    /** After the Mac app was updated. */
+    fun checkAgain() {
+        _state.update { it.copy(macTooOld = false) }
+        updatePolling()
     }
 
     fun pairWithCode(raw: String) {
@@ -141,7 +165,7 @@ class MacViewModel(
         }
     }
 
-    fun disconnect() = forget(null)
+    fun unpair() = forget(null)
 
     private fun forget(reason: String?) {
         prefs.pairing = null
@@ -150,28 +174,48 @@ class MacViewModel(
         _state.value = MacUiState(pairingError = reason)
     }
 
+    /** Uploads the attachments, then sends; on failure text and attachments stay for another try. */
     fun send() {
         val api = api ?: return
         val text = draft.trim()
-        val photos = attachments.photos.value
-        if (text.isEmpty() && photos.isEmpty() || _state.value.sending) return
+        val items = attachments.items.value
+        if (text.isEmpty() && items.isEmpty() || _state.value.sending) return
+        val uploads = items.map { it.upload ?: return }
         _state.update { it.copy(sending = true) }
         viewModelScope.launch {
             try {
-                api.send(text, photos.map { ImageUpload(it.name, it.base64) })
+                api.send(text, upload(api, uploads))
                 draft = ""
                 attachments.clear()
             } catch (e: RemoteException) {
                 showMessage(e.message)
             } finally {
-                _state.update { it.copy(sending = false) }
+                _state.update { it.copy(sending = false, upload = null) }
             }
+        }
+    }
+
+    private suspend fun upload(api: RemoteApi, uploads: List<Upload>): List<String> {
+        val total = uploads.sumOf { it.body.length }
+        var done = 0L
+        return uploads.map { upload ->
+            val result = api.upload(upload.name, upload.contentType, upload.body) { sent ->
+                _state.update { it.copy(upload = UploadProgress(done + sent, total)) }
+            }
+            done += upload.body.length
+            result.id
         }
     }
 
     fun stop() = act { it.stop() }
 
-    fun newChat() = act { it.newChat() }
+    fun newChat() = whenIdle { it.newChat() }
+
+    fun openChat(id: String) {
+        if (id != _state.value.remote?.chat?.id) whenIdle { it.openChat(id) }
+    }
+
+    fun deleteChat(id: String) = whenIdle { it.deleteChat(id) }
 
     fun retry() = act { it.retry() }
 
@@ -206,6 +250,11 @@ class MacViewModel(
         if (message != null) _state.update { it.copy(message = message) }
     }
 
+    /** Chats cannot change while an answer runs; saying so right away beats a round trip. */
+    private fun whenIdle(action: suspend (RemoteApi) -> Unit) {
+        if (_state.value.remote?.busy == true) showMessage(RemoteApi.BUSY) else act(action)
+    }
+
     private fun act(action: suspend (RemoteApi) -> Unit) {
         val api = api ?: return
         viewModelScope.launch {
@@ -217,6 +266,8 @@ class MacViewModel(
         }
     }
 
+    override fun onCleared() = attachments.clear()
+
     companion object {
         private const val MIN_BACKOFF_MS = 2_000L
         private const val MAX_BACKOFF_MS = 10_000L
@@ -224,7 +275,7 @@ class MacViewModel(
         val Factory = viewModelFactory {
             initializer {
                 val app = this[APPLICATION_KEY] as FadisApplication
-                MacViewModel(app.prefs, app.http, app.photos)
+                MacViewModel(app.prefs, app.http, app.photos, app.videos)
             }
         }
     }

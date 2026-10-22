@@ -12,8 +12,8 @@ android {
         applicationId = "de.fadi.nemotron"
         minSdk = 26
         targetSdk = 36
-        versionCode = 300
-        versionName = "0.3.0"
+        versionCode = 400
+        versionName = "0.4.0"
     }
 
     // One key for debug and release, so every build installs over the previous one.
@@ -54,6 +54,9 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.exifinterface)
+    implementation(libs.media3.transformer)
+    implementation(libs.media3.effect)
+    implementation(libs.media3.common)
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
     implementation(libs.play.services.code.scanner)

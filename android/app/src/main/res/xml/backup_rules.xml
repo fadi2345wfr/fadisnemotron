@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Android 8 to 11: backups are off anyway (allowBackup="false"); this keeps the keys out should that change. -->
+<!-- Android 8 to 11: backups are off anyway (allowBackup="false"); this keeps the pairing key out should that change. -->
 <full-backup-content>
     <exclude domain="sharedpref" path="." />
 </full-backup-content>
