@@ -1466,7 +1466,9 @@ impl Workspace {
                     .status();
                 match status {
                     Ok(s) if s.success() => {
-                        let size = std::fs::metadata(&target_path).map(|m| m.len()).unwrap_or(0);
+                        let size = std::fs::metadata(&target_path)
+                            .map(|m| m.len())
+                            .unwrap_or(0);
                         ToolOutput::ok(format!(
                             "Screenshot captured successfully: {target_path} ({size} bytes). Look at this image to see UI elements and their positions."
                         ))
