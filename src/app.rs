@@ -1,5 +1,6 @@
-//! The main window: chat with Nemotron, or, with a project folder open, an
-//! agent that reads, edits and runs things in that folder.
+//! The main window: Nemotron as an agent that reads, edits and runs things
+//! on the computer (in the home folder, or in an open project folder), with
+//! saved chats that the phone sees too.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use serde_json::{Value, json};
 use crate::agent::{self, AgentConfig, AgentEvent, Decision};
 use crate::api::{self, ChatMessage, Role, TextDelta, ToolCall};
 use crate::attachments::{self, Attachment, AttachmentKind};
+use crate::chats::{self, Chat, ChatStore, ChatSummary};
 use crate::config::Settings;
 use crate::remote::{self, Command, RemoteServer, Reply};
 use crate::tools::{ApprovalMode, FileChange, Workspace};
@@ -26,8 +28,12 @@ const INTERRUPTED: &str = "Stopped by the user while running; it may have partly
 /// Tool outputs of earlier answers are cut to this many characters in the
 /// history, so long sessions still fit the context.
 const OLD_TOOL_OUTPUT_CHARS: usize = 2_000;
+/// Uploads from the phone wait this long for the message that uses them.
+const UPLOAD_TTL: Duration = Duration::from_secs(30 * 60);
+/// The phone gets at most this many chats in its list.
+const MAX_LISTED_CHATS: usize = 200;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum Status {
     Streaming,
     Done,
@@ -35,7 +41,7 @@ pub enum Status {
     Failed(String),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum ToolState {
     Planned,
     AwaitingApproval,
@@ -47,14 +53,17 @@ pub enum ToolState {
     Interrupted,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct ToolView {
     pub call: ToolCall,
     pub state: ToolState,
     pub output: String,
     pub ok: bool,
-    /// What the tool changed on disk.
+    /// What the tool changed on disk. Not saved: undo has its own list.
+    #[serde(skip)]
     pub change: Option<FileChange>,
     /// What it would change, shown while it waits for approval.
+    #[serde(skip)]
     pub preview: Option<FileChange>,
     /// Why this command always needs a yes (e.g. `sudo`).
     pub warning: Option<String>,
@@ -86,13 +95,15 @@ impl ToolView {
 }
 
 /// One model request within an answer: its thinking, text and tool calls.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 pub struct Step {
     pub reasoning: String,
     pub content: String,
     pub tools: Vec<ToolView>,
     /// Set once so the thinking folds away when the answer or tools arrive.
+    #[serde(skip)]
     pub collapse_reasoning: bool,
+    #[serde(skip)]
     reasoning_collapsed: bool,
     /// Thinking was requested; only then can `<think>` in the text be thinking.
     thinking: bool,
@@ -119,13 +130,17 @@ impl Step {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub struct Message {
     /// Identifies the message while its worker may still report, also after
     /// other messages were added or removed.
+    #[serde(skip, default = "next_message_id")]
     id: u64,
     pub role: Role,
     /// The user's text.
     pub text: String,
+    /// Saved by the chat store next to the chat.
+    #[serde(skip)]
     pub attachments: Vec<Attachment>,
     /// The assistant's steps.
     pub steps: Vec<Step>,
@@ -138,9 +153,8 @@ pub struct Message {
 
 impl Message {
     fn user(text: String, attachments: Vec<Attachment>) -> Self {
-        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
-            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            id: next_message_id(),
             role: Role::User,
             text,
             attachments,
@@ -200,6 +214,11 @@ impl Message {
             tool.set_file_change(None);
         }
     }
+}
+
+fn next_message_id() -> u64 {
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 /// A file the agent changed during this session, with its original content.
@@ -268,7 +287,16 @@ pub struct NemotronApp {
     /// Where the agent works: the open project, or the home folder.
     workspace: Workspace,
     changes: Vec<TrackedChange>,
+    /// The open chat.
     messages: Vec<Message>,
+    chat_id: String,
+    chat_created: u64,
+    /// Saved chats, newest first; `None` disables saving (tests).
+    chat_store: Option<ChatStore>,
+    chats: Vec<ChatSummary>,
+    delete_chat_confirm: Option<String>,
+    /// Photos and videos the phone uploaded for its next message.
+    uploads: Vec<(String, Instant, Attachment)>,
     input: String,
     pending: Vec<Attachment>,
     loading_attachments: usize,
@@ -335,6 +363,13 @@ impl NemotronApp {
             .as_deref()
             .and_then(|p| Workspace::open(p).ok())
             .unwrap_or_else(Workspace::home);
+        // Saved chats live next to the settings; without a settings file
+        // (tests) nothing is written.
+        let chat_store = settings_path
+            .as_ref()
+            .and_then(|_| ChatStore::default_dir())
+            .map(ChatStore::new);
+        let chats = chat_store.as_ref().map(ChatStore::list).unwrap_or_default();
         Self {
             settings,
             settings_path,
@@ -342,6 +377,12 @@ impl NemotronApp {
             workspace,
             changes: Vec::new(),
             messages: Vec::new(),
+            chat_id: ChatStore::new_id(),
+            chat_created: chats::now(),
+            chat_store,
+            chats,
+            delete_chat_confirm: None,
+            uploads: Vec::new(),
             input: String::new(),
             pending: Vec::new(),
             loading_attachments: 0,
@@ -534,20 +575,212 @@ impl NemotronApp {
 
     fn new_chat(&mut self, ctx: &egui::Context) {
         self.stop();
-        for att in self
-            .messages
-            .iter()
-            .flat_map(|m| &m.attachments)
-            .chain(&self.pending)
-        {
+        self.save_chat();
+        for att in &self.pending {
             ctx.forget_image(&att.preview_uri());
         }
-        self.messages.clear();
         self.pending.clear();
         self.input.clear();
+        self.show_chat(Vec::new(), ctx);
+        self.chat_id = ChatStore::new_id();
+        self.chat_created = chats::now();
+    }
+
+    // --------------------------------------------------------------- chats
+
+    /// Replaces the messages on screen, e.g. with another chat's.
+    fn show_chat(&mut self, messages: Vec<Message>, ctx: &egui::Context) {
+        for att in self.messages.iter().flat_map(|m| &m.attachments) {
+            ctx.forget_image(&att.preview_uri());
+        }
+        self.messages = messages;
         self.notice = None;
         self.markdown = CommonMarkCache::default();
         self.focus_input = true;
+        self.scroll_to_bottom = true;
+    }
+
+    fn chat_title(&self) -> String {
+        let first = self.messages.iter().find(|m| m.role == Role::User);
+        chats::title_from(
+            first.map_or("", |m| m.text.as_str()),
+            first
+                .and_then(|m| m.attachments.first())
+                .map(|a| a.name.as_str()),
+        )
+    }
+
+    /// Writes the open chat to disk; a chat without messages is not saved.
+    fn save_chat(&mut self) {
+        let Some(store) = &self.chat_store else {
+            return;
+        };
+        if self.messages.is_empty() {
+            return;
+        }
+        let chat = Chat {
+            id: self.chat_id.clone(),
+            title: self.chat_title(),
+            created: self.chat_created,
+            messages: self
+                .messages
+                .iter()
+                .map(|m| (m, m.attachments.clone()))
+                .collect(),
+        };
+        match store.save(&chat) {
+            Ok(summary) => {
+                self.chats.retain(|c| c.id != summary.id);
+                self.chats.insert(0, summary);
+            }
+            Err(e) => {
+                self.notice = Some(Notice {
+                    text: format!("Chat konnte nicht gespeichert werden: {e}"),
+                    error: true,
+                });
+            }
+        }
+    }
+
+    fn open_chat(&mut self, id: &str, ctx: &egui::Context) -> Result<(), (u16, String)> {
+        if self.active.is_some() {
+            return Err(busy_error());
+        }
+        if id == self.chat_id {
+            return Ok(());
+        }
+        let not_found = || (404, "Chat nicht gefunden.".to_owned());
+        let store = self.chat_store.as_ref().ok_or_else(not_found)?;
+        if !store.exists(id) {
+            return Err(not_found());
+        }
+        let chat: Chat<Message> = store.load(id).map_err(|e| (500, e))?;
+        self.save_chat();
+        let messages = chat
+            .messages
+            .into_iter()
+            .map(|(mut message, attachments)| {
+                message.attachments = attachments;
+                // Saved while it was still answering, e.g. the app was quit.
+                if message.status == Status::Streaming {
+                    message.status = Status::Cancelled;
+                    message.settle_tools();
+                }
+                message
+            })
+            .collect();
+        self.show_chat(messages, ctx);
+        self.chat_id = chat.id;
+        self.chat_created = chat.created;
+        Ok(())
+    }
+
+    fn delete_chat(&mut self, id: &str, ctx: &egui::Context) -> Result<(), (u16, String)> {
+        let current = id == self.chat_id;
+        if current && self.active.is_some() {
+            return Err(busy_error());
+        }
+        let saved = self.chat_store.as_ref().is_some_and(|s| s.exists(id));
+        if !saved && !current {
+            return Err((404, "Chat nicht gefunden.".to_owned()));
+        }
+        if saved && let Some(store) = &self.chat_store {
+            store
+                .delete(id)
+                .map_err(|e| (500, format!("Chat konnte nicht gelöscht werden: {e}")))?;
+        }
+        self.chats.retain(|c| c.id != id);
+        if current {
+            // Nothing left to save: then open the newest other chat, or a new one.
+            self.messages.clear();
+            match self.chats.first().map(|c| c.id.clone()) {
+                Some(next) if self.open_chat(&next, ctx).is_ok() => {}
+                _ => self.new_chat(ctx),
+            }
+        }
+        Ok(())
+    }
+
+    /// The open chat and the saved ones, for the phone.
+    fn chat_list_json(&self) -> Value {
+        let mut list: Vec<Value> = Vec::new();
+        if !self.chats.iter().any(|c| c.id == self.chat_id) {
+            list.push(json!({
+                "id": self.chat_id,
+                "title": self.chat_title(),
+                "updated": self.chat_created,
+                "messages": self.messages.len(),
+            }));
+        }
+        list.extend(self.chats.iter().map(
+            |c| json!({"id": c.id, "title": c.title, "updated": c.updated, "messages": c.messages}),
+        ));
+        list.truncate(MAX_LISTED_CHATS);
+        Value::Array(list)
+    }
+
+    /// A photo or video from the phone, prepared like a local attachment.
+    fn take_upload(&mut self, name: &str, content_type: &str, bytes: Vec<u8>) -> Reply {
+        self.uploads.retain(|(_, at, _)| at.elapsed() < UPLOAD_TTL);
+        let ext = Path::new(name)
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        let kind = attachments::kind_for_extension(&ext).or_else(|| {
+            if content_type.starts_with("image/") {
+                Some(AttachmentKind::Image)
+            } else if content_type.starts_with("video/") {
+                Some(AttachmentKind::Video)
+            } else {
+                None
+            }
+        });
+        let size = bytes.len();
+        let att = match kind {
+            Some(AttachmentKind::Image) => {
+                attachments::image_attachment(name, &bytes, self.settings.max_image_dim)
+                    .map_err(|e| (400, e))?
+            }
+            Some(AttachmentKind::Video) => {
+                let ext = match (ext.as_str(), content_type) {
+                    ("mov" | "webm" | "mp4" | "m4v", _) => ext.clone(),
+                    (_, "video/quicktime") => "mov".to_owned(),
+                    (_, "video/webm") => "webm".to_owned(),
+                    _ => "mp4".to_owned(),
+                };
+                attachments::video_attachment(name, &ext, bytes).map_err(|e| {
+                    let status = if size > attachments::MAX_VIDEO_BYTES {
+                        413
+                    } else {
+                        400
+                    };
+                    (status, e)
+                })?
+            }
+            None => {
+                return Err((
+                    400,
+                    format!(
+                        "{name}: nur Fotos und Videos (MP4, MOV, WebM) können angehängt werden."
+                    ),
+                ));
+            }
+        };
+        let mut random = [0u8; 4];
+        let _ = getrandom::fill(&mut random);
+        let id = format!(
+            "up-{}",
+            random
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        );
+        let kind = match att.kind {
+            AttachmentKind::Image => "image",
+            AttachmentKind::Video => "video",
+        };
+        self.uploads.push((id.clone(), Instant::now(), att));
+        Ok(json!({"id": id, "kind": kind, "size": size}))
     }
 
     // ------------------------------------------------------------- sending
@@ -576,6 +809,7 @@ impl NemotronApp {
             .push(Message::user(text, std::mem::take(&mut self.pending)));
         self.input.clear();
         self.notice = None;
+        self.save_chat();
         self.start_request(ctx);
     }
 
@@ -693,6 +927,7 @@ impl NemotronApp {
             }
             let id = self.messages.last().map_or(0, |m| m.id);
             self.stopped.push((id, active.rx));
+            self.save_chat();
         }
     }
 
@@ -809,6 +1044,7 @@ impl NemotronApp {
         }
         if finished {
             self.active = None;
+            self.save_chat();
         }
     }
 
@@ -979,7 +1215,8 @@ impl NemotronApp {
     fn handle_remote(&mut self, ctx: &egui::Context) {
         let mut handled = false;
         while let Some(request) = self.remote.as_ref().and_then(RemoteServer::next_command) {
-            let reply = self.remote_command(&request.command, ctx);
+            let mut request = request;
+            let reply = self.remote_command(&mut request.command, ctx);
             // Publish before answering, so the phone's next look sees the result.
             self.remote_published = None;
             self.publish_remote(ctx);
@@ -991,16 +1228,22 @@ impl NemotronApp {
         }
     }
 
-    fn remote_command(&mut self, command: &Command, ctx: &egui::Context) -> Reply {
-        let busy = || {
-            (
-                409,
-                "Nemotron arbeitet noch. Erst stoppen oder warten.".to_owned(),
-            )
-        };
+    fn remote_command(&mut self, command: &mut Command, ctx: &egui::Context) -> Reply {
+        let busy = busy_error;
         let ok = Ok(json!({ "ok": true }));
         match command {
-            Command::Send { text, images } => {
+            Command::Upload {
+                name,
+                content_type,
+                bytes,
+            } => self.take_upload(name, content_type, std::mem::take(bytes)),
+            Command::OpenChat { id } => self.open_chat(id, ctx).map(|()| json!({ "ok": true })),
+            Command::DeleteChat { id } => self.delete_chat(id, ctx).map(|()| json!({ "ok": true })),
+            Command::Send {
+                text,
+                images,
+                uploads,
+            } => {
                 if self.active.is_some() {
                     return Err(busy());
                 }
@@ -1010,16 +1253,32 @@ impl NemotronApp {
                         "Am Mac ist noch kein NVIDIA-API-Schlüssel eingetragen.".into(),
                     ));
                 }
-                let mut attachments = Vec::with_capacity(images.len());
-                for (name, bytes) in images {
+                self.uploads.retain(|(_, at, _)| at.elapsed() < UPLOAD_TTL);
+                if let Some(missing) = uploads
+                    .iter()
+                    .find(|id| !self.uploads.iter().any(|(u, _, _)| u == *id))
+                {
+                    return Err((
+                        404,
+                        format!("Anhang {missing} ist abgelaufen – bitte erneut senden."),
+                    ));
+                }
+                let mut attachments = Vec::with_capacity(images.len() + uploads.len());
+                for (name, bytes) in images.iter() {
                     let att =
                         attachments::image_attachment(name, bytes, self.settings.max_image_dim)
                             .map_err(|e| (400, e))?;
                     attachments.push(att);
                 }
+                for id in uploads.iter() {
+                    if let Some(i) = self.uploads.iter().position(|(u, _, _)| u == id) {
+                        attachments.push(self.uploads.remove(i).2);
+                    }
+                }
                 self.messages
                     .push(Message::user(text.trim().to_owned(), attachments));
                 self.notice = None;
+                self.save_chat();
                 self.start_request(ctx);
                 ok
             }
@@ -1041,6 +1300,9 @@ impl NemotronApp {
                 ok
             }
             Command::NewChat => {
+                if self.active.is_some() {
+                    return Err(busy());
+                }
                 self.new_chat(ctx);
                 ok
             }
@@ -1202,6 +1464,8 @@ impl NemotronApp {
                 "home": self.workspace.is_home(),
             }),
             "notice": self.notice.as_ref().map(|n| json!({"text": n.text, "error": n.error})),
+            "chat": {"id": self.chat_id, "title": self.chat_title()},
+            "chats": self.chat_list_json(),
             "changes": changes,
             "messages": messages,
         })
@@ -1405,6 +1669,135 @@ impl NemotronApp {
             });
             ui.add_space(6.0);
         });
+    }
+
+    /// Saved chats on the left; the phone shows the same list.
+    fn chat_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let busy = self.active.is_some();
+        let now = chats::now();
+        let mut open: Option<String> = None;
+        let mut new = false;
+        egui::Panel::left("chats")
+            .resizable(true)
+            .default_size(210.0)
+            .min_size(150.0)
+            .show(ui, |ui| {
+                ui.add_space(8.0);
+                new = ui
+                    .add_sized(
+                        [ui.available_width(), 28.0],
+                        egui::Button::new("➕ Neuer Chat"),
+                    )
+                    .on_hover_text("⌘ N")
+                    .clicked();
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("chatliste")
+                    .auto_shrink(false)
+                    .show(ui, |ui| {
+                        let unsaved = !self.chats.iter().any(|c| c.id == self.chat_id);
+                        let entries = unsaved
+                            .then(|| (self.chat_id.clone(), self.chat_title(), self.chat_created))
+                            .into_iter()
+                            .chain(
+                                self.chats
+                                    .iter()
+                                    .map(|c| (c.id.clone(), c.title.clone(), c.updated)),
+                            );
+                        for (id, title, updated) in entries {
+                            let selected = id == self.chat_id;
+                            ui.horizontal(|ui| {
+                                let width = ui.available_width() - 26.0;
+                                let label = ui
+                                    .add_enabled_ui(!busy || selected, |ui| {
+                                        ui.add_sized(
+                                            [width.max(60.0), 20.0],
+                                            egui::Button::selectable(
+                                                selected,
+                                                egui::RichText::new(&title),
+                                            )
+                                            .truncate(),
+                                        )
+                                    })
+                                    .inner
+                                    .on_hover_text(format!(
+                                        "{title}\n{}",
+                                        chats::relative_time(updated, now)
+                                    ));
+                                if label.clicked() && !selected {
+                                    open = Some(id.clone());
+                                }
+                                if !(unsaved && selected)
+                                    && ui
+                                        .add_enabled(
+                                            !(busy && selected),
+                                            egui::Button::new("🗑").small().frame(false),
+                                        )
+                                        .on_hover_text("Chat löschen")
+                                        .clicked()
+                                {
+                                    self.delete_chat_confirm = Some(id.clone());
+                                }
+                            });
+                            ui.label(
+                                RichText::new(chats::relative_time(updated, now))
+                                    .small()
+                                    .weak(),
+                            );
+                            ui.add_space(2.0);
+                        }
+                    });
+            });
+        if new {
+            self.new_chat(ctx);
+        }
+        if let Some(id) = open
+            && let Err((_, message)) = self.open_chat(&id, ctx)
+        {
+            self.notice = Some(Notice {
+                text: message,
+                error: true,
+            });
+        }
+    }
+
+    fn delete_chat_window(&mut self, ctx: &egui::Context, screen: egui::Rect) {
+        let Some(id) = self.delete_chat_confirm.clone() else {
+            return;
+        };
+        let title = self
+            .chats
+            .iter()
+            .find(|c| c.id == id)
+            .map(|c| c.title.clone())
+            .unwrap_or_else(|| self.chat_title());
+        let mut yes = false;
+        let mut no = false;
+        egui::Window::new("Chat löschen?")
+            .pivot(egui::Align2::CENTER_CENTER)
+            .default_pos(screen.center())
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "„{title}“ wird endgültig gelöscht, auch auf dem Handy."
+                ));
+                ui.horizontal(|ui| {
+                    yes = ui.button("Löschen").clicked();
+                    no = ui.button("Abbrechen").clicked();
+                });
+            });
+        if yes {
+            self.delete_chat_confirm = None;
+            if let Err((_, message)) = self.delete_chat(&id, ctx) {
+                self.notice = Some(Notice {
+                    text: message,
+                    error: true,
+                });
+            }
+        } else if no {
+            self.delete_chat_confirm = None;
+        }
     }
 
     fn project_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
@@ -2101,6 +2494,7 @@ impl eframe::App for NemotronApp {
             active.cancel.store(true, Ordering::Relaxed);
         }
         crate::tools::kill_running_commands();
+        self.save_chat();
     }
 
     /// Also runs while the window is hidden, so the phone keeps working
@@ -2124,15 +2518,24 @@ impl eframe::App for NemotronApp {
 
         self.top_bar(ui, &ctx);
         self.composer(ui, &ctx);
+        self.chat_list(ui, &ctx);
         self.project_panel(ui, &ctx);
         self.chat_area(ui, &ctx);
         self.settings_window(&ctx, full_rect);
         self.url_window(&ctx, full_rect);
         self.diff_window(&ctx, full_rect);
         self.undo_confirm_window(&ctx, full_rect);
+        self.delete_chat_window(&ctx, full_rect);
         self.remote_window(&ctx, full_rect);
         widgets::drop_overlay(&ctx, full_rect);
     }
+}
+
+fn busy_error() -> (u16, String) {
+    (
+        409,
+        "Nemotron arbeitet noch. Erst stoppen oder warten.".to_owned(),
+    )
 }
 
 /// A tool output from an earlier answer: its start, enough to remember
@@ -2552,6 +2955,230 @@ mod tests {
         assert_eq!(state["workspace"]["home"], true);
         assert_eq!(state["approval"], "AutoEdits");
         assert_eq!(app.messages[0].text, "Hi vom Handy");
+    }
+
+    #[test]
+    fn phone_sees_saved_chats_and_sends_videos() {
+        use crate::api::tests::mock_server;
+        let answer = |text: &str| {
+            format!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n"
+            )
+        };
+        let (base_url, nvidia) = mock_server(vec![(
+            "200 OK",
+            "text/event-stream",
+            answer("Ein Hund rennt."),
+        )]);
+        let dir = std::env::temp_dir().join(format!("fadis-app-chats-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let settings = Settings {
+            base_url,
+            api_key: "k".into(),
+            remote_port: 0,
+            remote_token: "tok".into(),
+            ..Settings::default()
+        };
+        let mut app = NemotronApp::with_settings(settings, None);
+        app.chat_store = Some(ChatStore::new(dir.clone()));
+        let ctx = egui::Context::default();
+        app.start_remote(&ctx);
+        let base = format!(
+            "http://127.0.0.1:{}/api/v1",
+            app.remote.as_ref().unwrap().port()
+        );
+
+        let phone = std::thread::spawn(move || {
+            let agent = remote_client();
+            let upload = |name: &str, content_type: &str, bytes: &[u8]| -> (u16, Value) {
+                let mut res = agent
+                    .post(format!("{base}/upload?name={name}"))
+                    .header("Authorization", "Bearer tok")
+                    .header("Content-Type", content_type)
+                    .send(bytes)
+                    .unwrap();
+                let text = res.body_mut().read_to_string().unwrap_or_default();
+                (
+                    res.status().as_u16(),
+                    serde_json::from_str(&text).unwrap_or(Value::Null),
+                )
+            };
+            let (status, up) = upload(
+                "clip.mp4",
+                "video/mp4",
+                &[0, 0, 0, 24, b'f', b't', b'y', b'p'],
+            );
+            assert_eq!((status, up["kind"].as_str()), (200, Some("video")), "{up}");
+            assert_eq!(upload("notiz.txt", "text/plain", b"hallo").0, 400);
+            assert_eq!(
+                call(
+                    &agent,
+                    "POST",
+                    &format!("{base}/send"),
+                    Some(json!({"text": "x", "uploads": ["up-gibtsnicht"]}))
+                )
+                .0,
+                404
+            );
+            let (status, _) = call(
+                &agent,
+                "POST",
+                &format!("{base}/send"),
+                Some(json!({"text": "Was passiert im Video?", "uploads": [up["id"]]})),
+            );
+            assert_eq!(status, 200);
+            let mut state = Value::Null;
+            for _ in 0..20 {
+                let version = state["version"].as_u64().unwrap_or(0);
+                state = call(
+                    &agent,
+                    "GET",
+                    &format!("{base}/state?after={version}&wait=5"),
+                    None,
+                )
+                .1;
+                if state["busy"] == false
+                    && state["messages"].as_array().is_some_and(|m| m.len() == 2)
+                {
+                    break;
+                }
+            }
+            let first_chat = state["chat"]["id"].as_str().unwrap().to_owned();
+            assert_eq!(state["chat"]["title"], "Was passiert im Video?");
+            assert_eq!(state["messages"][0]["attachments"], json!(["clip.mp4"]));
+            assert_eq!(state["chats"][0]["id"], first_chat.as_str());
+            assert_eq!(state["chats"][0]["messages"], 2);
+
+            // A new chat on the phone is a new chat on the Mac; the old one stays listed.
+            assert_eq!(
+                call(&agent, "POST", &format!("{base}/new_chat"), None).0,
+                200
+            );
+            let state = call(&agent, "GET", &format!("{base}/state"), None).1;
+            assert_ne!(state["chat"]["id"], first_chat.as_str());
+            assert_eq!(state["chat"]["title"], chats::UNTITLED);
+            assert_eq!(state["messages"], json!([]));
+            assert_eq!(state["chats"].as_array().unwrap().len(), 2);
+
+            assert_eq!(
+                call(
+                    &agent,
+                    "POST",
+                    &format!("{base}/open_chat"),
+                    Some(json!({"id": first_chat}))
+                )
+                .0,
+                200
+            );
+            let state = call(&agent, "GET", &format!("{base}/state"), None).1;
+            assert_eq!(state["chat"]["id"], first_chat.as_str());
+            assert_eq!(
+                state["messages"][1]["steps"][0]["content"],
+                "Ein Hund rennt."
+            );
+            assert_eq!(
+                call(
+                    &agent,
+                    "POST",
+                    &format!("{base}/open_chat"),
+                    Some(json!({"id": "c-0-gibtsnicht"}))
+                )
+                .0,
+                404
+            );
+            assert_eq!(
+                call(
+                    &agent,
+                    "POST",
+                    &format!("{base}/open_chat"),
+                    Some(json!({"id": "../settings"}))
+                )
+                .0,
+                404
+            );
+
+            assert_eq!(
+                call(
+                    &agent,
+                    "POST",
+                    &format!("{base}/delete_chat"),
+                    Some(json!({"id": first_chat}))
+                )
+                .0,
+                200
+            );
+            let state = call(&agent, "GET", &format!("{base}/state"), None).1;
+            assert_ne!(state["chat"]["id"], first_chat.as_str());
+            assert!(
+                state["chats"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|c| c["id"] != first_chat.as_str())
+            );
+            first_chat
+        });
+        pump(&mut app, &ctx, || phone.is_finished());
+        let first_chat = phone.join().unwrap();
+        let requests = nvidia.join().unwrap();
+        // The video went to NVIDIA as a data URL.
+        assert!(requests[0].contains(r#""type":"video_url""#));
+        assert!(requests[0].contains("data:video/mp4;base64,AAAAGGZ0eXA="));
+        assert!(!dir.join(format!("{first_chat}.json")).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chats_are_saved_and_come_back_after_a_restart() {
+        let dir = std::env::temp_dir().join(format!("fadis-app-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let ctx = egui::Context::default();
+        let mut app = NemotronApp::with_settings(Settings::default(), None);
+        app.chat_store = Some(ChatStore::new(dir.clone()));
+        app.messages.push(Message::user(
+            "Räum Downloads auf".into(),
+            vec![Attachment::from_bytes(
+                "a.png",
+                AttachmentKind::Image,
+                "image/png",
+                vec![9],
+            )],
+        ));
+        let (mut answer, _) = run_events(vec![
+            AgentEvent::StepStarted,
+            AgentEvent::StepFinished {
+                content: String::new(),
+                reasoning: "Erst schauen.".into(),
+                tool_calls: vec![tool("c1", "list_dir", r#"{"path":"~/Downloads"}"#)],
+            },
+            AgentEvent::ToolStarted {
+                call_id: "c1".into(),
+            },
+        ]);
+        // Quit while the tool ran.
+        answer.status = Status::Streaming;
+        app.messages.push(answer);
+        let id = app.chat_id.clone();
+        app.save_chat();
+        assert_eq!(app.chats[0].title, "Räum Downloads auf");
+
+        let mut later = NemotronApp::with_settings(Settings::default(), None);
+        later.chat_store = Some(ChatStore::new(dir.clone()));
+        later.chats = later.chat_store.as_ref().unwrap().list();
+        assert_eq!(later.chats.len(), 1);
+        later.open_chat(&id, &ctx).unwrap();
+        assert_eq!(later.messages.len(), 2);
+        assert_eq!(later.messages[0].attachments[0].name, "a.png");
+        let answer = &later.messages[1];
+        assert_eq!(answer.status, Status::Cancelled);
+        assert_eq!(answer.steps[0].reasoning, "Erst schauen.");
+        assert_eq!(answer.steps[0].tools[0].state, ToolState::Interrupted);
+        assert_eq!(answer.steps[0].tools[0].call.name, "list_dir");
+        // The reopened chat goes to the model like before.
+        assert!(
+            matches!(&later.api_history()[0], ChatMessage::User { attachments, .. } if attachments.len() == 1)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -24,7 +24,7 @@ const VIDEO_EXTENSIONS: &[&str] = &["mp4", "m4v", "mov", "webm"];
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum AttachmentKind {
     Image,
     Video,
@@ -210,7 +210,7 @@ pub fn image_attachment(name: &str, bytes: &[u8], max_dim: u32) -> Result<Attach
     Ok(att)
 }
 
-fn video_attachment(name: &str, ext: &str, bytes: Vec<u8>) -> Result<Attachment, String> {
+pub fn video_attachment(name: &str, ext: &str, bytes: Vec<u8>) -> Result<Attachment, String> {
     if bytes.len() > MAX_VIDEO_BYTES {
         return Err(format!(
             "{name}: Video ist zu groß ({}). Maximal {} – besser einen kurzen Clip (1–2 Minuten) oder einen öffentlichen Link verwenden.",

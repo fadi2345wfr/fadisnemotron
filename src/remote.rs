@@ -20,8 +20,12 @@ use crate::agent::Decision;
 use crate::tools::ApprovalMode;
 
 pub const DEFAULT_PORT: u16 = 7878;
-pub const PROTOCOL: u32 = 1;
+pub const PROTOCOL: u32 = 2;
+/// Format of the QR code; independent of the protocol version.
+const PAIRING_FORMAT: u32 = 1;
 const MAX_BODY_BYTES: usize = 20 * 1024 * 1024;
+/// Photos and videos come as raw bytes; the phone shrinks videos first.
+const MAX_UPLOAD_BYTES: usize = 200 * 1024 * 1024;
 const MAX_WAIT_SECS: u64 = 30;
 const MAX_CONCURRENT: usize = 32;
 /// How long a request waits for the app to handle a command.
@@ -33,6 +37,14 @@ pub enum Command {
     Send {
         text: String,
         images: Vec<(String, Vec<u8>)>,
+        /// Ids from earlier uploads.
+        uploads: Vec<String>,
+    },
+    /// A photo or video, as raw bytes; the app answers with an id for `Send`.
+    Upload {
+        name: String,
+        content_type: String,
+        bytes: Vec<u8>,
     },
     Stop,
     Decide {
@@ -40,6 +52,12 @@ pub enum Command {
         decision: Decision,
     },
     NewChat,
+    OpenChat {
+        id: String,
+    },
+    DeleteChat {
+        id: String,
+    },
     Retry,
     Settings {
         approval: Option<ApprovalMode>,
@@ -246,6 +264,28 @@ fn route(
             Some(path) => ask_app(commands, wake, Command::Diff { path }),
             None => error(400, "path fehlt"),
         },
+        ("POST", "/api/v1/upload") => {
+            let name = query_param(query, "name").unwrap_or_else(|| "anhang".to_owned());
+            let content_type = request
+                .headers()
+                .iter()
+                .find(|h| h.field.equiv("Content-Type"))
+                .map(|h| h.value.as_str().to_owned())
+                .unwrap_or_default();
+            match read_body(request, MAX_UPLOAD_BYTES) {
+                Ok(bytes) if bytes.is_empty() => error(400, "Leerer Upload."),
+                Ok(bytes) => ask_app(
+                    commands,
+                    wake,
+                    Command::Upload {
+                        name,
+                        content_type,
+                        bytes,
+                    },
+                ),
+                Err(e) => e,
+            }
+        }
         ("POST", endpoint) => {
             let body = match read_json(request) {
                 Ok(b) => b,
@@ -330,14 +370,32 @@ fn parse_command(endpoint: &str, body: &Value) -> Result<Command, (u16, Value)> 
                     })?;
                 images.push((name, bytes));
             }
+            let uploads: Vec<String> = body
+                .get("uploads")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect();
             let text = text("text").unwrap_or_default();
-            if text.trim().is_empty() && images.is_empty() {
+            if text.trim().is_empty() && images.is_empty() && uploads.is_empty() {
                 return Err(error(400, "Leere Nachricht."));
             }
-            Ok(Command::Send { text, images })
+            Ok(Command::Send {
+                text,
+                images,
+                uploads,
+            })
         }
         "/api/v1/stop" => Ok(Command::Stop),
         "/api/v1/new_chat" => Ok(Command::NewChat),
+        "/api/v1/open_chat" => Ok(Command::OpenChat {
+            id: text("id").ok_or_else(|| error(400, "id fehlt"))?,
+        }),
+        "/api/v1/delete_chat" => Ok(Command::DeleteChat {
+            id: text("id").ok_or_else(|| error(400, "id fehlt"))?,
+        }),
         "/api/v1/retry" => Ok(Command::Retry),
         "/api/v1/decide" => {
             let call_id = text("call_id").ok_or_else(|| error(400, "call_id fehlt"))?;
@@ -374,19 +432,33 @@ fn parse_command(endpoint: &str, body: &Value) -> Result<Command, (u16, Value)> 
     }
 }
 
-fn read_json(request: &mut tiny_http::Request) -> Result<Value, (u16, Value)> {
-    if request.body_length().is_some_and(|n| n > MAX_BODY_BYTES) {
-        return Err(error(413, "Die Anfrage ist zu groß (höchstens 20 MB)."));
+fn read_body(request: &mut tiny_http::Request, max: usize) -> Result<Vec<u8>, (u16, Value)> {
+    let too_big = || {
+        error(
+            413,
+            &format!(
+                "Die Anfrage ist zu groß (höchstens {} MB).",
+                max / (1024 * 1024)
+            ),
+        )
+    };
+    if request.body_length().is_some_and(|n| n > max) {
+        return Err(too_big());
     }
     let mut bytes = Vec::new();
     request
         .as_reader()
-        .take(MAX_BODY_BYTES as u64 + 1)
+        .take(max as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| error(400, &format!("Anfrage konnte nicht gelesen werden: {e}")))?;
-    if bytes.len() > MAX_BODY_BYTES {
-        return Err(error(413, "Die Anfrage ist zu groß (höchstens 20 MB)."));
+    if bytes.len() > max {
+        return Err(too_big());
     }
+    Ok(bytes)
+}
+
+fn read_json(request: &mut tiny_http::Request) -> Result<Value, (u16, Value)> {
+    let bytes = read_body(request, MAX_BODY_BYTES)?;
     if bytes.iter().all(u8::is_ascii_whitespace) {
         return Ok(json!({}));
     }
@@ -497,7 +569,7 @@ pub fn is_tailscale(addr: Ipv4Addr) -> bool {
 /// The QR code content the Android app scans.
 pub fn pairing_payload(name: &str, port: u16, token: &str, addrs: &[Ipv4Addr]) -> String {
     let urls: Vec<String> = addrs.iter().map(|a| format!("http://{a}:{port}")).collect();
-    json!({"fadis": PROTOCOL, "name": name, "urls": urls, "token": token}).to_string()
+    json!({"fadis": PAIRING_FORMAT, "name": name, "urls": urls, "token": token}).to_string()
 }
 
 /// A short name for this computer, shown on the phone.
@@ -571,6 +643,23 @@ mod tests {
         }
     }
 
+    impl Client {
+        fn upload(&self, path: &str, content_type: &str, bytes: &[u8]) -> (u16, Value) {
+            let mut res = self
+                .agent
+                .post(format!("{}{path}", self.base))
+                .header("Authorization", "Bearer geheim123")
+                .header("Content-Type", content_type)
+                .send(bytes)
+                .unwrap();
+            (
+                res.status().as_u16(),
+                serde_json::from_str(&res.body_mut().read_to_string().unwrap_or_default())
+                    .unwrap_or(Value::Null),
+            )
+        }
+    }
+
     fn start() -> (RemoteServer, Client) {
         let server = RemoteServer::start(0, "geheim123".into(), "Testmac".into(), || {}).unwrap();
         let client = Client::new(server.port());
@@ -587,15 +676,31 @@ mod tests {
             while Instant::now() < until {
                 if let Some(req) = server.next_command() {
                     let reply = match &req.command {
-                        Command::Send { text, images } => {
-                            seen.lock()
-                                .unwrap()
-                                .push(format!("send:{text}:{}", images.len()));
+                        Command::Send {
+                            text,
+                            images,
+                            uploads,
+                        } => {
+                            seen.lock().unwrap().push(format!(
+                                "send:{text}:{}:{}",
+                                images.len(),
+                                uploads.join(",")
+                            ));
                             if text == "besetzt" {
                                 Err((409, "Nemotron arbeitet noch.".into()))
                             } else {
                                 Ok(json!({"ok": true}))
                             }
+                        }
+                        Command::Upload {
+                            name,
+                            content_type,
+                            bytes,
+                        } => {
+                            seen.lock()
+                                .unwrap()
+                                .push(format!("upload:{name}:{content_type}:{}", bytes.len()));
+                            Ok(json!({"id": "up-1", "kind": "video", "size": bytes.len()}))
                         }
                         other => {
                             seen.lock().unwrap().push(format!("{other:?}"));
@@ -617,7 +722,7 @@ mod tests {
         let (status, body) = client.get("/api/v1/ping", Some("geheim123"));
         assert_eq!(status, 200);
         assert_eq!(body["name"], "Testmac");
-        assert_eq!(body["protocol"], 1);
+        assert_eq!(body["protocol"], 2);
         assert_eq!(client.get("/api/v1/gibtsnicht", Some("geheim123")).0, 404);
     }
 
@@ -730,14 +835,52 @@ mod tests {
             401
         );
 
+        // Videos come as raw bytes, then the send names the upload.
+        let video = vec![7u8; 3 * 1024 * 1024];
+        let (status, body) =
+            client.upload("/api/v1/upload?name=Mein%20Clip.mp4", "video/mp4", &video);
+        assert_eq!((status, body["id"].as_str()), (200, Some("up-1")));
+        assert_eq!(
+            client
+                .upload("/api/v1/upload?name=leer.mp4", "video/mp4", &[])
+                .0,
+            400
+        );
+        let (status, _) = client.post(
+            "/api/v1/send",
+            "geheim123",
+            r#"{"text":"Was passiert?","uploads":["up-1"]}"#,
+        );
+        assert_eq!(status, 200);
+        assert_eq!(
+            client
+                .post("/api/v1/open_chat", "geheim123", r#"{"id":"c-1"}"#)
+                .0,
+            200
+        );
+        assert_eq!(
+            client
+                .post("/api/v1/delete_chat", "geheim123", r#"{"id":"c-2"}"#)
+                .0,
+            200
+        );
+        assert_eq!(client.post("/api/v1/open_chat", "geheim123", "{}").0, 400);
+
         helper.join().unwrap();
         let seen = seen.lock().unwrap().clone();
-        assert_eq!(seen[0], "send:Hallo:1");
-        assert_eq!(seen[1], "send:besetzt:0");
+        assert_eq!(seen[0], "send:Hallo:1:");
+        assert_eq!(seen[1], "send:besetzt:0:");
         assert!(seen[2].contains("AllowForRun"), "{seen:?}");
         assert!(seen[3].contains("AskAll") && seen[3].contains("Some(false)"));
         assert_eq!(seen[4], "Stop");
-        assert_eq!(seen.len(), 5, "bad requests must not reach the app");
+        assert_eq!(
+            seen[5],
+            format!("upload:Mein Clip.mp4:video/mp4:{}", video.len())
+        );
+        assert_eq!(seen[6], "send:Was passiert?:0:up-1");
+        assert!(seen[7].contains("OpenChat") && seen[7].contains("c-1"));
+        assert!(seen[8].contains("DeleteChat") && seen[8].contains("c-2"));
+        assert_eq!(seen.len(), 9, "bad requests must not reach the app");
         assert!(server.last_seen().is_some_and(|(_, ip)| ip == "127.0.0.1"));
     }
 

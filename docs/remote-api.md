@@ -1,6 +1,8 @@
-# Fernzugriff-Protokoll (Version 1)
+# Fernzugriff-Protokoll (Version 2)
 
-Die Mac-App bietet, wenn **Fernzugriff** eingeschaltet ist, eine kleine HTTP/JSON-Schnittstelle an. Die Android-App steuert darüber den Chat und den Agenten auf dem Mac. Standard-Port: `7878`.
+Die Mac-App bietet, wenn **Fernzugriff** eingeschaltet ist, eine kleine HTTP/JSON-Schnittstelle an. Die Android-App ist darüber eine zweite Oberfläche derselben App: Sie zeigt dieselben Chats, denselben Agenten und dieselben Freigaben wie der Mac. Standard-Port: `7878`.
+
+Version 2 ergänzt gegenüber Version 1: gespeicherte Chats (`chat`, `chats`, `open_chat`, `delete_chat`), Uploads für Fotos und Videos (`upload`, `send.uploads`) und `workspace.home`.
 
 ## Sicherheit
 
@@ -27,8 +29,10 @@ Fehler haben einen passenden Status (`400`, `401`, `404`, `409`, `413`, `503`) u
 ### `GET /api/v1/ping`
 
 ```json
-{"ok": true, "app": "Fadis Nemotron", "version": "0.3.0", "protocol": 1, "name": "MacBook"}
+{"ok": true, "app": "Fadis Nemotron", "version": "0.4.0", "protocol": 2, "name": "MacBook"}
 ```
+
+Das Handy prüft `protocol`. Ist es kleiner als 2, zeigt es „Bitte die Mac-App aktualisieren“.
 
 ### `GET /api/v1/state?after=<version>&wait=<sekunden>`
 
@@ -41,11 +45,16 @@ Liefert den ganzen sichtbaren Zustand. Ist `after` gleich der aktuellen Version,
   "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
   "thinking": true,
   "approval": "AutoEdits",
-  "workspace": {"name": "proj", "path": "/Users/fadi/proj"},
+  "workspace": {"name": "proj", "path": "/Users/fadi/proj", "home": false},
   "notice": {"text": "README.md wiederhergestellt.", "error": false},
+  "chat": {"id": "c-1792658712-3f9a1c", "title": "Ändere die README"},
+  "chats": [
+    {"id": "c-1792658712-3f9a1c", "title": "Ändere die README", "updated": 1792658712, "messages": 2},
+    {"id": "c-1792605781-b7c1e0", "title": "Ordner auf dem Schreibtisch anlegen", "updated": 1792605781, "messages": 6}
+  ],
   "changes": [{"path": "README.md", "added": 1, "removed": 1, "created": false}],
   "messages": [
-    {"role": "user", "text": "Ändere die README", "attachments": ["foto.jpg"]},
+    {"role": "user", "text": "Ändere die README", "attachments": ["foto.jpg", "clip.mp4"]},
     {
       "role": "assistant",
       "status": "streaming",
@@ -77,19 +86,33 @@ Liefert den ganzen sichtbaren Zustand. Ist `after` gleich der aktuellen Version,
 }
 ```
 
-- `workspace` ist `null`, wenn kein Projektordner offen ist (reiner Chat).
+- `workspace` ist der Arbeitsordner des Agenten. Ohne geöffnetes Projekt ist es der Benutzerordner des Macs, dann ist `home` `true`. Nemotron kann auch außerhalb des Arbeitsordners im Benutzerordner lesen und (nach Freigabe) schreiben, z. B. in Downloads oder auf dem Schreibtisch.
+- `chat` ist der Chat, der gerade auf dem Mac (und damit auch auf dem Handy) offen ist; `messages` gehört zu ihm. `chats` listet alle gespeicherten Chats, neueste zuerst, höchstens 200. `updated` ist eine Unix-Zeit in Sekunden. Ein neuer, noch leerer Chat hat den Titel `"Neuer Chat"`.
 - `approval`: `AskAll`, `AutoEdits` oder `AutoAll`.
 - `status`: `streaming`, `done`, `cancelled`, `failed` (dann steht der Grund in `error`).
-- Werkzeug-`state`: `planned`, `awaiting_approval`, `running`, `done`, `declined`, `not_run`, `interrupted` (lief beim Stopp noch; kann teilweise ausgeführt sein). Bei `awaiting_approval` enthält `diff` die geplante Änderung und `warning` ggf. den Grund, warum ein Befehl immer nachgefragt wird.
+- Werkzeug-`state`: `planned`, `awaiting_approval`, `running`, `done`, `declined`, `not_run`, `interrupted` (lief beim Stopp noch; kann teilweise ausgeführt sein). Bei `awaiting_approval` enthält `diff` die geplante Änderung und `warning` ggf. den Grund, warum nachgefragt wird (z. B. „ändert eine Datei außerhalb des Projektordners“ oder „läuft mit Administratorrechten“).
 - Lange Texte werden gekürzt: `reasoning` auf die letzten 6000 Zeichen, `output` auf die letzten 4000, `diff` auf die ersten 8000.
+- Unbekannte Felder und Werte soll der Client ignorieren bzw. auf einen Standard zurückfallen lassen.
+
+### `POST /api/v1/upload?name=<dateiname>`
+
+Lädt ein Foto oder Video hoch, **als rohe Bytes im Body** (kein JSON, kein Base64), z. B. mit `Content-Type: video/mp4` oder `image/jpeg`. Höchstens 200 MB.
+
+```json
+{"id": "up-7f3a9c", "kind": "video", "size": 14680064}
+```
+
+- Die Art erkennt der Mac an der Dateiendung von `name` (Bilder: png, jpg, jpeg, gif, webp, bmp; Videos: mp4, m4v, mov, webm), sonst am `Content-Type` (`image/…`, `video/…`). Unbekannt: `400`.
+- Bilder werden wie in der Mac-App verkleinert (längste Seite 1536 px). Videos werden unverändert übernommen; über 100 MB: `413`. Das Handy verkleinert Videos deshalb vorher (720p, MP4/H.264).
+- Ein Upload bleibt 30 Minuten gültig und wird mit dem nächsten `send`, der ihn nennt, verbraucht.
 
 ### `POST /api/v1/send`
 
 ```json
-{"text": "Bau das Projekt und behebe die Fehler", "images": [{"name": "foto.jpg", "data": "<base64 JPEG/PNG>"}]}
+{"text": "Was passiert in dem Video?", "uploads": ["up-7f3a9c"], "images": [{"name": "foto.jpg", "data": "<base64 JPEG/PNG>"}]}
 ```
 
-Wie Tippen und Senden in der Mac-App. `409`, wenn gerade eine Antwort läuft. Höchstens 20 MB pro Anfrage.
+Wie Tippen und Senden in der Mac-App, im offenen Chat. `uploads` und `images` sind optional (`images` ist die Form aus Version 1 und nur für kleine Bilder gedacht). `409`, wenn gerade eine Antwort läuft; `404`, wenn ein Upload unbekannt oder abgelaufen ist. Höchstens 20 MB pro Anfrage.
 
 ### `POST /api/v1/stop`
 
@@ -103,9 +126,29 @@ Stoppt die laufende Antwort (wie der Stop-Knopf).
 
 `decision`: `allow`, `allow_for_run` (für diesen Auftrag alles erlauben) oder `deny`.
 
-### `POST /api/v1/new_chat` · `POST /api/v1/retry`
+### `POST /api/v1/new_chat`
 
-Neuer Chat bzw. letzte Antwort neu generieren.
+Legt einen neuen, leeren Chat an und öffnet ihn (auf Mac und Handy). `409`, wenn gerade eine Antwort läuft.
+
+### `POST /api/v1/open_chat`
+
+```json
+{"id": "c-1792605781-b7c1e0"}
+```
+
+Öffnet einen gespeicherten Chat. `404` bei unbekannter `id`, `409`, wenn gerade eine Antwort läuft.
+
+### `POST /api/v1/delete_chat`
+
+```json
+{"id": "c-1792605781-b7c1e0"}
+```
+
+Löscht einen Chat endgültig. Ist es der offene Chat, öffnet der Mac den neuesten übrigen (oder einen neuen, leeren). `404` bei unbekannter `id`, `409`, wenn gerade eine Antwort läuft.
+
+### `POST /api/v1/retry`
+
+Letzte Antwort neu generieren.
 
 ### `POST /api/v1/settings`
 
@@ -121,7 +164,7 @@ Beide Felder sind optional.
 {"path": "README.md"}
 ```
 
-Setzt eine geänderte Datei auf den Stand vor Nemotron zurück. `409`, wenn die Datei inzwischen anderweitig verändert wurde (am Mac bestätigen) oder gerade eine Antwort läuft.
+Setzt eine geänderte Datei auf den Stand vor Nemotron zurück. `path` ist der Pfad wie in `changes`. `409`, wenn die Datei inzwischen anderweitig verändert wurde (am Mac bestätigen) oder gerade eine Antwort läuft.
 
 ### `GET /api/v1/diff?path=README.md`
 
