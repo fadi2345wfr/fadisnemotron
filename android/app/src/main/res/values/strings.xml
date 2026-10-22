@@ -1,0 +1,111 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Fadis Nemotron</string>
+    <string name="nemotron">Nemotron</string>
+
+    <!-- Navigation -->
+    <string name="tab_mac">Mac</string>
+    <string name="tab_direct">Direkt</string>
+
+    <!-- Pairing -->
+    <string name="pair_title">Mit dem Mac verbinden</string>
+    <string name="pair_step_remote">Am Mac in Fadis Nemotron oben auf das Handy-Symbol klicken und „Fernzugriff“ einschalten.</string>
+    <string name="pair_step_scan">Den QR-Code scannen, den der Mac dann zeigt.</string>
+    <string name="pair_step_tailscale">Für unterwegs: Tailscale auf Mac und Handy installieren und mit demselben Konto anmelden. Im WLAN zu Hause geht es auch ohne.</string>
+    <string name="scan_qr">QR-Code scannen</string>
+    <string name="scanner_failed">Der QR-Scanner ist nicht verfügbar. Er kommt über die Google-Play-Dienste und wird beim ersten Mal geladen – gleich noch einmal versuchen oder unten von Hand verbinden.</string>
+    <string name="connecting">Verbinde …</string>
+    <string name="pair_manual_title">Oder von Hand verbinden</string>
+    <string name="pair_address">Adresse des Macs</string>
+    <string name="pair_token">Schlüssel</string>
+    <string name="connect">Verbinden</string>
+
+    <!-- Mac mode -->
+    <string name="chat_only">Nur Chat</string>
+    <string name="connecting_to">Verbinde mit %1$s …</string>
+    <string name="connection_lost">Verbindung zum Mac unterbrochen – versuche erneut …</string>
+    <string name="empty_chat">Kein Projektordner offen: ein normaler Chat mit Nemotron auf dem Mac.</string>
+    <string name="empty_project">Schreib, was Nemotron im Projekt tun soll – zum Beispiel „Bau das Projekt und behebe die Fehler“.</string>
+    <string name="menu">Menü</string>
+    <string name="new_chat">Neuer Chat</string>
+    <string name="retry">Neu generieren</string>
+    <string name="changes_menu">Änderungen (%1$d)</string>
+    <string name="approval_title">Nemotron darf</string>
+    <string name="approval_ask_all">Vor jeder Änderung fragen</string>
+    <string name="approval_auto_edits">Dateien selbst ändern, vor Befehlen fragen</string>
+    <string name="approval_auto_all">Alles selbst machen</string>
+    <string name="thinking_mode">Denkmodus</string>
+    <string name="disconnect">Verbindung trennen</string>
+
+    <!-- Changes -->
+    <string name="changes_title">Änderungen</string>
+    <string name="changes_empty">Noch keine Änderungen.</string>
+    <string name="change_new">neu</string>
+    <string name="diff">Diff</string>
+    <string name="diff_empty">Kein Unterschied (mehr).</string>
+    <string name="undo">Rückgängig</string>
+    <string name="undo_title">Rückgängig machen?</string>
+    <string name="undo_text">%1$s wird auf den Stand vor Nemotron zurückgesetzt.</string>
+    <string name="undo_text_created">%1$s hat Nemotron neu angelegt; die Datei wird gelöscht.</string>
+
+    <!-- Tools -->
+    <string name="details">Details</string>
+    <string name="tool_ok">erledigt</string>
+    <string name="tool_failed">mit Fehler beendet</string>
+    <string name="tool_waiting">wartet auf Freigabe</string>
+    <string name="tool_declined">abgelehnt</string>
+    <string name="tool_not_run">nicht ausgeführt</string>
+    <string name="tool_planned">geplant</string>
+    <string name="approve_question">Nemotron möchte das tun. Erlauben?</string>
+    <string name="approve_warning">⚠ Achtung: Dieser Befehl %1$s. Er wird deshalb immer erst nachgefragt.</string>
+    <string name="allow">Erlauben</string>
+    <string name="allow_for_run">Für diesen Auftrag alles erlauben</string>
+    <string name="deny">Ablehnen</string>
+
+    <!-- Messages -->
+    <string name="attachment">📎 %1$s</string>
+    <plurals name="thinking_header">
+        <item quantity="one">💭 Denkprozess (%1$d Zeichen)</item>
+        <item quantity="other">💭 Denkprozess (%1$d Zeichen)</item>
+    </plurals>
+    <string name="activity_thinking">denkt nach …</string>
+    <string name="activity_working">arbeitet …</string>
+    <string name="activity_waiting">wartet auf deine Freigabe</string>
+    <string name="activity_writing">schreibt …</string>
+    <string name="failed">Fehlgeschlagen.</string>
+    <string name="stopped">Gestoppt.</string>
+    <string name="cut_off">Die Antwort wurde bei „Max. Tokens“ abgeschnitten. Erhöhe den Wert in den Einstellungen.</string>
+    <string name="empty_answer">Keine Antwort erhalten. Erhöhe „Max. Tokens“ oder schalte den Denkmodus aus.</string>
+    <string name="answer">Antwort</string>
+    <string name="copy">Kopieren</string>
+    <string name="jump_to_end">Zum Ende</string>
+    <string name="close">Schließen</string>
+    <string name="cancel">Abbrechen</string>
+
+    <!-- Composer -->
+    <string name="composer_hint">Nachricht an Nemotron …</string>
+    <string name="add_photos">Fotos anhängen</string>
+    <string name="remove_photo">%1$s entfernen</string>
+    <string name="send">Senden</string>
+    <string name="stop">Stopp</string>
+
+    <!-- Direct mode -->
+    <string name="direct_title">Nemotron direkt</string>
+    <string name="direct_empty">Frag Nemotron etwas – auch mit Fotos. Diese Unterhaltung läuft direkt über NVIDIA, ohne Mac.</string>
+    <string name="direct_needs_key">Für den Direkt-Modus brauchst du einen kostenlosen API-Schlüssel von NVIDIA.</string>
+    <string name="enter_key">API-Schlüssel eintragen</string>
+    <string name="settings">Einstellungen</string>
+    <string name="settings_title">Direkt-Verbindung</string>
+    <string name="api_key">API-Schlüssel</string>
+    <string name="api_key_link_prefix">Kostenlos erstellen auf</string>
+    <string name="show_key">Schlüssel zeigen</string>
+    <string name="hide_key">Schlüssel verbergen</string>
+    <string name="base_url">Basis-URL</string>
+    <string name="model">Modell</string>
+    <string name="thinking_mode_hint">Nemotron denkt vor der Antwort nach. Gründlicher, aber langsamer.</string>
+    <string name="temperature">Temperatur</string>
+    <string name="top_p">Top-p</string>
+    <string name="max_tokens">Max. Tokens</string>
+    <string name="system_prompt">System-Prompt</string>
+    <string name="save">Speichern</string>
+</resources>
