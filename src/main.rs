@@ -9,6 +9,7 @@ mod awake;
 mod chats;
 mod computer;
 mod config;
+mod history;
 mod remote;
 mod tools;
 mod widgets;

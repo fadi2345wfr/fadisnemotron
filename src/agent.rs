@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::json;
 
 use crate::api::{self, ChatMessage, GenerationOptions, StepOutcome, TextDelta, ToolCall};
-use crate::tools::{self, ApprovalMode, FileChange, ToolOutput, Workspace};
+use crate::tools::{self, ApprovalMode, FileChange, SharedApproval, ToolOutput, Workspace};
 
 pub const DEFAULT_MAX_STEPS: usize = 60;
 
@@ -75,7 +75,9 @@ pub struct AgentConfig {
     pub options: GenerationOptions,
     /// Without a project folder the model gets no tools (plain chat).
     pub workspace: Option<Workspace>,
-    pub approval: ApprovalMode,
+    /// Shared with the window: changing it takes effect at the next call,
+    /// also while a call waits for an answer.
+    pub approval: SharedApproval,
     pub max_steps: usize,
     /// When the conversation gets too long, the run may end with a
     /// [`AgentEvent::Handoff`] so that the work goes on in a new chat.
@@ -302,7 +304,7 @@ pub fn run(
     mut emit: impl FnMut(AgentEvent) -> bool,
 ) {
     let tool_defs = config.workspace.as_ref().map(|_| tools::definitions());
-    let mut approval = config.approval;
+    let approval = config.approval.clone();
     let mut tool_choice: Option<&str> = None;
     let mut nudged_tool_text = 0;
     let mut nudged_truncation = 0;
@@ -332,7 +334,7 @@ pub fn run(
                 &config,
                 tool_defs.as_ref(),
                 &messages,
-                approval,
+                approval.get(),
                 cancel,
                 &mut emit,
             );
@@ -423,7 +425,7 @@ pub fn run(
                         &config,
                         tool_defs.as_ref(),
                         &messages,
-                        approval,
+                        approval.get(),
                         cancel,
                         &mut emit,
                     );
@@ -579,7 +581,7 @@ pub fn run(
                 emit(AgentEvent::Cancelled);
                 return;
             }
-            let output = match ask(ws, call, &mut approval, cancel, decisions, &mut emit) {
+            let output = match ask(ws, call, &approval, cancel, decisions, &mut emit) {
                 Asked::Go => {
                     if !emit(AgentEvent::ToolStarted {
                         call_id: call.id.clone(),
@@ -935,7 +937,7 @@ enum Asked {
 fn ask(
     ws: &Workspace,
     call: &ToolCall,
-    approval: &mut ApprovalMode,
+    approval: &SharedApproval,
     cancel: &AtomicBool,
     decisions: &Receiver<(String, Decision)>,
     emit: &mut impl FnMut(AgentEvent) -> bool,
@@ -952,7 +954,7 @@ fn ask(
     let read_only = command
         .as_deref()
         .is_some_and(|c| ws.is_read_only_command(c));
-    if warning.is_none() && (read_only || !approval.needs_approval(kind)) {
+    if warning.is_none() && (read_only || !approval.get().needs_approval(kind)) {
         return Asked::Go;
     }
     let preview = ws.preview(&call.name, &call.arguments).ok();
@@ -967,12 +969,16 @@ fn ask(
         if cancel.load(Ordering::Relaxed) {
             return Asked::Stop;
         }
+        // The user switched to autonomous while this call waited.
+        if warning.is_none() && !approval.get().needs_approval(kind) {
+            return Asked::Go;
+        }
         match decisions.recv_timeout(Duration::from_millis(100)) {
             Ok((id, decision)) if id == call.id => {
                 return match decision {
                     Decision::Allow => Asked::Go,
                     Decision::AllowForRun => {
-                        *approval = ApprovalMode::AutoAll;
+                        approval.set(ApprovalMode::AutoAll);
                         Asked::Go
                     }
                     Decision::Deny => Asked::Declined,
@@ -1069,7 +1075,7 @@ mod tests {
             system_prompt: system_prompt("", &ws),
             options: opts(true),
             workspace: Some(ws),
-            approval,
+            approval: approval.into(),
             max_steps: 10,
             handoff: false,
         };
@@ -1526,7 +1532,7 @@ mod tests {
             system_prompt: "s".into(),
             options: opts(false),
             workspace: Some(ws),
-            approval: ApprovalMode::AutoEdits,
+            approval: ApprovalMode::AutoEdits.into(),
             max_steps: 10,
             handoff: false,
         };
@@ -1698,7 +1704,7 @@ mod tests {
             system_prompt: system_prompt("", &ws),
             options: opts(true),
             workspace: Some(ws),
-            approval,
+            approval: approval.into(),
             max_steps: 10,
             handoff: true,
         };
@@ -1878,6 +1884,70 @@ mod tests {
     }
 
     #[test]
+    fn switching_to_autonomous_lets_a_waiting_proposal_through() {
+        let project = Project::new("live-mode");
+        let (base_url, server) = mock_server(vec![
+            (
+                "200 OK",
+                "text/event-stream",
+                tool_step(
+                    "c1",
+                    "edit_file",
+                    json!({"path": "src/lib.rs", "old_string": "    41", "new_string": "    42"}),
+                    "",
+                ),
+            ),
+            ("200 OK", "text/event-stream", answer_step("Erledigt.")),
+        ]);
+        let ws = Workspace::open(&project.0).unwrap();
+        let approval = SharedApproval::new(ApprovalMode::AskAll);
+        let config = AgentConfig {
+            base_url,
+            api_key: "k".into(),
+            system_prompt: String::new(),
+            options: opts(true),
+            workspace: Some(ws),
+            approval: approval.clone(),
+            max_steps: 5,
+            handoff: false,
+        };
+        let (_tx, rx) = mpsc::channel();
+        let mut asked = 0;
+        run(
+            &api::agent(),
+            config,
+            vec![ChatMessage::User {
+                text: "Mach 42 daraus".into(),
+                attachments: vec![],
+            }],
+            &AtomicBool::new(false),
+            &rx,
+            |e| {
+                if matches!(e, AgentEvent::ApprovalNeeded { .. }) {
+                    asked += 1;
+                    // The user taps "Autonom" instead of ✓ or ✗.
+                    approval.set(ApprovalMode::AutoAll);
+                }
+                true
+            },
+        );
+        server.join().unwrap();
+        assert_eq!(asked, 1);
+        assert_eq!(
+            project.read("src/lib.rs"),
+            "pub fn antwort() -> u32 {\n    42\n}\n"
+        );
+        // "Ab jetzt autonom" on a card does the same for the rest of the run.
+        assert_eq!(approval.get(), ApprovalMode::AutoAll);
+        let shared = SharedApproval::new(ApprovalMode::AutoEdits);
+        assert_eq!(shared.clone().get(), ApprovalMode::AutoEdits);
+        for mode in ApprovalMode::ALL {
+            shared.set(mode);
+            assert_eq!(shared.get(), mode);
+        }
+    }
+
+    #[test]
     fn only_a_shell_command_is_judged_by_its_command_text() {
         // A browser or screen call that carries a harmless-looking "command"
         // field must still be asked about: it is not a read-only `ls`.
@@ -1976,7 +2046,7 @@ mod tests {
             system_prompt: String::new(),
             options: opts(false),
             workspace: Some(ws),
-            approval: ApprovalMode::AutoAll,
+            approval: ApprovalMode::AutoAll.into(),
             max_steps: 5,
             handoff: false,
         };
@@ -2049,7 +2119,7 @@ mod tests {
             system_prompt: "Sei nett.".into(),
             options: opts(false),
             workspace: None,
-            approval: ApprovalMode::AutoEdits,
+            approval: ApprovalMode::AutoEdits.into(),
             max_steps: 5,
             handoff: false,
         };

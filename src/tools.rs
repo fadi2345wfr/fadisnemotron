@@ -58,6 +58,37 @@ const MAX_COMMAND_TOTAL_OUTPUT: u64 = 100 * 1024 * 1024;
 const DEFAULT_COMMAND_TIMEOUT: u64 = 120;
 const MAX_COMMAND_TIMEOUT: u64 = 900;
 
+/// The approval mode of a running request. The user can change it at any
+/// moment (from the window or the phone) and the agent sees it at once.
+#[derive(Clone, Debug)]
+pub struct SharedApproval(std::sync::Arc<std::sync::atomic::AtomicU8>);
+
+impl SharedApproval {
+    pub fn new(mode: ApprovalMode) -> Self {
+        Self(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            mode as u8,
+        )))
+    }
+
+    pub fn get(&self) -> ApprovalMode {
+        let raw = self.0.load(Ordering::Relaxed);
+        ApprovalMode::ALL
+            .into_iter()
+            .find(|m| *m as u8 == raw)
+            .unwrap_or_default()
+    }
+
+    pub fn set(&self, mode: ApprovalMode) {
+        self.0.store(mode as u8, Ordering::Relaxed);
+    }
+}
+
+impl From<ApprovalMode> for SharedApproval {
+    fn from(mode: ApprovalMode) -> Self {
+        Self::new(mode)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ApprovalMode {
     /// Ask before every change and every command.
@@ -77,6 +108,39 @@ impl ApprovalMode {
             Self::AskAll => "Vor jeder Änderung fragen",
             Self::AutoEdits => "Dateien selbst ändern, vor Befehlen fragen",
             Self::AutoAll => "Alles selbst machen",
+        }
+    }
+
+    /// The icon on the switch in the input bar.
+    pub fn icon(self) -> &'static str {
+        match self {
+            Self::AskAll => "🔍",
+            Self::AutoEdits => "✏",
+            Self::AutoAll => "🤖",
+        }
+    }
+
+    /// The name on the switch in the input bar.
+    pub fn short_label(self) -> &'static str {
+        match self {
+            Self::AskAll => "Prüfen",
+            Self::AutoEdits => "Dateien frei",
+            Self::AutoAll => "Autonom",
+        }
+    }
+
+    /// What the switch does, for its tooltip.
+    pub fn explanation(self) -> &'static str {
+        match self {
+            Self::AskAll => {
+                "Request Review: Nemotron zeigt jede Änderung und jeden Befehl als Vorschlag mit Diff. Du entscheidest mit ✓ oder ✗."
+            }
+            Self::AutoEdits => {
+                "Dateien ändert Nemotron selbst (du kannst alles zurücknehmen), vor Befehlen fragt er."
+            }
+            Self::AutoAll => {
+                "Autonomous: Nemotron macht alles selbst. Nur riskante Befehle (sudo, rm -rf, git push …) fragen trotzdem."
+            }
         }
     }
 

@@ -11,7 +11,7 @@ use crate::agent::Decision;
 use crate::api::Role;
 use crate::app::{Message, Status, Step, ToolState, ToolView};
 use crate::attachments::{self, Attachment, AttachmentKind};
-use crate::tools::canonical_tool_name;
+use crate::tools::{ApprovalMode, canonical_tool_name};
 
 pub const ACCENT: Color32 = Color32::from_rgb(118, 185, 0);
 const ACCENT_LIGHT_THEME: Color32 = Color32::from_rgb(64, 118, 0);
@@ -28,10 +28,18 @@ const INLINE_DIFF_LINES: usize = 120;
 /// Something the user clicked inside the chat; handled by the app afterwards.
 pub enum UiAction {
     OpenPhoneSetup,
+    /// Open another chat, e.g. the one a too-long chat went on in.
+    OpenChat(String),
     Copy(String),
     Retry,
-    Decide { call_id: String, decision: Decision },
-    ShowDiff { title: String, diff: String },
+    Decide {
+        call_id: String,
+        decision: Decision,
+    },
+    ShowDiff {
+        title: String,
+        diff: String,
+    },
     Undo(usize),
     OpenProject,
     OpenSettings,
@@ -150,6 +158,29 @@ pub fn welcome(
     });
 }
 
+/// The switch above the input field: Request Review, files free, or
+/// autonomous. Returns the mode that was clicked, if it differs.
+pub fn mode_switcher(ui: &mut egui::Ui, current: ApprovalMode) -> Option<ApprovalMode> {
+    let mut picked = None;
+    ui.horizontal(|ui| {
+        ui.label(RichText::new("Modus").small().weak());
+        for mode in ApprovalMode::ALL {
+            let text = RichText::new(format!("{} {}", mode.icon(), mode.short_label()));
+            let selected = mode == current;
+            let text = if selected { text.strong() } else { text };
+            if ui
+                .selectable_label(selected, text)
+                .on_hover_text(mode.explanation())
+                .clicked()
+                && !selected
+            {
+                picked = Some(mode);
+            }
+        }
+    });
+    picked
+}
+
 pub fn message_ui(
     ui: &mut egui::Ui,
     msg: &mut Message,
@@ -193,6 +224,14 @@ pub fn message_ui(
         for notice in &msg.notices {
             ui.label(RichText::new(format!("ℹ {notice}")).italics().weak());
         }
+        if let Some(next) = &msg.continued_in
+            && ui
+                .add(egui::Button::new(RichText::new("➡ Weiter im neuen Chat").strong().color(Color32::BLACK)).fill(accent(ui)))
+                .on_hover_text("Dieser Chat war zu lang. Nemotron macht im neuen Chat mit einer Notiz weiter (auch in der Chatliste: ↪).")
+                .clicked()
+        {
+            actions.push(UiAction::OpenChat(next.clone()));
+        }
 
         let warn = ui.visuals().warn_fg_color;
         let has_tools = msg.steps.iter().any(|s| !s.tools.is_empty());
@@ -219,7 +258,7 @@ pub fn message_ui(
                 if !answer.is_empty() && ui.small_button("📋 Kopieren").clicked() {
                     actions.push(UiAction::Copy(answer.to_owned()));
                 }
-                if is_last && !busy {
+                if is_last && !busy && msg.continued_in.is_none() {
                     let label = if msg.status == Status::Done { "↻ Neu generieren" } else { "↻ Erneut versuchen" };
                     if ui.small_button(label).on_hover_text("Fragt noch einmal. Bereits geänderte Dateien bleiben so.").clicked() {
                         actions.push(UiAction::Retry);
@@ -439,7 +478,7 @@ fn tool_card(ui: &mut egui::Ui, tool: &ToolView, actions: &mut Vec<UiAction>) {
             });
 
             if waiting {
-                ui.label(RichText::new("Nemotron möchte das tun. Erlauben?").strong());
+                ui.label(RichText::new("Vorschlag von Nemotron – übernehmen?").strong());
                 if let Some(warning) = &tool.warning {
                     ui.colored_label(
                         ui.visuals().warn_fg_color,
@@ -473,7 +512,7 @@ fn tool_card(ui: &mut egui::Ui, tool: &ToolView, actions: &mut Vec<UiAction>) {
                 }
                 ui.horizontal(|ui| {
                     let allow = egui::Button::new(
-                        RichText::new("✔ Erlauben").strong().color(Color32::BLACK),
+                        RichText::new("✓ Übernehmen").strong().color(Color32::BLACK),
                     )
                     .fill(ACCENT);
                     if ui.add(allow).clicked() {
@@ -483,9 +522,9 @@ fn tool_card(ui: &mut egui::Ui, tool: &ToolView, actions: &mut Vec<UiAction>) {
                         });
                     }
                     if ui
-                        .button("Für diesen Auftrag alles erlauben")
+                        .button("🤖 Ab jetzt autonom")
                         .on_hover_text(
-                            "Bis Nemotron mit dieser Nachricht fertig ist, ohne weitere Nachfrage.",
+                            "Stellt den Schalter auf Autonom: Nemotron macht den Rest selbst (riskante Befehle fragen weiter).",
                         )
                         .clicked()
                     {
@@ -494,7 +533,7 @@ fn tool_card(ui: &mut egui::Ui, tool: &ToolView, actions: &mut Vec<UiAction>) {
                             decision: Decision::AllowForRun,
                         });
                     }
-                    if ui.button("✖ Ablehnen").clicked() {
+                    if ui.button("✗ Ablehnen").clicked() {
                         actions.push(UiAction::Decide {
                             call_id: tool.call.id.clone(),
                             decision: Decision::Deny,

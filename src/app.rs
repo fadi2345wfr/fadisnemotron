@@ -18,10 +18,14 @@ use crate::attachments::{self, Attachment, AttachmentKind};
 use crate::awake;
 use crate::chats::{self, Chat, ChatStore, ChatSummary};
 use crate::config::Settings;
+use crate::history::InputHistory;
 use crate::remote::{self, Command, RemoteServer, Reply};
-use crate::tools::{ApprovalMode, FileChange, Workspace};
+use crate::tools::{ApprovalMode, FileChange, SharedApproval, Workspace};
 use crate::widgets::{self, UiAction};
 
+/// After this long without any sign of life from the server the window says
+/// that one can stop, or type on to go on at once.
+const STALLED_AFTER: Duration = Duration::from_secs(20);
 /// A request may move on to a new chat this many times by itself; after that
 /// old tool output is cut instead.
 const MAX_HANDOFFS: usize = 3;
@@ -156,6 +160,10 @@ pub struct Message {
     pub status: Status,
     pub finish_reason: Option<String>,
     pub notices: Vec<String>,
+    /// The work went on in this other chat because this one got too long:
+    /// the message shows a button that opens it.
+    #[serde(default)]
+    pub continued_in: Option<String>,
     /// Thinking was on for this answer.
     thinking: bool,
 }
@@ -171,6 +179,7 @@ impl Message {
             status: Status::Done,
             finish_reason: None,
             notices: Vec::new(),
+            continued_in: None,
             thinking: false,
         }
     }
@@ -263,6 +272,10 @@ struct ActiveRequest {
     rx: Receiver<AgentEvent>,
     cancel: Arc<AtomicBool>,
     decisions: Sender<(String, Decision)>,
+    /// What Nemotron may do right now; the switch in the input bar changes it.
+    approval: SharedApproval,
+    /// When the worker last reported anything (text, a tool, a notice).
+    last_event: Instant,
 }
 
 struct SettingsDraft {
@@ -330,6 +343,8 @@ pub struct NemotronApp {
     apk_offered: bool,
     remote_show_token: bool,
     keep_awake: awake::KeepAwake,
+    /// What was sent before, for ↑ and ↓ in the input field.
+    history: InputHistory,
     /// A run ended because the chat got too long: Nemotron's note for the new
     /// chat and the approval mode of that run.
     pending_handoff: Option<(String, ApprovalMode)>,
@@ -400,6 +415,12 @@ impl NemotronApp {
             .and_then(|_| ChatStore::default_dir())
             .map(ChatStore::new);
         let chats = chat_store.as_ref().map(ChatStore::list).unwrap_or_default();
+        let history = InputHistory::load(
+            settings_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|dir| dir.join("history.json")),
+        );
         Self {
             settings,
             settings_path,
@@ -431,6 +452,7 @@ impl NemotronApp {
             apk_offered: false,
             remote_show_token: false,
             keep_awake: awake::KeepAwake::new(),
+            history,
             pending_handoff: None,
             handoff_chain: 0,
             run_approval: None,
@@ -628,6 +650,7 @@ impl NemotronApp {
         }
         self.pending.clear();
         self.input.clear();
+        self.history.stop_browsing();
         self.show_chat(Vec::new(), ctx);
         self.chat_id = ChatStore::new_id();
         self.chat_created = chats::now();
@@ -819,10 +842,49 @@ impl NemotronApp {
 
     // ------------------------------------------------------------- sending
 
+    /// What Nemotron may do: the running request's mode, else the setting.
+    fn current_mode(&self) -> ApprovalMode {
+        self.active
+            .as_ref()
+            .map_or(self.settings.approval, |a| a.approval.get())
+    }
+
+    /// Switches the mode for good and for the request that is running now.
+    fn set_mode(&mut self, mode: ApprovalMode) {
+        if let Some(active) = &self.active {
+            active.approval.set(mode);
+        }
+        if self.settings.approval != mode {
+            self.settings.approval = mode;
+            if let Some(draft) = &mut self.settings_draft {
+                draft.settings.approval = mode;
+            }
+            self.save_settings();
+        }
+    }
+
+    /// Sending is possible while Nemotron works too: that run is stopped and
+    /// the new message goes out at once (the server may be hanging).
     fn can_send(&self) -> bool {
-        self.active.is_none()
-            && self.loading_attachments == 0
-            && (!self.input.trim().is_empty() || !self.pending.is_empty())
+        self.loading_attachments == 0 && (!self.input.trim().is_empty() || !self.pending.is_empty())
+    }
+
+    /// How long the running request has been silent, if that is long enough
+    /// to be worth a hint: no text, no tool, no notice, and the app is not
+    /// just waiting for the user's answer or for a command.
+    fn stalled_for(&self) -> Option<Duration> {
+        let active = self.active.as_ref()?;
+        let silent = active.last_event.elapsed();
+        if silent < STALLED_AFTER {
+            return None;
+        }
+        let busy_with_tool = self.messages.last().is_some_and(|m| {
+            m.steps
+                .iter()
+                .flat_map(|s| &s.tools)
+                .any(|t| matches!(t.state, ToolState::AwaitingApproval | ToolState::Running))
+        });
+        (!busy_with_tool).then_some(silent)
     }
 
     fn send(&mut self, ctx: &egui::Context) {
@@ -839,6 +901,9 @@ impl NemotronApp {
             return;
         }
         let text = self.input.trim().to_owned();
+        // A hanging request makes way for the new message.
+        self.stop();
+        self.history.push(&text);
         self.messages
             .push(Message::user(text, std::mem::take(&mut self.pending)));
         self.input.clear();
@@ -916,13 +981,15 @@ impl NemotronApp {
         let (decision_tx, decision_rx) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
         let system_prompt = agent::system_prompt(&self.settings.system_prompt, &self.workspace);
+        let approval =
+            SharedApproval::new(self.run_approval.take().unwrap_or(self.settings.approval));
         let config = AgentConfig {
             base_url: self.settings.base_url.clone(),
             api_key: self.settings.effective_api_key(),
             system_prompt,
             options: self.settings.generation_options(),
             workspace: Some(self.workspace.clone()),
-            approval: self.run_approval.take().unwrap_or(self.settings.approval),
+            approval: approval.clone(),
             max_steps: self.settings.max_steps.max(1),
             handoff: self.handoff_chain < MAX_HANDOFFS,
         };
@@ -947,6 +1014,8 @@ impl NemotronApp {
             rx,
             cancel,
             decisions: decision_tx,
+            approval,
+            last_event: Instant::now(),
         });
     }
 
@@ -1051,7 +1120,9 @@ impl NemotronApp {
     }
 
     fn poll_agent(&mut self) {
-        let Some(active) = &self.active else { return };
+        let Some(active) = &mut self.active else {
+            return;
+        };
         let mut events = Vec::new();
         let mut disconnected = false;
         loop {
@@ -1063,6 +1134,9 @@ impl NemotronApp {
                     break;
                 }
             }
+        }
+        if !events.is_empty() {
+            active.last_event = Instant::now();
         }
         let mut finished = false;
         let mut changes = Vec::new();
@@ -1105,6 +1179,16 @@ impl NemotronApp {
             .find(|m| m.role == Role::User)
             .map(|m| (m.text.clone(), m.attachments.clone()));
         let old_title = self.chat_title();
+        // The old chat points to the new one; it is saved with that link.
+        let new_id = ChatStore::new_id();
+        if let Some(last) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+        {
+            last.continued_in = Some(new_id.clone());
+        }
         if let Err(e) = self.new_chat(ctx) {
             self.notice = Some(Notice {
                 text: format!(
@@ -1114,9 +1198,12 @@ impl NemotronApp {
             });
             return;
         }
+        self.chat_id = new_id;
         let (request, attachments) = request.unwrap_or_default();
+        // The first line becomes the title in the chat list.
         let text = format!(
-            "{request}\n\n— Weiter aus dem Chat „{old_title}“, der zu lang geworden war. Nemotron hat sich diese Notiz geschrieben —\n{note}\n\nMach genau dort weiter, wo die Notiz endet. Lies Dateien nur wieder, wo du sie wirklich brauchst."
+            "↪ {}\n\nAuftrag aus dem vorigen Chat, der zu lang geworden war:\n{request}\n\nNemotrons Notiz zum Stand:\n{note}\n\nMach genau dort weiter, wo die Notiz endet. Lies Dateien nur wieder, wo du sie wirklich brauchst.",
+            old_title.trim_start_matches("↪ ")
         );
         self.messages
             .push(Message::user(text.trim().to_owned(), attachments));
@@ -1354,8 +1441,9 @@ impl NemotronApp {
                 text,
                 attachments: inline,
                 uploads,
+                interrupt,
             } => {
-                if self.active.is_some() {
+                if self.active.is_some() && !*interrupt {
                     return Err(busy());
                 }
                 if self.needs_api_key() {
@@ -1380,6 +1468,9 @@ impl NemotronApp {
                         attachments.push(self.uploads.remove(i).2);
                     }
                 }
+                // The phone typed on while the server hung: that run ends here.
+                self.stop();
+                self.history.push(text);
                 self.messages
                     .push(Message::user(text.trim().to_owned(), attachments));
                 self.notice = None;
@@ -1424,13 +1515,12 @@ impl NemotronApp {
             }
             Command::Settings { approval, thinking } => {
                 if let Some(mode) = approval {
-                    self.settings.approval = *mode;
+                    self.set_mode(*mode);
                 }
                 if let Some(on) = thinking {
                     self.settings.thinking = *on;
                 }
                 if let Some(draft) = &mut self.settings_draft {
-                    draft.settings.approval = self.settings.approval;
                     draft.settings.thinking = self.settings.thinking;
                 }
                 self.save_settings();
@@ -1551,6 +1641,7 @@ impl NemotronApp {
                         "error": error,
                         "finish_reason": msg.finish_reason,
                         "notices": msg.notices,
+                        "continued_in": msg.continued_in,
                         "steps": steps,
                     })
                 }
@@ -1563,9 +1654,10 @@ impl NemotronApp {
             .collect();
         json!({
             "busy": self.active.is_some(),
+            "stalled": self.stalled_for().is_some(),
             "model": self.settings.model,
             "thinking": self.settings.thinking,
-            "approval": match self.settings.approval {
+            "approval": match self.current_mode() {
                 ApprovalMode::AskAll => "AskAll",
                 ApprovalMode::AutoEdits => "AutoEdits",
                 ApprovalMode::AutoAll => "AutoAll",
@@ -2074,18 +2166,15 @@ impl NemotronApp {
                 });
                 ui.add_space(8.0);
                 ui.label(RichText::new("Nemotron darf").strong());
-                let before = self.settings.approval;
-                for mode in ApprovalMode::ALL {
-                    ui.radio_value(&mut self.settings.approval, mode, mode.label());
+                let mut mode = self.current_mode();
+                for choice in ApprovalMode::ALL {
+                    ui.radio_value(&mut mode, choice, choice.label());
                 }
-                if self.settings.approval != before {
-                    if let Some(draft) = &mut self.settings_draft {
-                        draft.settings.approval = self.settings.approval;
-                    }
-                    self.save_settings();
+                if mode != self.current_mode() {
+                    self.set_mode(mode);
                 }
                 ui.label(
-                    RichText::new("Lesen und Suchen geht immer ohne Nachfrage. Gilt ab der nächsten Nachricht.")
+                    RichText::new("Lesen und Suchen geht immer ohne Nachfrage. Gilt sofort, auch für den laufenden Auftrag. Schneller umstellen: Schalter über dem Eingabefeld.")
                         .small()
                         .weak(),
                 );
@@ -2137,6 +2226,45 @@ impl NemotronApp {
         }
     }
 
+    /// ↑ and ↓ in the input field call back what was sent before, like in a
+    /// shell: ↑ when the field is empty, the cursor is at its very start, or
+    /// an earlier message is shown; ↓ while one is shown, or at the very end.
+    /// Otherwise the keys move the cursor as usual.
+    fn history_keys(&mut self, ctx: &egui::Context, id: egui::Id) {
+        if self.history.is_empty() || !ctx.memory(|m| m.has_focus(id)) {
+            return;
+        }
+        let total = self.input.chars().count();
+        let cursor = egui::TextEdit::load_state(ctx, id)
+            .and_then(|s| s.cursor.char_range())
+            .map_or(total, |range| range.primary.index.into());
+        let browsing = self.history.is_browsing(&self.input);
+        let up_allowed = self.input.is_empty() || cursor == 0 || browsing;
+        let down_allowed = self.history.has_newer() && (browsing || cursor == total);
+        let up = up_allowed && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowUp));
+        let down = !up
+            && down_allowed
+            && ctx.input_mut(|i| i.consume_key(Modifiers::NONE, Key::ArrowDown));
+        let text = if up {
+            self.history.older(&self.input)
+        } else if down {
+            self.history.newer()
+        } else {
+            None
+        };
+        if let Some(text) = text {
+            self.input = text;
+            // The cursor goes to the end, as in a shell.
+            if let Some(mut state) = egui::TextEdit::load_state(ctx, id) {
+                let end = egui::text::CCursor::new(self.input.chars().count());
+                state
+                    .cursor
+                    .set_char_range(Some(egui::text::CCursorRange::one(end)));
+                state.store(ctx, id);
+            }
+        }
+    }
+
     fn composer(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         egui::Panel::bottom("eingabe").show(ui, |ui| {
             ui.add_space(8.0);
@@ -2155,16 +2283,41 @@ impl NemotronApp {
             let mut stop = false;
             let mut pick = false;
             let mut add_url = false;
+            // The mode is chosen here, where one types, not in the settings.
+            if let Some(mode) = widgets::mode_switcher(ui, self.current_mode()) {
+                self.set_mode(mode);
+            }
+            ui.add_space(4.0);
+            if let Some(silent) = self.stalled_for() {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        ui.visuals().warn_fg_color,
+                        format!(
+                            "⏳ Seit {} s keine Antwort von NVIDIA (Server hängt oder ist überlastet). Du kannst ⏹ stoppen – oder einfach weiterschreiben und Enter drücken: dann geht es sofort mit deiner neuen Nachricht weiter.",
+                            silent.as_secs()
+                        ),
+                    );
+                });
+                ui.add_space(4.0);
+            }
             let hint = if self.workspace.is_home() {
                 "Sag Nemotron, was passieren soll – z. B. „Räum meinen Downloads-Ordner auf“ … (Enter senden, Shift+Enter neue Zeile)"
             } else {
                 "Sag Nemotron, was im Projekt passieren soll … (Enter senden, Shift+Enter neue Zeile)"
             };
+            let input_id = egui::Id::unique("eingabe_text");
+            self.history_keys(ctx, input_id);
             // `horizontal` keeps the row as tall as its content; a free
             // layout here would stretch the panel over the whole window.
             ui.horizontal(|ui| {
                 let spacing = ui.spacing().item_spacing.x;
-                let buttons = 34.0 + 34.0 + 96.0 + 3.0 * spacing;
+                let working = self.active.is_some();
+                // 📎 and 🔗, Send, and Stop beside Send while Nemotron works.
+                let buttons = if working {
+                    34.0 + 34.0 + 96.0 + 96.0 + 4.0 * spacing
+                } else {
+                    34.0 + 34.0 + 96.0 + 3.0 * spacing
+                };
                 let input_width = (ui.available_width() - buttons).max(120.0);
                 // A long prompt scrolls inside the box instead of pushing the
                 // chat out of the window.
@@ -2179,6 +2332,7 @@ impl NemotronApp {
                             .show(ui, |ui| {
                                 ui.add(
                                     egui::TextEdit::multiline(&mut self.input)
+                                        .id(input_id)
                                         .hint_text(hint)
                                         .desired_rows(2)
                                         .desired_width(f32::INFINITY)
@@ -2205,18 +2359,21 @@ impl NemotronApp {
                     .add_sized([34.0, 34.0], egui::Button::new("🔗"))
                     .on_hover_text("Bild- oder Video-Link anhängen")
                     .clicked();
-                if self.active.is_some() {
+                if working {
                     stop = ui.add_sized([96.0, 34.0], egui::Button::new("⏹ Stop")).on_hover_text("Esc").clicked();
-                } else {
-                    let label = RichText::new("Senden ➤").strong().color(Color32::BLACK);
-                    send |= ui
-                        .add_enabled_ui(self.can_send(), |ui| {
-                            ui.add_sized([96.0, 34.0], egui::Button::new(label).fill(widgets::ACCENT))
-                        })
-                        .inner
-                        .on_hover_text("Enter")
-                        .clicked();
                 }
+                let label = RichText::new(if working { "Jetzt ➤" } else { "Senden ➤" }).strong().color(Color32::BLACK);
+                send |= ui
+                    .add_enabled_ui(self.can_send(), |ui| {
+                        ui.add_sized([96.0, 34.0], egui::Button::new(label).fill(widgets::ACCENT))
+                    })
+                    .inner
+                    .on_hover_text(if working {
+                        "Enter: stoppt den laufenden Auftrag und schickt dieses hier sofort"
+                    } else {
+                        "Enter"
+                    })
+                    .clicked();
             });
             ui.add_space(8.0);
 
@@ -2315,6 +2472,14 @@ impl NemotronApp {
             UiAction::OpenProject => self.pick_workspace(ctx),
             UiAction::OpenSettings => self.open_settings(),
             UiAction::OpenPhoneSetup => self.remote_window = true,
+            UiAction::OpenChat(id) => {
+                if let Err((_, e)) = self.open_chat(&id, ctx) {
+                    self.notice = Some(Notice {
+                        text: e,
+                        error: true,
+                    });
+                }
+            }
             UiAction::UsePrompt(text) => {
                 self.input = text;
                 self.focus_input = true;
@@ -3134,6 +3299,196 @@ mod tests {
         )
     }
 
+    /// Runs one frame of the input field with the given key presses.
+    fn frame_with_keys(app: &mut NemotronApp, ctx: &egui::Context, keys: &[Key]) {
+        let id = egui::Id::unique("eingabe_text");
+        let events = keys
+            .iter()
+            .map(|key| egui::Event::Key {
+                key: *key,
+                physical_key: Some(*key),
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            })
+            .collect();
+        let input = egui::RawInput {
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| {
+            let ctx = ui.ctx().clone();
+            app.history_keys(&ctx, id);
+            ui.add(egui::TextEdit::multiline(&mut app.input).id(id));
+            ctx.memory_mut(|m| m.request_focus(id));
+        });
+        // Nothing is painted in a test.
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn arrow_keys_in_the_input_field_call_back_earlier_messages() {
+        let mut app = NemotronApp::with_settings(Settings::default(), None);
+        let ctx = egui::Context::default();
+        app.history.push("Räum Downloads auf");
+        app.history.push("Bau das Projekt");
+        // First frame: the field gets the focus.
+        frame_with_keys(&mut app, &ctx, &[]);
+
+        frame_with_keys(&mut app, &ctx, &[Key::ArrowUp]);
+        assert_eq!(app.input, "Bau das Projekt");
+        frame_with_keys(&mut app, &ctx, &[Key::ArrowUp]);
+        assert_eq!(app.input, "Räum Downloads auf");
+        frame_with_keys(&mut app, &ctx, &[Key::ArrowDown]);
+        assert_eq!(app.input, "Bau das Projekt");
+        frame_with_keys(&mut app, &ctx, &[Key::ArrowDown]);
+        assert_eq!(app.input, "", "back to the empty draft");
+
+        // In the middle of a text the arrow keys keep moving the cursor.
+        app.input = "halber Satz".into();
+        app.history.stop_browsing();
+        frame_with_keys(&mut app, &ctx, &[]);
+        let id = egui::Id::unique("eingabe_text");
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+        let end = egui::text::CCursor::new(app.input.chars().count());
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(end)));
+        state.store(&ctx, id);
+        frame_with_keys(&mut app, &ctx, &[Key::ArrowUp]);
+        assert_eq!(app.input, "halber Satz", "the cursor is at the end");
+        // At the very start of the text, ↑ calls back the last message.
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(0),
+            )));
+        state.store(&ctx, id);
+        frame_with_keys(&mut app, &ctx, &[Key::ArrowUp]);
+        assert_eq!(app.input, "Bau das Projekt");
+    }
+
+    #[test]
+    fn typing_on_while_the_server_hangs_goes_on_with_the_new_message() {
+        use crate::api::tests::mock_server;
+        let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"Gleich da.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let (base_url, nvidia) =
+            mock_server(vec![("200 OK", "text/event-stream", answer.to_owned())]);
+        let settings = Settings {
+            base_url,
+            api_key: "k".into(),
+            ..Settings::default()
+        };
+        let mut app = NemotronApp::with_settings(settings, None);
+        let ctx = egui::Context::default();
+        app.messages
+            .push(Message::user("Lies alles".into(), vec![]));
+        app.messages.push(Message::assistant(true));
+        let (_tx, rx) = mpsc::channel();
+        let (decisions, _) = mpsc::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        app.active = Some(ActiveRequest {
+            rx,
+            cancel: cancel.clone(),
+            decisions,
+            approval: SharedApproval::new(ApprovalMode::AutoEdits),
+            last_event: Instant::now() - Duration::from_secs(25),
+        });
+        // Silent for 25 s: the window says so, and the phone is told too.
+        assert!(app.stalled_for().is_some());
+        assert_eq!(app.remote_snapshot()["stalled"], true);
+
+        app.input = "Dann nimm nur die erste Datei".into();
+        assert!(app.can_send(), "typing on is allowed while Nemotron works");
+        app.send(&ctx);
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the hanging run was stopped"
+        );
+        assert_eq!(app.messages[1].status, Status::Cancelled);
+        assert_eq!(app.messages[2].text, "Dann nimm nur die erste Datei");
+        let until = Instant::now() + Duration::from_secs(15);
+        while app.active.is_some() && Instant::now() < until {
+            app.poll_agent();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let requests = nvidia.join().unwrap();
+        assert!(requests[0].contains("Dann nimm nur die erste Datei"));
+        assert!(requests[0].contains("Lies alles"), "the chat goes on");
+        assert_eq!(app.messages[3].steps[0].content, "Gleich da.");
+        assert!(app.stalled_for().is_none(), "nothing runs any more");
+    }
+
+    #[test]
+    fn a_waiting_proposal_or_a_running_command_is_not_a_hanging_server() {
+        let mut app = NemotronApp::with_settings(Settings::default(), None);
+        let (_tx, rx) = mpsc::channel();
+        let (decisions, _) = mpsc::channel();
+        app.active = Some(ActiveRequest {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            decisions,
+            approval: SharedApproval::new(ApprovalMode::AskAll),
+            last_event: Instant::now() - Duration::from_secs(60),
+        });
+        let mut msg = Message::assistant(true);
+        for e in [
+            AgentEvent::StepStarted,
+            AgentEvent::StepFinished {
+                content: String::new(),
+                reasoning: String::new(),
+                tool_calls: vec![tool("c1", "run_command", r#"{"command":"make"}"#)],
+            },
+            AgentEvent::ApprovalNeeded {
+                call_id: "c1".into(),
+                preview: None,
+                warning: None,
+            },
+        ] {
+            apply_event(&mut msg, e, &mut Vec::new());
+        }
+        app.messages.push(Message::user("Bau".into(), vec![]));
+        app.messages.push(msg);
+        assert!(app.stalled_for().is_none(), "the user is being waited for");
+        apply_event(
+            app.messages.last_mut().unwrap(),
+            AgentEvent::ToolStarted {
+                call_id: "c1".into(),
+            },
+            &mut Vec::new(),
+        );
+        assert!(app.stalled_for().is_none(), "a command may run for minutes");
+    }
+
+    #[test]
+    fn the_mode_switch_reaches_the_running_request_and_the_phone() {
+        let mut app = NemotronApp::with_settings(Settings::default(), None);
+        assert_eq!(app.current_mode(), ApprovalMode::AutoEdits);
+        let (_tx, rx) = mpsc::channel();
+        let (decisions, _) = mpsc::channel();
+        let approval = SharedApproval::new(ApprovalMode::AutoEdits);
+        app.active = Some(ActiveRequest {
+            rx,
+            cancel: Arc::new(AtomicBool::new(false)),
+            decisions,
+            approval: approval.clone(),
+            last_event: Instant::now(),
+        });
+        app.set_mode(ApprovalMode::AskAll);
+        assert_eq!(approval.get(), ApprovalMode::AskAll);
+        assert_eq!(app.settings.approval, ApprovalMode::AskAll);
+        assert_eq!(app.remote_snapshot()["approval"], "AskAll");
+        // "Ab jetzt autonom" on a card changes the run, not the saved setting.
+        approval.set(ApprovalMode::AutoAll);
+        assert_eq!(app.current_mode(), ApprovalMode::AutoAll);
+        assert_eq!(app.settings.approval, ApprovalMode::AskAll);
+        assert_eq!(app.remote_snapshot()["approval"], "AutoAll");
+        // Choosing the saved one again still switches the run back.
+        app.set_mode(ApprovalMode::AskAll);
+        assert_eq!(approval.get(), ApprovalMode::AskAll);
+    }
+
     #[test]
     fn a_chat_that_got_too_long_goes_on_in_a_new_chat_with_the_note() {
         use crate::api::tests::mock_server;
@@ -3146,6 +3501,10 @@ mod tests {
             ..Settings::default()
         };
         let mut app = NemotronApp::with_settings(settings, None);
+        // Chats go to a folder of their own in this test.
+        let store_dir = std::env::temp_dir().join(format!("fadis-handoff-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&store_dir);
+        app.chat_store = Some(ChatStore::new(store_dir.clone()));
         let ctx = egui::Context::default();
         let mut old = Message::assistant(true);
         old.status = Status::Done;
@@ -3161,7 +3520,10 @@ mod tests {
         assert_eq!(app.handoff_chain, 1);
         assert_eq!(app.messages[0].role, Role::User);
         let first = &app.messages[0].text;
-        assert!(first.starts_with("Bau das Projekt"), "{first}");
+        // The first line is the title in the chat list.
+        assert!(first.starts_with("↪ Bau das Projekt\n"), "{first}");
+        assert!(first.contains("Auftrag aus dem vorigen Chat"), "{first}");
+        let new_id = app.chat_id.clone();
         assert!(
             first.contains("Gelesen: a.rs, b.rs. Offen: Tests."),
             "{first}"
@@ -3182,6 +3544,20 @@ mod tests {
         // Nothing is left to continue.
         app.continue_in_new_chat(&ctx);
         assert_eq!(app.handoff_chain, 1);
+
+        // The old chat shows a button to the new one, also after a restart,
+        // and the phone is told about it.
+        app.open_chat(&old_id, &ctx).unwrap();
+        let old = &app.messages[1];
+        assert_eq!(old.continued_in.as_deref(), Some(new_id.as_str()));
+        assert_eq!(
+            app.remote_snapshot()["messages"][1]["continued_in"],
+            json!(new_id)
+        );
+        // The list tells the continuation by its arrow.
+        let titles: Vec<String> = app.chats.iter().map(|c| c.title.clone()).collect();
+        assert!(titles.iter().any(|t| t.starts_with("↪ ")), "{titles:?}");
+        let _ = std::fs::remove_dir_all(&store_dir);
     }
 
     #[test]
@@ -3696,6 +4072,8 @@ mod tests {
             rx,
             cancel: Arc::new(AtomicBool::new(false)),
             decisions,
+            approval: SharedApproval::new(ApprovalMode::AutoEdits),
+            last_event: Instant::now(),
         });
         app.stop();
         let tools = &app.messages[1].steps[0].tools;

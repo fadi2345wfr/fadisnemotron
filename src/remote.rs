@@ -62,6 +62,9 @@ pub enum Command {
         attachments: Vec<Attachment>,
         /// Ids from earlier uploads.
         uploads: Vec<String>,
+        /// Stop the running request and answer this message right away
+        /// (otherwise a busy app refuses it).
+        interrupt: bool,
     },
     /// A photo or video that was received and prepared; the app keeps it
     /// until a `Send` names it.
@@ -976,10 +979,15 @@ fn parse_command(
             if text.trim().is_empty() && images.is_empty() && uploads.is_empty() {
                 return Err(error(400, "Leere Nachricht."));
             }
+            let interrupt = body
+                .get("interrupt")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             Ok(Command::Send {
                 text,
                 attachments: images,
                 uploads,
+                interrupt,
             })
         }
         "/api/v1/stop" => Ok(Command::Stop),
@@ -1262,6 +1270,7 @@ mod tests {
                             text,
                             attachments,
                             uploads,
+                            ..
                         } => {
                             seen.lock().unwrap().push(format!(
                                 "send:{text}:{}:{}",
@@ -1690,6 +1699,33 @@ mod tests {
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen.len(), 1, "{seen:?}");
         assert!(seen[0].starts_with("upload:foto.png:"));
+    }
+
+    #[test]
+    fn a_send_can_ask_to_interrupt_the_running_request() {
+        let parse = |body: Value| parse_command("/api/v1/send", &body, 1536).unwrap();
+        assert!(matches!(
+            parse(json!({"text": "weiter", "interrupt": true})),
+            Command::Send {
+                interrupt: true,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(json!({"text": "weiter"})),
+            Command::Send {
+                interrupt: false,
+                ..
+            }
+        ));
+        // Anything but a real boolean counts as "no".
+        assert!(matches!(
+            parse(json!({"text": "weiter", "interrupt": "ja"})),
+            Command::Send {
+                interrupt: false,
+                ..
+            }
+        ));
     }
 
     #[test]

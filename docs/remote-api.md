@@ -53,6 +53,7 @@ Liefert den ganzen sichtbaren Zustand. Ist `after` gleich der aktuellen Version,
 {
   "version": 42,
   "busy": true,
+  "stalled": false,
   "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
   "thinking": true,
   "approval": "AutoEdits",
@@ -99,7 +100,9 @@ Liefert den ganzen sichtbaren Zustand. Ist `after` gleich der aktuellen Version,
 
 - `workspace` ist der Arbeitsordner des Agenten. Ohne geöffnetes Projekt ist es der Benutzerordner des Macs, dann ist `home` `true`. Nemotron kann auch außerhalb des Arbeitsordners im Benutzerordner lesen und (nach Freigabe) schreiben, z. B. in Downloads oder auf dem Schreibtisch.
 - `chat` ist der Chat, der gerade auf dem Mac (und damit auch auf dem Handy) offen ist; `messages` gehört zu ihm. `chats` listet alle gespeicherten Chats, neueste zuerst, höchstens 200. `updated` ist eine Unix-Zeit in Sekunden. Ein neuer, noch leerer Chat hat den Titel `"Neuer Chat"`.
-- `approval`: `AskAll`, `AutoEdits` oder `AutoAll`.
+- `approval`: `AskAll` („Prüfen“ / Request Review: jeder Vorschlag wird mit ✓ oder ✗ entschieden), `AutoEdits` („Dateien frei“) oder `AutoAll` („Autonom“). Der Wert gilt sofort, auch für die laufende Antwort; wartende Vorschläge laufen weiter, wenn auf `AutoAll` gestellt wird. `allow_for_run` stellt ihn für den Rest des Auftrags auf `AutoAll`.
+- `busy` und `stalled`: `stalled` ist `true`, wenn die laufende Antwort seit über 20 Sekunden nichts gemeldet hat (kein Text, kein Werkzeug) und die App nicht auf eine Freigabe oder einen laufenden Befehl wartet. Dann hängt vermutlich der Server; das Handy zeigt den Hinweis „Stoppen oder einfach weitertippen“.
+- `continued_in` (an einer Antwort): Ist ein Chat zu lang geworden, macht Nemotron in einem neuen Chat weiter. Die letzte Antwort des alten Chats trägt dann die Id des neuen in `continued_in`; das Handy zeigt dort „Weiter im neuen Chat“ und öffnet ihn mit `open_chat`. Der Titel des neuen Chats beginnt mit „↪ “.
 - `status`: `streaming`, `done`, `cancelled`, `failed` (dann steht der Grund in `error`).
 - Werkzeug-`state`: `planned`, `awaiting_approval`, `running`, `done`, `declined`, `not_run`, `interrupted` (lief beim Stopp noch; kann teilweise ausgeführt sein). Bei `awaiting_approval` enthält `diff` die geplante Änderung und `warning` ggf. den Grund, warum nachgefragt wird (z. B. „ändert eine Datei außerhalb des Projektordners“ oder „läuft mit Administratorrechten“).
 - Lange Texte werden gekürzt: `reasoning` auf die letzten 6000 Zeichen, `output` auf die letzten 4000, `diff` auf die ersten 8000.
@@ -123,7 +126,7 @@ Lädt ein Foto oder Video hoch, **als rohe Bytes im Body** (kein JSON, kein Base
 {"text": "Was passiert in dem Video?", "uploads": ["up-7f3a9c"], "images": [{"name": "foto.jpg", "data": "<base64 JPEG/PNG>"}]}
 ```
 
-Wie Tippen und Senden in der Mac-App, im offenen Chat. `uploads` und `images` sind optional (`images` ist die Form aus Version 1 und nur für kleine Bilder gedacht). `409`, wenn gerade eine Antwort läuft; `404`, wenn ein Upload unbekannt oder abgelaufen ist. Höchstens 20 MB pro Anfrage.
+Wie Tippen und Senden in der Mac-App, im offenen Chat. `uploads` und `images` sind optional (`images` ist die Form aus Version 1 und nur für kleine Bilder gedacht). Mit `"interrupt": true` stoppt der Mac eine laufende Antwort und beantwortet die neue Nachricht sofort (der Fall „Server hängt, ich tippe einfach weiter“); ohne `interrupt` kommt `409`, wenn gerade eine Antwort läuft. Ältere Macs kennen `interrupt` nicht und antworten dann mit `409`; `404`, wenn ein Upload unbekannt oder abgelaufen ist. Höchstens 20 MB pro Anfrage.
 
 ### `POST /api/v1/stop`
 
@@ -167,7 +170,7 @@ Letzte Antwort neu generieren.
 {"approval": "AskAll", "thinking": false}
 ```
 
-Beide Felder sind optional.
+Beide Felder sind optional. `approval` wirkt sofort, auch auf eine laufende Antwort.
 
 ### `POST /api/v1/undo`
 
