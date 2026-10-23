@@ -196,7 +196,11 @@ impl ChatStore {
                 .as_bytes(),
         )?;
         // On disk before it replaces the old file: a power cut leaves a whole chat.
-        std::fs::File::open(&tmp).and_then(|f| f.sync_all())?;
+        // Opened for writing: Windows refuses to flush a file opened only for reading.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&tmp)
+            .and_then(|f| f.sync_all())?;
         std::fs::rename(&tmp, &path)?;
         Ok(ChatSummary {
             id: header.id,
