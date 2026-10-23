@@ -65,7 +65,7 @@ Hat Nemotron vor dem Fehler schon Dateien geändert, schreibt die App selbst (be
 
 **Lange Aufgaben:** Je länger ein Gespräch wird (viele gelesene Dateien), desto langsamer und schlechter antwortet der NVIDIA-Server – bis hin zu „timeout: receive response“. Deshalb schneidet die App nichts ab, sondern wechselt selbst den Chat: Ab etwa 60 000 Token (oder wenn NVIDIA bei einem längeren Gespräch nicht antwortet) schreibt Nemotron eine Übergabe-Notiz (Aufgabe, Erledigtes, Gefundenes, nächste Schritte), die App legt einen neuen Chat an – darin dein Auftrag samt Anhängen und die Notiz – und Nemotron macht dort von allein weiter. Der alte Chat bleibt unverändert in der Liste. Antwortet der Server auch für die Notiz nicht, schreibt die App ein Protokoll der letzten Schritte. Höchstens dreimal pro Auftrag; danach werden alte Werkzeugausgaben gekürzt. Kurze Aussetzer (Timeout, 429, 5xx) werden bis zu zweimal erneut versucht.
 
-**Chats** werden automatisch gespeichert und stehen links in der Chatliste (➕ Neuer Chat, anklicken zum Wechseln, 🗑 zum Löschen). Dieselbe Liste siehst du auf dem Handy.
+**Chats** werden automatisch gespeichert und stehen links in der Chatliste (➕ Neuer Chat, anklicken zum Wechseln, 🗑 zum Löschen). Die Liste ist eine **feste Seitenleiste**: Mit **☰** ganz links in der Kopfzeile (oder Strg/⌘+B) blendest du sie ein oder aus, sie behält ihre Breite und merkt sich, ob sie offen war. Dieselbe Liste siehst du auf dem Handy.
 
 Damit Nemotron wirklich ändert statt nur Beispielcode zu zeigen, bekommt er klare Anweisungen; zeigt er trotzdem einen größeren Codeblock ohne Änderung, fordert die App ihn einmal auf, die Änderung selbst einzutragen. Liegt im Projekt eine `AGENTS.md` oder `CLAUDE.md`, liest Nemotron sie als Projektregeln mit.
 
@@ -247,7 +247,7 @@ Die APK wird mit dem Schlüssel `android/app/fadis.keystore` signiert, der im Re
 | Datei | Inhalt |
 |---|---|
 | `src/main.rs` | Fenster, Icon, Wahl des Renderers (wgpu, bei Fehler OpenGL), `--selftest` |
-| `src/app.rs` | Zustand und Abläufe: Chat, Chatliste, Arbeitsordner, Freigaben, Änderungsliste, Einstellungen |
+| `src/app.rs` | Zustand und Abläufe: Chat, Chatliste (feste Seitenleiste, ☰), Arbeitsordner, Freigaben, Änderungsliste, Einstellungen |
 | `src/chats.rs` | Chats speichern, laden und löschen (samt Fotos und Videos) |
 | `src/widgets.rs` | Darstellung: Nachrichten, Werkzeug-Karten, Diffs, Anhänge |
 | `src/agent.rs` | Agent-Schleife: Modell fragen, Werkzeuge ausführen, Ergebnisse zurückgeben; System-Prompt |

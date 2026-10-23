@@ -1,6 +1,6 @@
 [package]
 name = "fadis-nemotron"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2024"
 rust-version = "1.95"
 description = "Desktop-Agent und Chat für NVIDIA Nemotron 3.5 Super VL"

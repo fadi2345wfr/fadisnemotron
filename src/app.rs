@@ -25,6 +25,10 @@ use crate::tools::{ApprovalMode, FileChange, SharedApproval, Workspace};
 use crate::widgets::{self, UiAction};
 
 /// What "Weitermachen" sends after an error stopped a run.
+/// The chat list on the left has this width, not more and not less.
+const CHAT_LIST_WIDTH: f32 = 232.0;
+/// The 🗑 button of a row in the chat list.
+const DELETE_BUTTON_WIDTH: f32 = 24.0;
 const CONTINUE_TEXT: &str = "Weiter: Mach genau dort weiter, wo du wegen des Fehlers aufgehört hast. Schau kurz nach, was schon erledigt ist, und mach nichts doppelt.";
 /// After this long without any sign of life from the server the window says
 /// that one can stop, or type on to go on at once.
@@ -482,6 +486,8 @@ pub struct NemotronApp {
     /// The microphone button was pressed: dictation starts once the input
     /// field has the focus (the next frame).
     dictation_pending: bool,
+    /// How wide the chat list was drawn last frame (a test watches it).
+    chat_list_width: f32,
     scroll_to_bottom: bool,
 }
 
@@ -587,6 +593,7 @@ impl NemotronApp {
             http: api::agent(),
             focus_input: true,
             dictation_pending: false,
+            chat_list_width: 0.0,
             scroll_to_bottom: false,
         }
     }
@@ -1560,14 +1567,18 @@ impl NemotronApp {
     // --------------------------------------------------------------- input
 
     fn handle_global_input(&mut self, ctx: &egui::Context) {
-        let (settings, new_chat, open_project, escape) = ctx.input_mut(|i| {
+        let (settings, new_chat, open_project, toggle_chats, escape) = ctx.input_mut(|i| {
             (
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::Comma)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::N)),
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::B)),
                 i.key_pressed(Key::Escape),
             )
         });
+        if toggle_chats {
+            self.toggle_chat_list();
+        }
         if settings {
             self.open_settings();
         }
@@ -2238,6 +2249,16 @@ impl NemotronApp {
         egui::Panel::top("kopfzeile").show(ui, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                if ui
+                    .add(egui::Button::selectable(self.settings.chat_list_open, "☰"))
+                    .on_hover_text(format!(
+                        "Chats ein- oder ausblenden ({}B)",
+                        crate::platform::command_key()
+                    ))
+                    .clicked()
+                {
+                    self.toggle_chat_list();
+                }
                 ui.label(RichText::new("Fadis Nemotron").strong().size(18.0).color(widgets::accent(ui)));
                 ui.label(RichText::new("Agent").small().strong().color(Color32::BLACK).background_color(widgets::accent(ui)))
                     .on_hover_text(if self.workspace.is_home() {
@@ -2297,16 +2318,23 @@ impl NemotronApp {
         });
     }
 
+    /// Shows or hides the list of chats on the left, and remembers it.
+    fn toggle_chat_list(&mut self) {
+        self.settings.chat_list_open = !self.settings.chat_list_open;
+        self.save_settings();
+    }
+
     /// Saved chats on the left; the phone shows the same list.
     fn chat_list(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let busy = self.active.is_some();
         let now = chats::now();
         let mut open: Option<String> = None;
         let mut new = false;
-        egui::Panel::left("chats")
-            .resizable(true)
-            .default_size(210.0)
-            .min_size(150.0)
+        // A fixed width: a panel that can be dragged is easily pushed to the
+        // right by accident, and rows that are a hair too wide make it grow.
+        let panel = egui::Panel::left("chats")
+            .resizable(false)
+            .exact_size(CHAT_LIST_WIDTH)
             .show(ui, |ui| {
                 ui.add_space(8.0);
                 new = ui
@@ -2333,11 +2361,15 @@ impl NemotronApp {
                         for (id, title, updated) in entries {
                             let selected = id == self.chat_id;
                             ui.horizontal(|ui| {
-                                let width = ui.available_width() - 26.0;
+                                // The title takes what the delete button leaves,
+                                // to the pixel, whatever the width of the symbols.
+                                let width = ui.available_width()
+                                    - ui.spacing().item_spacing.x
+                                    - DELETE_BUTTON_WIDTH;
                                 let label = ui
                                     .add_enabled_ui(!busy || selected, |ui| {
                                         ui.add_sized(
-                                            [width.max(60.0), 20.0],
+                                            [width.max(40.0), 20.0],
                                             egui::Button::selectable(
                                                 selected,
                                                 egui::RichText::new(&title),
@@ -2353,14 +2385,19 @@ impl NemotronApp {
                                 if label.clicked() && !selected {
                                     open = Some(id.clone());
                                 }
-                                if !(unsaved && selected)
-                                    && ui
-                                        .add_enabled(
-                                            !(busy && selected),
-                                            egui::Button::new("🗑").small().frame(false),
-                                        )
-                                        .on_hover_text("Chat löschen")
-                                        .clicked()
+                                if unsaved && selected {
+                                    // Nothing to delete yet; keep the row as wide as the others.
+                                    ui.add_space(DELETE_BUTTON_WIDTH);
+                                } else if ui
+                                    .add_enabled(
+                                        !(busy && selected),
+                                        egui::Button::new("🗑")
+                                            .small()
+                                            .frame(false)
+                                            .min_size(egui::vec2(DELETE_BUTTON_WIDTH, 20.0)),
+                                    )
+                                    .on_hover_text("Chat löschen")
+                                    .clicked()
                                 {
                                     self.delete_chat_confirm = Some(id.clone());
                                 }
@@ -2374,6 +2411,7 @@ impl NemotronApp {
                         }
                     });
             });
+        self.chat_list_width = panel.response.rect.width();
         if new {
             let _ = self.new_chat(ctx);
         }
@@ -3439,7 +3477,11 @@ impl eframe::App for NemotronApp {
 
         self.top_bar(ui, &ctx);
         self.composer(ui, &ctx);
-        self.chat_list(ui, &ctx);
+        if self.settings.chat_list_open {
+            self.chat_list(ui, &ctx);
+        } else {
+            self.chat_list_width = 0.0;
+        }
         self.project_panel(ui, &ctx);
         self.chat_area(ui, &ctx);
         self.settings_window(&ctx, full_rect);
@@ -4997,5 +5039,81 @@ mod tests {
             apply_event(&mut msg, e, &mut Vec::new());
         }
         assert_eq!(msg.steps[0].parts(), (None, "Schreib </think> nie so."));
+    }
+
+    /// Runs `frames` frames of the chat list in a window of the given size
+    /// and returns the width the list had in the last frame.
+    fn chat_list_width_after(app: &mut NemotronApp, ctx: &egui::Context, frames: usize) -> f32 {
+        for _ in 0..frames {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1040.0, 780.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                let ctx = ui.ctx().clone();
+                app.chat_list(ui, &ctx);
+            });
+            output.textures_delta.clear();
+        }
+        app.chat_list_width
+    }
+
+    #[test]
+    fn the_chat_list_keeps_its_width_instead_of_creeping_to_the_right() {
+        let mut app = NemotronApp::with_settings(Settings::default(), None);
+        app.chats = (0..12)
+            .map(|i| chats::ChatSummary {
+                id: format!("c-{i}"),
+                title: format!(
+                    "Ein ziemlich langer Titel für den Chat Nummer {i}, damit es eng wird"
+                ),
+                updated: chats::now(),
+                messages: 3,
+            })
+            .collect();
+        let ctx = egui::Context::default();
+        let first = chat_list_width_after(&mut app, &ctx, 3);
+        let later = chat_list_width_after(&mut app, &ctx, 60);
+        assert!(first > 100.0, "the list is drawn: {first}");
+        assert!(
+            (later - first).abs() < 0.5,
+            "the list grew from {first} to {later} px within 60 frames"
+        );
+    }
+
+    #[test]
+    fn the_chat_list_has_a_fixed_width_and_can_be_hidden() {
+        let dir = std::env::temp_dir().join(format!("fadis-sidebar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+        let mut app = NemotronApp::with_settings(Settings::default(), Some(path.clone()));
+        let ctx = egui::Context::default();
+        assert!(app.settings.chat_list_open, "shown at first");
+        let width = chat_list_width_after(&mut app, &ctx, 5);
+        assert!((width - CHAT_LIST_WIDTH).abs() < 0.5, "{width}");
+
+        // ☰ (or Ctrl+B) hides it; the choice survives a restart.
+        app.toggle_chat_list();
+        assert!(!app.settings.chat_list_open);
+        assert!(!Settings::load_from(&path).chat_list_open);
+        app.toggle_chat_list();
+        assert!(Settings::load_from(&path).chat_list_open);
+
+        // A window of any size and a chat list full of long titles change nothing.
+        app.chats = (0..30)
+            .map(|i| chats::ChatSummary {
+                id: format!("c-{i}"),
+                title: "W".repeat(10 + i * 5),
+                updated: chats::now(),
+                messages: 1,
+            })
+            .collect();
+        let again = chat_list_width_after(&mut app, &ctx, 20);
+        assert!((again - CHAT_LIST_WIDTH).abs() < 0.5, "{again}");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
