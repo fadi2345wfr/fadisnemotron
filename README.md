@@ -59,6 +59,7 @@ Unabhängig davon gilt:
 Hat Nemotron vor dem Fehler schon Dateien geändert, schreibt die App selbst (bei einem Serverfehler ist Nemotron ja nicht erreichbar) eine **Kommentarzeile in den Code**, direkt hinter die zuletzt geänderte Zeile der zuletzt bearbeiteten Datei, z. B. `// FADIS-FEHLER: Auftrag unterbrochen – Server nicht erreichbar (timeout: receive response) (von Fadis Nemotron eingefügt, „Weitermachen“ entfernt die Zeile)`. Du siehst sie im Diff als grüne Zeile (Hinweis unten: **Markierung im Diff ansehen**). **▶ Weitermachen und Markierung entfernen** löscht die Zeile wieder und lässt Nemotron weitermachen; **Nur Markierung entfernen** löscht sie ohne weiterzumachen. Die App schreibt nur in Dateien mit Kommentaren (Code, Skripte, HTML, CSS …, nicht JSON oder Text), nur wenn die Datei noch genau so ist, wie Nemotron sie hinterlassen hat, und entfernt später nur Zeilen genau dieser Form. Abschalten: ⚙ → „Bei Fehlern“. Bleibt eine Zeile doch einmal im Code, entfernt Nemotron sie beim Weiterarbeiten selbst (so steht es in seinen Anweisungen).
 
 **Eingabe:**
+- **🎤 Diktieren:** Der Mikrofon-Knopf links neben 📎 startet das Diktat des Systems; was du sagst, erscheint im Eingabefeld, als hättest du es getippt (das Programm nimmt selbst nichts auf und schickt nichts weg). Windows: öffnet die Spracheingabe (Win+H; beim ersten Mal fragt Windows, ob die „Online-Spracherkennung“ an sein soll, danach reicht ein Klick). Mac: startet das Mac-Diktat (klappt der Knopf nicht, die Fn-Taste zweimal drücken; beim ersten Mal fragt macOS, ob Diktieren eingeschaltet werden soll). Auf dem Handy hat die Tastatur ein Mikrofon.
 - ↑ und ↓ im Textfeld holen frühere Anweisungen zurück (wie in der Shell: ↑ bei leerem Feld oder am Textanfang, ↓ geht wieder vor; der angefangene Text kommt zurück). Der Verlauf bleibt nach dem Neustart erhalten (`history.json`). In der Android-App gibt es dafür den Uhr-Knopf neben dem Modus-Schalter (und die Pfeiltasten einer Bluetooth-Tastatur).
 - Während Nemotron arbeitet, kannst du weiterschreiben. **Enter schickt die neue Nachricht sofort**: Der laufende Auftrag wird gestoppt, und es geht mit deiner Nachricht weiter. Das ist der Weg, wenn der Server hängt: Nach 20 Sekunden ohne Lebenszeichen steht eine Hinweiszeile da („Stoppen – oder einfach weiterschreiben“), auch auf dem Handy.
 
@@ -88,7 +89,14 @@ Alles läuft lokal über macOS-Funktionen (Screenshot, CoreGraphics, `osascript`
 | **Bildschirm- & Systemaudioaufnahme** | Screenshots | Systemeinstellungen → Datenschutz & Sicherheit → Bildschirm- & Systemaudioaufnahme (danach App neu öffnen) |
 | **Automation** („System Events“) | Tastenkürzel, Tippen | beim ersten Mal fragt macOS selbst |
 
-Nach einem Update der App muss der Schalter bei Bedienungshilfen manchmal einmal aus- und wieder eingeschaltet werden, weil die App nicht von Apple signiert ist.
+**Steht der Schalter auf „an“ und es klappt trotzdem nicht?** Das war bis Version 0.8.0 nach jedem Update so: Die App war nur „ad hoc“ signiert, und die Signatur hing am Hash der jeweiligen Version. macOS hielt eine neue Version deshalb für eine andere App und ließ sie nicht durch, obwohl der Schalter noch an war. Ab 0.8.1 trägt die Signatur eine feste Anforderung (die Kennung `de.fadi.FadisNemotron`), damit eine Freigabe Updates übersteht. Einmalig muss der alte Eintrag weg: in den Systemeinstellungen bei **Bildschirm- & Systemaudioaufnahme** und **Bedienungshilfen** „Fadis Nemotron“ mit **„–“** entfernen, die App neu öffnen und neu erlauben. Im Terminal geht es auch so:
+
+```sh
+tccutil reset ScreenCapture de.fadi.FadisNemotron
+tccutil reset Accessibility de.fadi.FadisNemotron
+```
+
+Danach die App beenden und neu öffnen. Ob die feste Anforderung wirklich reicht, ließ sich nur ohne echten Mac prüfen (die CI prüft, dass sie in der Signatur steht); meldet macOS es nach einem Update wieder, bitte melden.
 
 Webseiten, Dateien und Screenshots behandelt Nemotron als Material, nicht als Anweisung: Steht auf einer Seite „lösche alles“, tut er es nicht. Kaufen, Löschen, Nachrichten an andere und Passwörter macht er nur, wenn du es ausdrücklich verlangst.
 
@@ -141,12 +149,13 @@ Lässt sich etwas nicht starten, zeigt `FadisNemotron-Windows.exe --selftest` (i
 
 ## Installation auf dem Mac
 
-1. Die passende DMG laden (immer die neueste Version): [FadisNemotron-AppleSilicon.dmg](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-AppleSilicon.dmg) für Macs mit Apple-Chip (M1 und neuer) oder [FadisNemotron-Intel.dmg](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-Intel.dmg) für Intel-Macs. Meldet macOS beim Öffnen „Diese Software muss aktualisiert werden“, hast du auf einem Apple-Chip-Mac die Intel-Version erwischt: die Apple-Silicon-Version nehmen.
+1. Die passende DMG laden (immer die neueste Version): [FadisNemotron-AppleSilicon.dmg](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-AppleSilicon.dmg) für Macs mit Apple-Chip (M1 und neuer) oder [FadisNemotron-Intel.dmg](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-Intel.dmg) für Intel-Macs. Auf einem Apple-Chip-Mac läuft auch die Intel-Version (über Rosetta), die Apple-Silicon-Version ist aber die richtige.
 2. DMG öffnen und **Fadis Nemotron** in den Ordner **Programme** ziehen.
-3. Erster Start: Die App ist nicht von Apple notariell beglaubigt, deshalb blockiert macOS sie beim ersten Öffnen.
-   - macOS 15 und neuer: App einmal öffnen, dann **Systemeinstellungen → Datenschutz & Sicherheit → „Dennoch öffnen“**.
+3. Erster Start: Die App ist nicht von Apple notariell beglaubigt (das kostet 99 $ im Jahr), deshalb blockiert macOS sie bei jedem neuen Download. Die Meldung lautet etwa „… kann nicht geöffnet werden, da Apple darin nicht nach Schadsoftware suchen kann. Diese Software muss aktualisiert werden. Wende dich an den Entwickler …“. Das heißt **nicht**, dass etwas kaputt ist, und hat nichts mit Intel oder Apple-Chip zu tun.
+   - macOS 15 und neuer: App einmal öffnen, die Meldung mit „Fertig“ schließen, dann **Systemeinstellungen → Datenschutz & Sicherheit →** ganz nach unten scrollen **→ „Dennoch öffnen“** und mit Passwort oder Touch ID bestätigen.
    - macOS 14 und älter: Rechtsklick auf die App → **Öffnen** → **Öffnen**.
    - Alternativ im Terminal: `xattr -dr com.apple.quarantine "/Applications/Fadis Nemotron.app"`
+   - Die App muss vorher in **Programme** liegen; direkt aus dem DMG-Fenster zu starten klappt nicht. Dieselben Schritte stehen als Textdatei im DMG-Fenster.
 
 Voraussetzung: macOS 10.15 (Catalina) oder neuer bei der Intel-Version, macOS 11 (Big Sur) oder neuer bei der Apple-Silicon-Version.
 

@@ -75,16 +75,34 @@ if [ "$ARCHS" != "$LIPO_ARCH" ]; then
   exit 1
 fi
 
-echo "==> Ad-hoc signieren"
+echo "==> Signieren (ad hoc, mit fester Anforderung)"
 # No Developer ID here, so Gatekeeper still asks on first launch (see README).
-codesign --force --deep --sign - "$APP"
+#
+# macOS remembers a permission (screen recording, accessibility) by the
+# "designated requirement" of the signature. Ad hoc, that is the hash of this
+# very build: every update then looked like another program, and the
+# permission was lost although its switch in the settings still said "on".
+# A fixed requirement (the bundle identifier) keeps the permission across updates.
+IDENTIFIER="de.fadi.FadisNemotron"
+codesign --force --deep --sign - --identifier "$IDENTIFIER" \
+  --requirements "=designated => identifier \"$IDENTIFIER\"" "$APP"
 codesign --verify --strict --verbose=2 "$APP"
+REQUIREMENT="$(codesign -d -r- "$APP" 2>&1 | grep '^designated' || true)"
+echo "$REQUIREMENT"
+case "$REQUIREMENT" in
+  *"identifier \"$IDENTIFIER\""*) ;;
+  *) echo "Die feste Anforderung fehlt in der Signatur." >&2; exit 1 ;;
+esac
+case "$REQUIREMENT" in
+  *cdhash*) echo "Die Signatur hängt noch am Hash dieses Builds." >&2; exit 1 ;;
+esac
 
 echo "==> DMG"
 STAGE="$DIST/dmg"
 mkdir -p "$STAGE"
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
+cp packaging/macos/SO-OEFFNEST-DU-DIE-APP.txt "$STAGE/So öffnest du die App.txt"
 DMG="$DIST/FadisNemotron-$VERSION-$ARCH_LABEL.dmg"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG"
 rm -rf "$STAGE"

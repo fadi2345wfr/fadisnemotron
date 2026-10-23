@@ -9,6 +9,7 @@ mod awake;
 mod chats;
 mod computer;
 mod config;
+mod dictation;
 mod history;
 mod markers;
 mod platform;

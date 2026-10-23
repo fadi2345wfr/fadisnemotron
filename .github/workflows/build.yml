@@ -227,6 +227,11 @@ jobs:
           app="$mnt/Fadis Nemotron.app"
           test -L "$mnt/Applications"
           test -f "$app/Contents/Resources/AppIcon.icns"
+          test -f "$mnt/So öffnest du die App.txt"
+          requirement="$(codesign -d -r- "$app" 2>&1)"
+          echo "$requirement"
+          grep -q 'designated => identifier "de.fadi.FadisNemotron"' <<< "$requirement"
+          if grep -q cdhash <<< "$requirement"; then echo "Signatur hängt noch am Hash" >&2; exit 1; fi
           test "$(wc -c < "$app/Contents/Resources/FadisNemotron.apk")" -gt 1000000
           cmp "$app/Contents/Resources/FadisNemotron.apk" build/apk/FadisNemotron-*.apk
           plutil -p "$app/Contents/Info.plist"

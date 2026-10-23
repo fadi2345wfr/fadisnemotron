@@ -479,6 +479,9 @@ pub struct NemotronApp {
     markdown: CommonMarkCache,
     http: ureq::Agent,
     focus_input: bool,
+    /// The microphone button was pressed: dictation starts once the input
+    /// field has the focus (the next frame).
+    dictation_pending: bool,
     scroll_to_bottom: bool,
 }
 
@@ -583,6 +586,7 @@ impl NemotronApp {
             markdown: CommonMarkCache::default(),
             http: api::agent(),
             focus_input: true,
+            dictation_pending: false,
             scroll_to_bottom: false,
         }
     }
@@ -2580,6 +2584,7 @@ impl NemotronApp {
             let mut stop = false;
             let mut pick = false;
             let mut add_url = false;
+            let mut dictate = false;
             let mut after_error = None;
             // An error ended the last answer: one click goes on from there.
             if let Some(error) = self.interrupted_by() {
@@ -2671,11 +2676,13 @@ impl NemotronApp {
                 let spacing = ui.spacing().item_spacing.x;
                 let working = self.active.is_some();
                 // 📎 and 🔗, Send, and Stop beside Send while Nemotron works.
-                let buttons = if working {
-                    34.0 + 34.0 + 96.0 + 96.0 + 4.0 * spacing
-                } else {
-                    34.0 + 34.0 + 96.0 + 3.0 * spacing
-                };
+                let microphone = if crate::dictation::available() { 34.0 + spacing } else { 0.0 };
+                let buttons = microphone
+                    + if working {
+                        34.0 + 34.0 + 96.0 + 96.0 + 4.0 * spacing
+                    } else {
+                        34.0 + 34.0 + 96.0 + 3.0 * spacing
+                    };
                 let input_width = (ui.available_width() - buttons).max(120.0);
                 // A long prompt scrolls inside the box instead of pushing the
                 // chat out of the window.
@@ -2709,6 +2716,12 @@ impl NemotronApp {
                     send = true;
                 }
 
+                if crate::dictation::available() {
+                    dictate = ui
+                        .add_sized([34.0, 34.0], egui::Button::new("🎤"))
+                        .on_hover_text(crate::dictation::hint())
+                        .clicked();
+                }
                 pick = ui
                     .add_sized([34.0, 34.0], egui::Button::new("📎"))
                     .on_hover_text("Bilder oder Videos anhängen (oder ins Fenster ziehen)")
@@ -2744,6 +2757,19 @@ impl NemotronApp {
             }
             if stop {
                 self.stop();
+            }
+            if dictate {
+                // What is said goes where the cursor is: first back into the
+                // input field, and the dictation starts a frame later.
+                self.focus_input = true;
+                self.dictation_pending = true;
+                ctx.request_repaint();
+            }
+            if self.dictation_pending && !self.focus_input {
+                self.dictation_pending = false;
+                if let Err(text) = crate::dictation::start() {
+                    self.notice = Some(Notice { text, error: true });
+                }
             }
             if pick {
                 self.pick_files(ctx);

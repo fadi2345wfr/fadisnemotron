@@ -1,6 +1,6 @@
 [package]
 name = "fadis-nemotron"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 rust-version = "1.95"
 description = "Desktop-Agent und Chat für NVIDIA Nemotron 3.5 Super VL"
@@ -51,6 +51,7 @@ windows-sys = { version = "0.61", features = [
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = { version = "0.25", features = ["highsierra"] }
+objc2 = "0.6"
 
 [target.'cfg(windows)'.build-dependencies]
 winresource = "0.1"
