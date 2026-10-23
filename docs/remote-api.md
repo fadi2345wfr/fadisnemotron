@@ -54,6 +54,7 @@ Liefert den ganzen sichtbaren Zustand. Ist `after` gleich der aktuellen Version,
   "version": 42,
   "busy": true,
   "stalled": false,
+  "error_marks": [],
   "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
   "thinking": true,
   "approval": "AutoEdits",
@@ -102,6 +103,7 @@ Liefert den ganzen sichtbaren Zustand. Ist `after` gleich der aktuellen Version,
 - `chat` ist der Chat, der gerade auf dem Mac (und damit auch auf dem Handy) offen ist; `messages` gehört zu ihm. `chats` listet alle gespeicherten Chats, neueste zuerst, höchstens 200. `updated` ist eine Unix-Zeit in Sekunden. Ein neuer, noch leerer Chat hat den Titel `"Neuer Chat"`.
 - `approval`: `AskAll` („Prüfen“ / Request Review: jeder Vorschlag wird mit ✓ oder ✗ entschieden), `AutoEdits` („Dateien frei“) oder `AutoAll` („Autonom“). Der Wert gilt sofort, auch für die laufende Antwort; wartende Vorschläge laufen weiter, wenn auf `AutoAll` gestellt wird. `allow_for_run` stellt ihn für den Rest des Auftrags auf `AutoAll`.
 - `busy` und `stalled`: `stalled` ist `true`, wenn die laufende Antwort seit über 20 Sekunden nichts gemeldet hat (kein Text, kein Werkzeug) und die App nicht auf eine Freigabe oder einen laufenden Befehl wartet. Dann hängt vermutlich der Server; das Handy zeigt den Hinweis „Stoppen oder einfach weitertippen“.
+- `error_marks`: Endet eine Antwort mit einem Fehler, nachdem Nemotron Dateien geändert hat, schreibt die Mac-App eine Kommentarzeile `FADIS-FEHLER: Auftrag unterbrochen – …` hinter die zuletzt geänderte Zeile der zuletzt bearbeiteten Datei (nur bei Dateitypen mit Kommentaren und nur, wenn die Datei noch so ist, wie Nemotron sie hinterlassen hat; abschaltbar in den Einstellungen). `error_marks` nennt die Dateien. `POST /api/v1/continue` entfernt die Zeilen wieder und lässt Nemotron weitermachen.
 - `continued_in` (an einer Antwort): Ist ein Chat zu lang geworden, macht Nemotron in einem neuen Chat weiter. Die letzte Antwort des alten Chats trägt dann die Id des neuen in `continued_in`; das Handy zeigt dort „Weiter im neuen Chat“ und öffnet ihn mit `open_chat`. Der Titel des neuen Chats beginnt mit „↪ “.
 - `status`: `streaming`, `done`, `cancelled`, `failed` (dann steht der Grund in `error`).
 - Werkzeug-`state`: `planned`, `awaiting_approval`, `running`, `done`, `declined`, `not_run`, `interrupted` (lief beim Stopp noch; kann teilweise ausgeführt sein). Bei `awaiting_approval` enthält `diff` die geplante Änderung und `warning` ggf. den Grund, warum nachgefragt wird (z. B. „ändert eine Datei außerhalb des Projektordners“ oder „läuft mit Administratorrechten“).
@@ -131,6 +133,10 @@ Wie Tippen und Senden in der Mac-App, im offenen Chat. `uploads` und `images` si
 ### `POST /api/v1/stop`
 
 Stoppt die laufende Antwort (wie der Stop-Knopf).
+
+### `POST /api/v1/continue`
+
+Nach einer Antwort, die mit einem Fehler endete (`status` `failed`): entfernt die Fehler-Markierungen (`error_marks`) aus dem Code und schickt Nemotron mit „Mach genau dort weiter, wo du wegen des Fehlers aufgehört hast“ weiter. `409`, wenn gerade eine Antwort läuft oder es nichts zum Weitermachen gibt. Ältere Macs kennen den Endpunkt nicht (`404`); das Handy schickt dann die Nachricht mit `send`.
 
 ### `POST /api/v1/decide`
 

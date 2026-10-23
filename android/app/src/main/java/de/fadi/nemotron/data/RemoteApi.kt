@@ -80,6 +80,16 @@ class RemoteApi(baseUrl: String, private val token: String, http: OkHttpClient) 
 
     suspend fun stop() = post("stop")
 
+    /**
+     * After an error: the Mac takes the error marks out of the code and goes
+     * on. An older Mac does not know this; then [fallback] text is sent.
+     */
+    suspend fun continueWork(fallback: String) = try {
+        post("continue")
+    } catch (e: RemoteException) {
+        if (e.status == 404) send(fallback) else throw e
+    }
+
     suspend fun decide(callId: String, decision: Decision) =
         post("decide", remoteJson.encodeToString(DecideRequest(callId, decision)))
 

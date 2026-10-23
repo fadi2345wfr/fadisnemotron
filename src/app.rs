@@ -19,6 +19,7 @@ use crate::awake;
 use crate::chats::{self, Chat, ChatStore, ChatSummary};
 use crate::config::Settings;
 use crate::history::InputHistory;
+use crate::markers;
 use crate::remote::{self, Command, RemoteServer, Reply};
 use crate::tools::{ApprovalMode, FileChange, SharedApproval, Workspace};
 use crate::widgets::{self, UiAction};
@@ -299,6 +300,14 @@ struct Notice {
     error: bool,
 }
 
+/// A comment line the app wrote into a file when an error stopped Nemotron
+/// there; "Weitermachen" removes it again.
+struct ErrorMark {
+    abs: PathBuf,
+    /// As shown to the user.
+    path: String,
+}
+
 /// The window that shows one file's change line by line (red: what went
 /// away, green: what came in) and undoes it from the same place, so that the
 /// result is seen right there.
@@ -373,6 +382,24 @@ impl DiffWindow {
     }
 }
 
+/// A few words for the mark in the code: the part of the error that says what went wrong.
+fn error_reason(error: &str) -> String {
+    let first = error
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or(error);
+    // "Verbindung zu https://… fehlgeschlagen: timeout: receive response"
+    let reason = first
+        .split("fehlgeschlagen: ")
+        .nth(1)
+        .map_or(first, |rest| rest);
+    if first.starts_with("Verbindung zu") {
+        format!("Server nicht erreichbar ({reason})")
+    } else {
+        reason.to_owned()
+    }
+}
+
 /// Added and removed lines of a unified diff.
 fn diff_stats(diff: &str) -> (usize, usize) {
     diff.lines().fold((0, 0), |(added, removed), line| {
@@ -431,6 +458,10 @@ pub struct NemotronApp {
     keep_awake: awake::KeepAwake,
     /// What was sent before, for ↑ and ↓ in the input field.
     history: InputHistory,
+    /// The files Nemotron changed during the request that runs (or ran last).
+    run_edits: Vec<FileChange>,
+    /// Error marks in the code that have not been removed yet.
+    error_marks: Vec<ErrorMark>,
     /// A run ended because the chat got too long: Nemotron's note for the new
     /// chat and the approval mode of that run.
     pending_handoff: Option<(String, ApprovalMode)>,
@@ -538,6 +569,8 @@ impl NemotronApp {
             remote_show_token: false,
             keep_awake: awake::KeepAwake::new(),
             history,
+            run_edits: Vec::new(),
+            error_marks: Vec::new(),
             pending_handoff: None,
             handoff_chain: 0,
             run_approval: None,
@@ -996,8 +1029,73 @@ impl NemotronApp {
         }
     }
 
-    /// "Weitermachen": a short message asks Nemotron to go on where the error
-    /// stopped it. Typed text and attachments stay in the input field.
+    /// An error ended the answer after Nemotron changed files: one comment
+    /// line, behind the last line it changed in the last file, says so. The
+    /// developer sees it in the diff; "Weitermachen" removes it. Only if the
+    /// file is still exactly as Nemotron left it and its type has comments.
+    fn mark_error_in_code(&mut self, error: &str) {
+        if !self.settings.mark_errors {
+            return;
+        }
+        let Some(last) = self.run_edits.last().cloned() else {
+            return;
+        };
+        if self.error_marks.iter().any(|m| m.abs == last.abs) {
+            return;
+        }
+        let Ok(current) = std::fs::read_to_string(&last.abs) else {
+            return;
+        };
+        if current != last.after {
+            return;
+        }
+        let Some(mark) = markers::marker_line(&last.abs, &error_reason(error)) else {
+            return;
+        };
+        let above = markers::lines_above_mark(last.before.as_deref(), &last.after);
+        let marked = markers::insert_mark(&current, above, &mark);
+        if std::fs::write(&last.abs, &marked).is_err() {
+            return;
+        }
+        // The mark is part of the change now, so Undo and the diff see it.
+        if let Some(tracked) = self.changes.iter_mut().find(|t| t.abs == last.abs) {
+            tracked.current = marked;
+            tracked.update_stats();
+        }
+        self.error_marks.push(ErrorMark {
+            abs: last.abs,
+            path: last.path,
+        });
+    }
+
+    /// Takes the marks out of the code again; returns how many lines went.
+    /// Only lines the app wrote are touched.
+    fn remove_error_marks(&mut self) -> usize {
+        let mut removed_total = 0;
+        for mark in std::mem::take(&mut self.error_marks) {
+            let Ok(content) = std::fs::read_to_string(&mark.abs) else {
+                continue;
+            };
+            let (cleaned, removed) = markers::remove_marks(&content);
+            if removed == 0 {
+                continue;
+            }
+            if std::fs::write(&mark.abs, &cleaned).is_err() {
+                self.error_marks.push(mark);
+                continue;
+            }
+            removed_total += removed;
+            if let Some(tracked) = self.changes.iter_mut().find(|t| t.abs == mark.abs) {
+                tracked.current = markers::remove_marks(&tracked.current).0;
+                tracked.update_stats();
+            }
+        }
+        removed_total
+    }
+
+    /// "Weitermachen": the marks leave the code, and a short message asks
+    /// Nemotron to go on where the error stopped it. Typed text and
+    /// attachments stay in the input field.
     fn continue_after_error(&mut self, ctx: &egui::Context) {
         if self.interrupted_by().is_none() {
             return;
@@ -1006,9 +1104,20 @@ impl NemotronApp {
             self.open_settings();
             return;
         }
+        let removed = self.remove_error_marks();
         self.messages
             .push(Message::user(CONTINUE_TEXT.to_owned(), Vec::new()));
-        self.notice = None;
+        self.notice = (removed > 0).then(|| Notice {
+            text: format!(
+                "{removed} Fehler-{} aus dem Code entfernt.",
+                if removed == 1 {
+                    "Markierung"
+                } else {
+                    "Markierungen"
+                }
+            ),
+            error: false,
+        });
         self.save_chat();
         self.handoff_chain = 0;
         self.start_request(ctx);
@@ -1124,6 +1233,7 @@ impl NemotronApp {
 
     fn start_request(&mut self, ctx: &egui::Context) {
         let history = self.api_history();
+        self.run_edits.clear();
         self.messages
             .push(Message::assistant(self.settings.thinking));
         self.scroll_to_bottom = true;
@@ -1251,6 +1361,7 @@ impl NemotronApp {
             self.messages.pop();
         }
         if self.messages.last().is_some_and(|m| m.role == Role::User) {
+            self.remove_error_marks();
             self.handoff_chain = 0;
             self.start_request(ctx);
         }
@@ -1307,9 +1418,20 @@ impl NemotronApp {
         }
         for change in &changes {
             self.record_change(change);
+            self.run_edits.push(change.clone());
         }
         if finished {
             self.active = None;
+            // An error after changes: say so in the code where it stopped.
+            if let Some(Message {
+                role: Role::Assistant,
+                status: Status::Failed(error),
+                ..
+            }) = self.messages.last()
+            {
+                let error = error.clone();
+                self.mark_error_in_code(&error);
+            }
             self.save_chat();
             if handoff.is_some() {
                 self.pending_handoff = handoff;
@@ -1634,6 +1756,16 @@ impl NemotronApp {
                 self.stop();
                 ok
             }
+            Command::Continue => {
+                if self.active.is_some() {
+                    return Err(busy());
+                }
+                if self.interrupted_by().is_none() {
+                    return Err((409, "Es gibt nichts zum Weitermachen.".into()));
+                }
+                self.continue_after_error(ctx);
+                ok
+            }
             Command::Decide { call_id, decision } => {
                 let waiting = self.active.is_some()
                     && self
@@ -1806,6 +1938,7 @@ impl NemotronApp {
         json!({
             "busy": self.active.is_some(),
             "stalled": self.stalled_for().is_some(),
+            "error_marks": self.error_marks.iter().map(|m| m.path.as_str()).collect::<Vec<_>>(),
             "model": self.settings.model,
             "thinking": self.settings.thinking,
             "approval": match self.current_mode() {
@@ -2439,18 +2572,55 @@ impl NemotronApp {
             if let Some(error) = self.interrupted_by() {
                 let first_line = error.lines().next().unwrap_or(error);
                 let short: String = first_line.chars().take(110).collect();
+                let marked: Vec<&str> = self.error_marks.iter().map(|m| m.path.as_str()).collect();
+                let first_marked = self
+                    .error_marks
+                    .first()
+                    .and_then(|m| self.changes.iter().position(|c| c.abs == m.abs));
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(ui.visuals().error_fg_color, format!("⚠ Unterbrochen: {short}"));
+                });
+                if !marked.is_empty() {
+                    ui.label(
+                        RichText::new(format!(
+                            "Der Fehler steht als Markierung im Code: {} (Zeile „{}“).",
+                            marked.join(", "),
+                            markers::MARK
+                        ))
+                        .small(),
+                    );
+                }
+                ui.horizontal_wrapped(|ui| {
+                    let go_on = if marked.is_empty() {
+                        "▶ Weitermachen"
+                    } else {
+                        "▶ Weitermachen und Markierung entfernen"
+                    };
                     if ui
-                        .add(egui::Button::new(RichText::new("▶ Weitermachen").strong().color(Color32::BLACK)).fill(widgets::ACCENT))
-                        .on_hover_text("Nemotron macht genau dort weiter, wo der Fehler ihn gestoppt hat.")
+                        .add(egui::Button::new(RichText::new(go_on).strong().color(Color32::BLACK)).fill(widgets::ACCENT))
+                        .on_hover_text("Nemotron macht genau dort weiter, wo der Fehler ihn gestoppt hat. Die Markierung verschwindet dabei aus dem Code.")
                         .clicked()
                     {
                         after_error = Some(UiAction::ContinueAfterError);
                     }
+                    if let Some(index) = first_marked
+                        && ui
+                            .button("Markierung im Diff ansehen")
+                            .on_hover_text("Zeigt die Datei Zeile für Zeile; die Markierung ist eine grüne Zeile.")
+                            .clicked()
+                    {
+                        after_error = Some(UiAction::ShowChange(index));
+                    }
+                    if !marked.is_empty()
+                        && ui
+                            .button("Nur Markierung entfernen")
+                            .clicked()
+                    {
+                        after_error = Some(UiAction::RemoveErrorMarks);
+                    }
                     if ui
                         .button("↻ Erneut versuchen")
-                        .on_hover_text("Fragt noch einmal. Bereits geänderte Dateien bleiben so.")
+                        .on_hover_text("Fragt noch einmal. Bereits geänderte Dateien bleiben so, die Markierung wird entfernt.")
                         .clicked()
                     {
                         after_error = Some(UiAction::Retry);
@@ -2665,6 +2835,13 @@ impl NemotronApp {
             UiAction::OpenSettings => self.open_settings(),
             UiAction::OpenPhoneSetup => self.remote_window = true,
             UiAction::ContinueAfterError => self.continue_after_error(ctx),
+            UiAction::RemoveErrorMarks => {
+                let removed = self.remove_error_marks();
+                self.notice = Some(Notice {
+                    text: format!("{removed} Fehler-Markierung(en) aus dem Code entfernt."),
+                    error: false,
+                });
+            }
             UiAction::OpenChat(id) => {
                 if let Err((_, e)) = self.open_chat(&id, ctx) {
                     self.notice = Some(Notice {
@@ -2919,6 +3096,10 @@ impl NemotronApp {
 
                     ui.label("Denkmodus");
                     ui.checkbox(&mut s.thinking, "an (Nemotron denkt vor der Antwort nach)");
+                    ui.end_row();
+
+                    ui.label("Bei Fehlern");
+                    ui.checkbox(&mut s.mark_errors, "Markierung in den Code schreiben (hinter die zuletzt geänderte Zeile; „Weitermachen“ entfernt sie)");
                     ui.end_row();
 
                     ui.label("Agent darf");
@@ -3712,6 +3893,153 @@ mod tests {
         assert!(requests[0].contains("Lies alles"), "the chat goes on");
         assert_eq!(app.messages[3].steps[0].content, "Gleich da.");
         assert!(app.stalled_for().is_none(), "nothing runs any more");
+    }
+
+    #[test]
+    fn an_error_after_a_change_leaves_a_mark_in_the_code_and_one_click_removes_it() {
+        use crate::api::tests::mock_server;
+        let dir = std::env::temp_dir().join(format!("fadis-mark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "fn a() {}\nfn zahl() -> u32 { 41 }\nfn b() {}\n").unwrap();
+        let edit = |text: &str| {
+            format!(
+                "data: {}\n\ndata: {}\n\ndata: {}\n\ndata: [DONE]\n\n",
+                json!({"choices":[{"delta":{"role":"assistant","content":""}}]}),
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"edit_file","arguments": json!({"path":"lib.rs","old_string":"41","new_string":text}).to_string()}}]}}]}),
+                json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+            )
+        };
+        let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"Fertig.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let (base_url, nvidia) = mock_server(vec![
+            ("200 OK", "text/event-stream", edit("42")),
+            // The server drops out right after the edit.
+            (
+                "401 Unauthorized",
+                "application/json",
+                r#"{"detail":"Server weg"}"#.to_owned(),
+            ),
+            ("200 OK", "text/event-stream", answer.to_owned()),
+        ]);
+        let settings = Settings {
+            base_url,
+            api_key: "k".into(),
+            approval: ApprovalMode::AutoAll,
+            ..Settings::default()
+        };
+        let mut app = NemotronApp::with_settings(settings, None);
+        app.workspace = Workspace::open(&dir).unwrap();
+        let ctx = egui::Context::default();
+        app.input = "Mach daraus 42".into();
+        app.send(&ctx);
+        let until = Instant::now() + Duration::from_secs(15);
+        while app.active.is_some() && Instant::now() < until {
+            app.poll_agent();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        // The edit stays, and one comment line stands right behind the changed line.
+        let text = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "fn zahl() -> u32 { 42 }", "{text}");
+        assert!(
+            lines[2].starts_with("// FADIS-FEHLER: Auftrag unterbrochen"),
+            "{text}"
+        );
+        assert_eq!(lines[3], "fn b() {}");
+        assert_eq!(app.error_marks.len(), 1);
+        assert!(app.interrupted_by().is_some());
+        assert_eq!(app.remote_snapshot()["error_marks"], json!(["lib.rs"]));
+        // The mark is part of the change: the diff shows it as a new line, and
+        // Undo still sees the file as Nemotron left it (it does not ask).
+        assert!(app.changes[0].diff().contains("+// FADIS-FEHLER"));
+        assert!(!app.needs_undo_confirm(&app.changes[0]));
+
+        // One click: the mark leaves the code, Nemotron goes on.
+        app.continue_after_error(&ctx);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(text, "fn a() {}\nfn zahl() -> u32 { 42 }\nfn b() {}\n");
+        assert!(app.error_marks.is_empty());
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| n.text.contains("1 Fehler-Markierung"))
+        );
+        assert!(!app.changes[0].diff().contains("FADIS-FEHLER"));
+        assert!(!app.needs_undo_confirm(&app.changes[0]));
+        while app.active.is_some() && Instant::now() < until {
+            app.poll_agent();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let requests = nvidia.join().unwrap();
+        assert!(requests[2].contains("wegen des Fehlers"));
+        assert_eq!(app.messages.last().unwrap().steps[0].content, "Fertig.");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn no_mark_without_a_change_in_a_file_with_comments_or_when_switched_off() {
+        let dir = std::env::temp_dir().join(format!("fadis-nomark-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json_file = dir.join("daten.json");
+        std::fs::write(&json_file, "{\"a\": 2}\n").unwrap();
+        let rust_file = dir.join("lib.rs");
+        std::fs::write(&rust_file, "fn a() {}\n").unwrap();
+        let mut app = NemotronApp::with_settings(Settings::default(), None);
+
+        // Nothing was changed in this run: nowhere to write.
+        app.mark_error_in_code("Server weg");
+        assert!(app.error_marks.is_empty());
+
+        // JSON has no comments: left alone.
+        app.run_edits.push(FileChange {
+            path: "daten.json".into(),
+            abs: json_file.clone(),
+            before: Some("{\"a\": 1}\n".into()),
+            after: "{\"a\": 2}\n".into(),
+        });
+        app.mark_error_in_code("Server weg");
+        assert!(app.error_marks.is_empty());
+        assert_eq!(std::fs::read_to_string(&json_file).unwrap(), "{\"a\": 2}\n");
+
+        // The file was changed by hand after Nemotron: not touched.
+        app.run_edits.push(FileChange {
+            path: "lib.rs".into(),
+            abs: rust_file.clone(),
+            before: Some("fn a() {}\n".into()),
+            after: "fn b() {}\n".into(),
+        });
+        app.mark_error_in_code("Server weg");
+        assert!(app.error_marks.is_empty());
+        assert_eq!(std::fs::read_to_string(&rust_file).unwrap(), "fn a() {}\n");
+
+        // As Nemotron left it, but the setting is off: not touched either.
+        std::fs::write(&rust_file, "fn b() {}\n").unwrap();
+        app.settings.mark_errors = false;
+        app.mark_error_in_code("Server weg");
+        assert!(app.error_marks.is_empty());
+        assert_eq!(std::fs::read_to_string(&rust_file).unwrap(), "fn b() {}\n");
+
+        // On: one mark, never two in the same file.
+        app.settings.mark_errors = true;
+        app.mark_error_in_code(
+            "Verbindung zu https://x/v1/chat/completions fehlgeschlagen: timeout: receive response",
+        );
+        app.mark_error_in_code("noch ein Fehler");
+        assert_eq!(app.error_marks.len(), 1);
+        let text = std::fs::read_to_string(&rust_file).unwrap();
+        assert_eq!(text.matches("FADIS-FEHLER").count(), 1);
+        assert!(
+            text.contains("Server nicht erreichbar (timeout: receive response)"),
+            "{text}"
+        );
+        // "Nur entfernen" works without going on.
+        assert_eq!(app.remove_error_marks(), 1);
+        assert_eq!(std::fs::read_to_string(&rust_file).unwrap(), "fn b() {}\n");
+        assert_eq!(app.remove_error_marks(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

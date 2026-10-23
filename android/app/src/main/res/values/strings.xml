@@ -52,6 +52,8 @@
     <string name="continue_in_new_chat">Weiter im neuen Chat</string>
     <string name="interrupted_by">⚠ Unterbrochen: %1$s</string>
     <string name="continue_work">▶ Weitermachen</string>
+    <string name="continue_work_and_clean">▶ Weitermachen und Markierung entfernen</string>
+    <string name="error_mark_in_code">Der Fehler steht als Markierung im Code: %1$s</string>
     <string name="try_again">↻ Erneut versuchen</string>
     <string name="undone_result">✓ Rückgängig gemacht – die Datei ist wieder auf dem Stand vor Nemotron.</string>
     <string name="diff_legend">Rot: was entfernt wurde · Grün: was stattdessen eingefügt wird</string>

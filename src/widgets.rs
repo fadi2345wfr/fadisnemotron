@@ -30,8 +30,10 @@ pub enum UiAction {
     OpenPhoneSetup,
     /// Open another chat, e.g. the one a too-long chat went on in.
     OpenChat(String),
-    /// Go on where an error stopped the answer.
+    /// Go on where an error stopped the answer (and take the error marks out of the code).
     ContinueAfterError,
+    /// Take the error marks out of the code without going on.
+    RemoveErrorMarks,
     /// Show a tracked change in the window where it can also be undone.
     ShowChange(usize),
     Copy(String),

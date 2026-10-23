@@ -54,6 +54,8 @@ Unabhängig davon gilt:
 
 **Fehler:** Endet ein Auftrag mit einem Fehler (rote Meldung, z. B. „Server nicht erreichbar“), steht über dem Eingabefeld ein Hinweis mit **▶ Weitermachen** (Nemotron macht mit einem Klick genau dort weiter, wo der Fehler ihn gestoppt hat) und **↻ Erneut versuchen**. Das gibt es auch in der Android-App.
 
+Hat Nemotron vor dem Fehler schon Dateien geändert, schreibt die App selbst (bei einem Serverfehler ist Nemotron ja nicht erreichbar) eine **Kommentarzeile in den Code**, direkt hinter die zuletzt geänderte Zeile der zuletzt bearbeiteten Datei, z. B. `// FADIS-FEHLER: Auftrag unterbrochen – Server nicht erreichbar (timeout: receive response) (von Fadis Nemotron eingefügt, „Weitermachen“ entfernt die Zeile)`. Du siehst sie im Diff als grüne Zeile (Hinweis unten: **Markierung im Diff ansehen**). **▶ Weitermachen und Markierung entfernen** löscht die Zeile wieder und lässt Nemotron weitermachen; **Nur Markierung entfernen** löscht sie ohne weiterzumachen. Die App schreibt nur in Dateien mit Kommentaren (Code, Skripte, HTML, CSS …, nicht JSON oder Text), nur wenn die Datei noch genau so ist, wie Nemotron sie hinterlassen hat, und entfernt später nur Zeilen genau dieser Form. Abschalten: ⚙ → „Bei Fehlern“. Bleibt eine Zeile doch einmal im Code, entfernt Nemotron sie beim Weiterarbeiten selbst (so steht es in seinen Anweisungen).
+
 **Eingabe:**
 - ↑ und ↓ im Textfeld holen frühere Anweisungen zurück (wie in der Shell: ↑ bei leerem Feld oder am Textanfang, ↓ geht wieder vor; der angefangene Text kommt zurück). Der Verlauf bleibt nach dem Neustart erhalten (`history.json`). In der Android-App gibt es dafür den Uhr-Knopf neben dem Modus-Schalter (und die Pfeiltasten einer Bluetooth-Tastatur).
 - Während Nemotron arbeitet, kannst du weiterschreiben. **Enter schickt die neue Nachricht sofort**: Der laufende Auftrag wird gestoppt, und es geht mit deiner Nachricht weiter. Das ist der Weg, wenn der Server hängt: Nach 20 Sekunden ohne Lebenszeichen steht eine Hinweiszeile da („Stoppen – oder einfach weiterschreiben“), auch auf dem Handy.
@@ -213,6 +215,7 @@ Die APK wird mit dem Schlüssel `android/app/fadis.keystore` signiert, der im Re
 | `src/config.rs` | Einstellungen laden und speichern |
 | `src/remote.rs` | Fernzugriff fürs Handy: kleiner HTTP-Server, Schlüssel, Kopplung, Installationsseite mit der Android-App |
 | `src/computer.rs` | Netz und Bildschirm: Websuche, Webseiten lesen, Screenshot, Maus, Tastatur |
+| `src/markers.rs` | Fehler-Markierungen im Code: Kommentarzeile je Dateityp schreiben und sicher wieder entfernen |
 | `src/awake.rs` | Mac wach halten (`caffeinate`), Schlaf bei zugeklapptem Deckel ein-/ausschalten |
 | `docs/remote-api.md` | Protokoll zwischen Mac-App und Android-App |
 | `android/` | Android-App (Kotlin, Jetpack Compose) |

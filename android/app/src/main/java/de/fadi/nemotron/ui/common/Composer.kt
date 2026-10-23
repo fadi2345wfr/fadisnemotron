@@ -70,6 +70,7 @@ fun Composer(
     onRemoveAttachment: (Attachment) -> Unit,
     busy: Boolean,
     interruptedBy: String?,
+    errorMarks: List<String>,
     onContinue: () -> Unit,
     onRetry: () -> Unit,
     stalled: Boolean,
@@ -107,7 +108,7 @@ fun Composer(
                 }
             }
             if (interruptedBy != null && !busy) {
-                InterruptedHint(interruptedBy, onContinue, onRetry)
+                InterruptedHint(interruptedBy, errorMarks, onContinue, onRetry)
             }
             if (busy && stalled) {
                 Text(
@@ -179,7 +180,12 @@ fun Composer(
 
 /** An error ended the last answer: one tap goes on where it stopped. */
 @Composable
-private fun InterruptedHint(error: String, onContinue: () -> Unit, onRetry: () -> Unit) {
+private fun InterruptedHint(
+    error: String,
+    marks: List<String>,
+    onContinue: () -> Unit,
+    onRetry: () -> Unit,
+) {
     Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
         Text(
             stringResource(R.string.interrupted_by, error),
@@ -188,8 +194,19 @@ private fun InterruptedHint(error: String, onContinue: () -> Unit, onRetry: () -
             maxLines = 3,
             overflow = TextOverflow.Ellipsis,
         )
+        if (marks.isNotEmpty()) {
+            Text(
+                stringResource(R.string.error_mark_in_code, marks.joinToString(", ")),
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 2,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
-            Button(onClick = onContinue) { Text(stringResource(R.string.continue_work)) }
+            Button(onClick = onContinue) {
+                Text(stringResource(if (marks.isEmpty()) R.string.continue_work else R.string.continue_work_and_clean))
+            }
             OutlinedButton(onClick = onRetry) { Text(stringResource(R.string.try_again)) }
         }
     }

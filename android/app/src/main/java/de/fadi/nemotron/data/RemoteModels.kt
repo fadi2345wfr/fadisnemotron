@@ -23,6 +23,8 @@ data class RemoteState(
     val busy: Boolean = false,
     /** Nemotron is working but has said nothing for a while: the server probably hangs. */
     val stalled: Boolean = false,
+    /** Files in which the Mac app wrote an error mark after an error stopped Nemotron. */
+    @SerialName("error_marks") val errorMarks: List<String> = emptyList(),
     val thinking: Boolean = true,
     val approval: ApprovalMode = ApprovalMode.AutoEdits,
     val workspace: Workspace? = null,

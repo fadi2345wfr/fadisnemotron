@@ -23,6 +23,8 @@ class RemoteModelsTest {
         )
 
         assertTrue(state.stalled)
+        assertEquals(emptyList<String>(), state.errorMarks)
+        assertEquals(listOf("src/lib.rs"), parse("""{"error_marks": ["src/lib.rs"]}""").errorMarks)
         assertEquals(ApprovalMode.AskAll, state.approval)
         assertEquals("c-20261023-101500-aa11", state.messages[0].continuedIn)
         assertNull(state.messages[1].continuedIn)

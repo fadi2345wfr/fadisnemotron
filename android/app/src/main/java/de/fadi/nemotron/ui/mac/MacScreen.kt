@@ -285,6 +285,7 @@ private fun Conversation(viewModel: MacViewModel, state: MacUiState, macName: St
         onRemoveAttachment = { viewModel.attachments.remove(it.key) },
         busy = remote?.busy == true,
         interruptedBy = remote?.interruptedBy,
+        errorMarks = remote?.errorMarks.orEmpty(),
         onContinue = viewModel::continueAfterError,
         onRetry = viewModel::retry,
         stalled = remote?.stalled == true,

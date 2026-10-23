@@ -284,7 +284,7 @@ class MacViewModel(
     }
 
     /** After an error stopped the answer: Nemotron goes on where it stopped. */
-    fun continueAfterError() = act { it.send(CONTINUE_TEXT) }
+    fun continueAfterError() = act { it.continueWork(CONTINUE_TEXT) }
 
     fun decide(callId: String, decision: Decision) {
         if (callId in _state.value.deciding) return

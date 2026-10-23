@@ -204,6 +204,30 @@ class RemoteApiTest {
     }
 
     @Test
+    fun `continuing after an error asks the Mac to clean its marks and go on`() = runBlocking {
+        answer()
+
+        api.continueWork(fallback = "Weiter")
+
+        val request = mac.takeRequest()
+        assertEquals("/api/v1/continue", request.url.encodedPath)
+        assertEquals(1, mac.requestCount)
+    }
+
+    @Test
+    fun `an older Mac without continue gets the message instead`() = runBlocking {
+        answer(404, """{"error": "Unbekannter Endpunkt."}""")
+        answer()
+
+        api.continueWork(fallback = "Weiter: Mach dort weiter")
+
+        assertEquals("/api/v1/continue", mac.takeRequest().url.encodedPath)
+        val second = mac.takeRequest()
+        assertEquals("/api/v1/send", second.url.encodedPath)
+        assertEquals("Weiter: Mach dort weiter", second.json()["text"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun `opens, deletes and starts chats`() = runBlocking {
         repeat(3) { answer() }
 

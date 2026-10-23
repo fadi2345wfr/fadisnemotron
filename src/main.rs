@@ -10,6 +10,7 @@ mod chats;
 mod computer;
 mod config;
 mod history;
+mod markers;
 mod remote;
 mod tools;
 mod widgets;

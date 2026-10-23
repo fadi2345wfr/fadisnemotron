@@ -12,8 +12,8 @@ android {
         applicationId = "de.fadi.nemotron"
         minSdk = 26
         targetSdk = 36
-        versionCode = 601
-        versionName = "0.6.1"
+        versionCode = 700
+        versionName = "0.7.0"
     }
 
     // One key for debug and release, so every build installs over the previous one.

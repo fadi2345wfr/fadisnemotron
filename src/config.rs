@@ -47,6 +47,9 @@ pub struct Settings {
     pub phone_setup_seen: bool,
     /// The Mac stays awake while remote access is on.
     pub keep_awake: bool,
+    /// An error that ends an answer after files were changed leaves one
+    /// comment line in the file Nemotron worked on (see markers.rs).
+    pub mark_errors: bool,
 }
 
 impl Default for Settings {
@@ -72,6 +75,7 @@ impl Default for Settings {
             remote_token: String::new(),
             phone_setup_seen: false,
             keep_awake: true,
+            mark_errors: true,
         }
     }
 }

@@ -72,6 +72,9 @@ pub enum Command {
         attachment: Attachment,
     },
     Stop,
+    /// Go on where an error stopped the answer (and take the error marks
+    /// out of the code).
+    Continue,
     Decide {
         call_id: String,
         decision: Decision,
@@ -991,6 +994,7 @@ fn parse_command(
             })
         }
         "/api/v1/stop" => Ok(Command::Stop),
+        "/api/v1/continue" => Ok(Command::Continue),
         "/api/v1/new_chat" => Ok(Command::NewChat),
         "/api/v1/open_chat" => Ok(Command::OpenChat {
             id: text("id").ok_or_else(|| error(400, "id fehlt"))?,
