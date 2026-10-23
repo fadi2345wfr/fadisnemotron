@@ -1,4 +1,4 @@
-//! Remote access for the Android app: a small HTTP/JSON server on the Mac
+//! Remote access for the Android app: a small HTTP/JSON server on the computer
 //! (protocol in docs/remote-api.md).
 //!
 //! The server runs on its own threads. It never touches the UI state itself:
@@ -13,7 +13,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex};
@@ -310,8 +310,9 @@ impl RemoteServer {
     }
 }
 
-/// The Android app that came with this Mac app: in the bundle's `Resources`
-/// folder (or next to the program, or named by `FADIS_APK`).
+/// The Android app that came with this program: in the Mac bundle's
+/// `Resources` folder, next to the program, named by `FADIS_APK`, or inside
+/// the program itself (the Windows exe).
 pub fn bundled_app_file() -> Option<PathBuf> {
     let named = std::env::var_os("FADIS_APK").map(PathBuf::from);
     let beside = std::env::current_exe().ok().and_then(|exe| {
@@ -323,7 +324,50 @@ pub fn bundled_app_file() -> Option<PathBuf> {
         .into_iter()
         .find(|p| p.is_file())
     });
-    named.filter(|p| p.is_file()).or(beside)
+    named
+        .filter(|p| p.is_file())
+        .or(beside)
+        .or_else(embedded_app_file)
+}
+
+/// The Android app inside this program (built with the `embed-apk` feature),
+/// written to a file in the user's data folder so the server can send it from
+/// there; `None` for a program built without it.
+fn embedded_app_file() -> Option<PathBuf> {
+    #[cfg(feature = "embed-apk")]
+    {
+        static APK: &[u8] = include_bytes!(env!(
+            "FADIS_APK_PATH",
+            "FADIS_APK_PATH must name the APK when building with --features embed-apk"
+        ));
+        let dirs = directories::ProjectDirs::from("de", "fadi", "FadisNemotron")?;
+        extract_app(APK, dirs.data_local_dir())
+    }
+    #[cfg(not(feature = "embed-apk"))]
+    {
+        None
+    }
+}
+
+/// Puts `bytes` into `dir/FadisNemotron.apk`, unless that file holds exactly
+/// them already (which is the usual case after the first start).
+#[cfg_attr(not(feature = "embed-apk"), allow(dead_code))]
+fn extract_app(bytes: &[u8], dir: &Path) -> Option<PathBuf> {
+    let target = dir.join(APP_FILE_NAME);
+    let current = |path: &Path| std::fs::read(path).is_ok_and(|have| have == bytes);
+    if current(&target) {
+        return Some(target);
+    }
+    std::fs::create_dir_all(dir).ok()?;
+    let temp = dir.join(format!("{APP_FILE_NAME}.{}.tmp", std::process::id()));
+    std::fs::write(&temp, bytes).ok()?;
+    if std::fs::rename(&temp, &target).is_err() {
+        // Another running copy may be sending the file just now; it is fine
+        // if that one is the same.
+        let _ = std::fs::remove_file(&temp);
+        return current(&target).then_some(target);
+    }
+    Some(target)
 }
 
 impl Drop for RemoteServer {
@@ -603,17 +647,18 @@ fn serve_public(stream: &TcpStream, head: &Head, shared: &Shared) -> bool {
 }
 
 fn install_page(has_app: bool) -> String {
+    let pc = crate::platform::computer();
     let steps = if has_app {
         format!(
             r#"<a class="knopf" href="/{APP_FILE_NAME}">Fadis Nemotron laden</a>
 <ol>
 <li>Tippe auf den grünen Knopf und lade die Datei.</li>
 <li>Öffne die geladene Datei. Fragt Android nach „Installieren aus dieser Quelle“, erlaube es einmal.</li>
-<li>Öffne die App und tippe auf „QR-Code scannen“. Scanne den Code im Fenster „Fernzugriff fürs Handy“ am Mac (Schritt 2).</li>
+<li>Öffne die App und tippe auf „QR-Code scannen“. Scanne den Code im Fenster „Fernzugriff fürs Handy“ am {pc} (Schritt 2).</li>
 </ol>"#
         )
     } else {
-        r#"<p>Diese Mac-App enthält die Android-App nicht. Lade sie hier:</p>
+        r#"<p>Dieses Programm enthält die Android-App nicht. Lade sie hier:</p>
 <a class="knopf" href="https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron.apk">FadisNemotron.apk von GitHub</a>"#
             .to_owned()
     };
@@ -630,9 +675,9 @@ a.knopf{{display:block;text-align:center;background:#76b900;color:#000;font-weig
 li{{margin:.5em 0}} small{{color:#9aa7b4}}
 </style></head><body><main>
 <h1>Fadis Nemotron aufs Handy</h1>
-<p>Die Android-App steuert den Mac: Aufträge, Antworten, Freigaben, Fotos und Videos.</p>
+<p>Die Android-App steuert den {pc}: Aufträge, Antworten, Freigaben, Fotos und Videos.</p>
 {steps}
-<small>Mac-App {}</small>
+<small>Fadis Nemotron {}</small>
 </main></body></html>"#,
         env!("CARGO_PKG_VERSION")
     )
@@ -654,7 +699,7 @@ fn send_app(stream: &TcpStream, shared: &Shared) {
             stream,
             404,
             "text/plain; charset=utf-8",
-            "Diese Mac-App enthält die Android-App nicht.".as_bytes(),
+            "Dieses Programm enthält die Android-App nicht.".as_bytes(),
         );
         return;
     };
@@ -704,7 +749,10 @@ fn route(
     if !authorized(head, &shared.token) {
         return error(
             401,
-            "Falscher oder fehlender Schlüssel. Koppel das Handy neu (QR-Code in der Mac-App).",
+            &format!(
+                "Falscher oder fehlender Schlüssel. Koppel das Handy neu (QR-Code in Fadis Nemotron am {}).",
+                crate::platform::computer()
+            ),
         );
     }
     *shared.last_seen.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -821,7 +869,10 @@ fn read_body(
     let Some(_reserved) = Reservation::take(budget, len) else {
         return Err(error(
             503,
-            "Der Mac nimmt gerade viele Daten an. Bitte kurz warten und noch einmal senden.",
+            &format!(
+                "Der {} nimmt gerade viele Daten an. Bitte kurz warten und noch einmal senden.",
+                crate::platform::computer()
+            ),
         ));
     };
     // curl and some libraries wait for this before they send a large body.
@@ -928,13 +979,16 @@ fn ask_app(
         deadline: Instant::now() + COMMAND_TIMEOUT,
     };
     if commands.send(request).is_err() {
-        return error(503, "Die Mac-App beendet gerade den Fernzugriff.");
+        return error(503, "Fadis Nemotron beendet gerade den Fernzugriff.");
     }
     wake();
     match answer.recv_timeout(COMMAND_TIMEOUT) {
         Ok(Ok(body)) => (200, body),
         Ok(Err((status, message))) => error(status, &message),
-        Err(_) => error(503, "Die Mac-App antwortet nicht. Ist sie geöffnet?"),
+        Err(_) => error(
+            503,
+            "Fadis Nemotron antwortet nicht. Ist das Programm geöffnet?",
+        ),
     }
 }
 
@@ -1095,7 +1149,7 @@ pub fn new_token() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
-/// The Mac's IPv4 addresses the phone can try, Tailscale first, then the
+/// This computer's IPv4 addresses the phone can try, Tailscale first, then the
 /// home network.
 pub fn local_addresses() -> Vec<Ipv4Addr> {
     let mut addrs: Vec<Ipv4Addr> = if_addrs::get_if_addrs()
@@ -1161,12 +1215,41 @@ pub fn device_name() -> String {
             }
         }
     }
-    "Mac".to_owned()
+    #[cfg(windows)]
+    if let Some(name) = crate::winsys::computer_name() {
+        return name;
+    }
+    crate::platform::computer().to_owned()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_embedded_app_is_written_once_and_replaced_when_it_differs() {
+        let dir = std::env::temp_dir().join(format!("fadis-apk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let first = extract_app(b"erste Version", &dir).unwrap();
+        assert_eq!(first, dir.join(APP_FILE_NAME));
+        assert_eq!(std::fs::read(&first).unwrap(), b"erste Version");
+        // Same bytes: the file is left alone.
+        let stamp = std::fs::metadata(&first).unwrap().modified().unwrap();
+        assert_eq!(extract_app(b"erste Version", &dir).unwrap(), first);
+        assert_eq!(
+            std::fs::metadata(&first).unwrap().modified().unwrap(),
+            stamp
+        );
+        // A new program version, or a damaged file: replaced.
+        extract_app(b"zweite Version", &dir).unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), b"zweite Version");
+        std::fs::write(&first, b"kaputt").unwrap();
+        extract_app(b"zweite Version", &dir).unwrap();
+        assert_eq!(std::fs::read(&first).unwrap(), b"zweite Version");
+        // No leftovers.
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     struct Client {
         base: String,

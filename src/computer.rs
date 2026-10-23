@@ -4,13 +4,15 @@
 //! pictures; it points with coordinates taken from the last picture and types
 //! through the keyboard, like a person at the Mac. On macOS the mouse goes
 //! through CoreGraphics, keys and UI elements through `osascript`, and
-//! screenshots through `screencapture`; elsewhere these actions answer with an
-//! error.
+//! screenshots through `screencapture`. On Windows everything goes through
+//! the Win32 functions in `winsys.rs`. Elsewhere these actions answer with
+//! an error.
 //!
-//! Nothing here builds a shell command or an AppleScript from text that came
-//! from the model or from a web page: such values are passed as arguments.
+//! Nothing here builds a shell command or a script from text that came from
+//! the model or from a web page: such values are passed as arguments, typed
+//! into the keyboard queue or put on the clipboard.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::LazyLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,7 +33,7 @@ const MAX_SEARCH_RESULTS: usize = 8;
 const MAX_SHOT_SIDE: f64 = 1568.0;
 /// Longer texts are pasted instead of typed key by key.
 const PASTE_FROM_CHARS: usize = 200;
-const NOT_ON_THIS_SYSTEM: &str = "Diese Aktion gibt es nur auf dem Mac.";
+const NOT_ON_THIS_SYSTEM: &str = "Diese Aktion gibt es nur auf dem Mac und unter Windows.";
 
 const ACCESSIBILITY_HELP: &str = "Fadis Nemotron darf den Mac noch nicht bedienen. Bitte in den Systemeinstellungen unter Datenschutz & Sicherheit → Bedienungshilfen „Fadis Nemotron“ einschalten (die Einstellungen sind geöffnet) und den Auftrag dann wiederholen. Nach einem Update der App muss der Schalter manchmal aus- und wieder eingeschaltet werden.";
 const SCREEN_RECORDING_HELP: &str = "Fadis Nemotron darf den Bildschirm noch nicht sehen. Bitte in den Systemeinstellungen unter Datenschutz & Sicherheit → Bildschirm- & Systemaudioaufnahme „Fadis Nemotron“ einschalten, die App danach beenden und neu öffnen, und den Auftrag wiederholen.";
@@ -200,6 +202,15 @@ fn require_mac() -> Result<(), String> {
     }
 }
 
+/// Screen, mouse and keyboard work on the Mac and under Windows.
+fn require_supported() -> Result<(), String> {
+    if cfg!(any(target_os = "macos", windows)) {
+        Ok(())
+    } else {
+        Err(NOT_ON_THIS_SYSTEM.to_owned())
+    }
+}
+
 /// Runs a command to its end, but not longer than `limit`: a dialog asking for
 /// a permission must not hang the agent.
 fn run_timeout(cmd: &mut Command, limit: Duration) -> Result<std::process::Output, String> {
@@ -221,7 +232,8 @@ fn run_timeout(cmd: &mut Command, limit: Duration) -> Result<std::process::Outpu
             let _ = child.kill();
             let _ = child.wait();
             return Err(format!(
-                "{program} hat nicht rechtzeitig geantwortet. Wartet der Mac auf eine Berechtigung? Dann bitte zustimmen und den Auftrag wiederholen."
+                "{program} hat nicht rechtzeitig geantwortet. Wartet der {} auf eine Berechtigung? Dann bitte zustimmen und den Auftrag wiederholen.",
+                crate::platform::computer()
             ));
         }
         std::thread::sleep(Duration::from_millis(30));
@@ -279,17 +291,7 @@ fn open_privacy_pane(pane: &str) {
 }
 
 fn open_in_browser(url: &str) {
-    let opener = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let _ = Command::new(opener)
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
+    crate::platform::open_address(url);
 }
 
 // -------------------------------------------------------------------- browser
@@ -320,6 +322,9 @@ fn run_browser(action: &str, args: &BrowserArgs) -> Result<String, String> {
         }
         "copy" | "clipboard" => clipboard(args.text.as_deref().filter(|t| !t.is_empty())),
         "click" => {
+            if cfg!(windows) {
+                return Err("clicking by name does not work on Windows: take a screenshot with computer_action and click the place in the picture".into());
+            }
             let target = args
                 .selector
                 .as_deref()
@@ -621,15 +626,9 @@ pub fn html_to_text(html: &str, max_chars: usize) -> String {
 }
 
 fn clipboard(text: Option<&str>) -> Result<String, String> {
-    require_mac()?;
+    require_supported()?;
     match text {
-        None => {
-            let out = run_timeout(&mut Command::new("pbpaste"), Duration::from_secs(5))?;
-            Ok(format!(
-                "Clipboard content:\n{}",
-                String::from_utf8_lossy(&out.stdout)
-            ))
-        }
+        None => Ok(format!("Clipboard content:\n{}", read_clipboard()?)),
         Some(text) => {
             set_clipboard(text)?;
             Ok(format!(
@@ -640,8 +639,19 @@ fn clipboard(text: Option<&str>) -> Result<String, String> {
     }
 }
 
+fn read_clipboard() -> Result<String, String> {
+    if cfg!(windows) {
+        return sys::clipboard_text();
+    }
+    let out = run_timeout(&mut Command::new("pbpaste"), Duration::from_secs(5))?;
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 fn set_clipboard(text: &str) -> Result<(), String> {
     use std::io::Write as _;
+    if cfg!(windows) {
+        return sys::set_clipboard_text(text);
+    }
     let mut child = Command::new("pbcopy")
         .stdin(Stdio::piped())
         .spawn()
@@ -665,7 +675,12 @@ fn focus_app(app: Option<&str>) -> Result<(), String> {
     let Some(app) = app.map(str::trim).filter(|a| !a.is_empty()) else {
         return Ok(());
     };
-    require_mac()?;
+    require_supported()?;
+    if cfg!(windows) {
+        sys::open_app(app)?;
+        std::thread::sleep(Duration::from_millis(900));
+        return Ok(());
+    }
     let status = Command::new("open")
         .arg("-a")
         .arg(app)
@@ -683,6 +698,9 @@ fn focus_app(app: Option<&str>) -> Result<(), String> {
 
 fn type_text(text: &str) -> Result<(), String> {
     if text.chars().count() <= PASTE_FROM_CHARS {
+        if cfg!(windows) {
+            return sys::type_text(text);
+        }
         osascript(
             &["tell application \"System Events\" to keystroke (item 2 of argv)"],
             &[text],
@@ -691,14 +709,16 @@ fn type_text(text: &str) -> Result<(), String> {
     }
     // Long texts: keystroke by keystroke is slow and drops characters. Paste,
     // then put back what was on the clipboard.
-    let before = run_timeout(&mut Command::new("pbpaste"), Duration::from_secs(5))
-        .map(|o| o.stdout)
-        .unwrap_or_default();
+    let before = read_clipboard().unwrap_or_default();
     set_clipboard(text)?;
-    let pasted = press(&parse_key("cmd+v")?);
+    let pasted = if cfg!(windows) {
+        parse_chord("ctrl+v").and_then(|chord| sys::press(&chord))
+    } else {
+        parse_key("cmd+v").and_then(|key| press(&key))
+    };
     std::thread::sleep(Duration::from_millis(400));
     if !before.is_empty() {
-        let _ = set_clipboard(&String::from_utf8_lossy(&before));
+        let _ = set_clipboard(&before);
     }
     pasted
 }
@@ -741,15 +761,14 @@ fn named_key_code(name: &str) -> Option<u16> {
     })
 }
 
-/// "cmd+shift+t", "enter", "f5": only known modifiers, named keys and single
-/// characters; anything else is refused instead of being typed as text.
-fn parse_key(spec: &str) -> Result<KeyPress, String> {
+/// Splits "cmd+shift+t" into the modifiers ("cmd+shift") and the key ("t").
+/// "+" itself, and "cmd++", are keys too.
+fn split_spec(spec: &str) -> Result<(&str, &str), String> {
     let spec = spec.trim();
     if spec.is_empty() {
         return Err("text is empty: give a key such as 'enter' or 'cmd+c'".into());
     }
-    // "+" itself, and "cmd++".
-    let (mods, key) = match spec.rsplit_once('+') {
+    Ok(match spec.rsplit_once('+') {
         Some((mods, "")) => match mods.strip_suffix('+') {
             Some(mods) => (mods, "+"),
             None if mods.is_empty() => ("", "+"),
@@ -757,7 +776,13 @@ fn parse_key(spec: &str) -> Result<KeyPress, String> {
         },
         Some((mods, key)) => (mods, key),
         None => ("", spec),
-    };
+    })
+}
+
+/// "cmd+shift+t", "enter", "f5": only known modifiers, named keys and single
+/// characters; anything else is refused instead of being typed as text.
+fn parse_key(spec: &str) -> Result<KeyPress, String> {
+    let (mods, key) = split_spec(spec)?;
     let mut modifiers = Vec::new();
     for m in mods.split('+').filter(|m| !m.is_empty()) {
         modifiers.push(match m.to_lowercase().as_str() {
@@ -797,6 +822,117 @@ fn parse_key(spec: &str) -> Result<KeyPress, String> {
     }
 }
 
+/// A modifier key of a Windows shortcut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum Modifier {
+    Ctrl,
+    Shift,
+    Alt,
+    Win,
+}
+
+impl Modifier {
+    /// The Windows virtual-key code.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn virtual_key(self) -> u16 {
+        match self {
+            Self::Shift => 0x10,
+            Self::Ctrl => 0x11,
+            Self::Alt => 0x12,
+            Self::Win => 0x5B,
+        }
+    }
+}
+
+/// The key of a Windows shortcut.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum Key {
+    /// A key with a name: Windows virtual-key code, and whether it is one of
+    /// the "extended" keys (arrows, Delete, Home …).
+    Virtual { code: u16, extended: bool },
+    /// A key that stands for a character.
+    Character(char),
+}
+
+/// Modifiers and a key, pressed together.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub struct Chord {
+    pub modifiers: Vec<Modifier>,
+    pub key: Key,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn named_virtual_key(name: &str) -> Option<(u16, bool)> {
+    Some(match name {
+        "return" | "enter" => (0x0D, false),
+        "tab" => (0x09, false),
+        "space" => (0x20, false),
+        "escape" | "esc" => (0x1B, false),
+        "backspace" => (0x08, false),
+        "delete" | "del" | "forwarddelete" => (0x2E, true),
+        "insert" | "ins" => (0x2D, true),
+        "up" => (0x26, true),
+        "down" => (0x28, true),
+        "left" => (0x25, true),
+        "right" => (0x27, true),
+        "home" => (0x24, true),
+        "end" => (0x23, true),
+        "pageup" => (0x21, true),
+        "pagedown" => (0x22, true),
+        "printscreen" => (0x2C, true),
+        _ => {
+            let number: u16 = name.strip_prefix('f')?.parse().ok()?;
+            if !(1..=12).contains(&number) {
+                return None;
+            }
+            (0x70 + number - 1, false)
+        }
+    })
+}
+
+/// "ctrl+shift+t", "enter", "f5", "win+d": the Windows counterpart of
+/// [`parse_key`]. Mac habits are understood: `cmd` means `ctrl` here.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_chord(spec: &str) -> Result<Chord, String> {
+    let (mods, key) = split_spec(spec)?;
+    let mut modifiers = Vec::new();
+    for m in mods.split('+').filter(|m| !m.is_empty()) {
+        let modifier = match m.to_lowercase().as_str() {
+            "ctrl" | "control" | "cmd" | "command" => Modifier::Ctrl,
+            "shift" => Modifier::Shift,
+            "alt" | "option" | "opt" => Modifier::Alt,
+            "win" | "windows" | "meta" | "super" => Modifier::Win,
+            other => {
+                return Err(format!(
+                    "unknown modifier '{other}' (use ctrl, shift, alt, win)"
+                ));
+            }
+        };
+        if !modifiers.contains(&modifier) {
+            modifiers.push(modifier);
+        }
+    }
+    if let Some((code, extended)) = named_virtual_key(&key.to_lowercase()) {
+        return Ok(Chord {
+            modifiers,
+            key: Key::Virtual { code, extended },
+        });
+    }
+    let mut chars = key.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Ok(Chord {
+            modifiers,
+            key: Key::Character(c),
+        }),
+        _ => Err(format!(
+            "unknown key '{key}'. Use a single character or one of: enter, tab, space, escape, backspace, delete, insert, up, down, left, right, home, end, pageup, pagedown, f1-f12 (with ctrl/shift/alt/win+ in front)."
+        )),
+    }
+}
+
 fn press(key: &KeyPress) -> Result<(), String> {
     let values: Vec<&str> = key.character.as_deref().into_iter().collect();
     osascript(&[key.script.as_str()], &values).map(|_| ())
@@ -821,14 +957,20 @@ pub fn computer_action(args: ComputerArgs, implied: Option<&str>, ws: &Workspace
 fn run_computer(action: &str, args: &ComputerArgs, ws: &Workspace) -> Result<ToolOutput, String> {
     match action {
         "screen_info" => {
-            require_mac()?;
+            require_supported()?;
             let (w, h) = sys::display_size();
+            let unit = if cfg!(windows) { "pixels" } else { "points" };
             let cursor = sys::mouse_position().map_or(String::new(), |(x, y)| {
-                format!(" Mouse pointer: x={x:.0}, y={y:.0} (points).")
+                format!(" Mouse pointer: x={x:.0}, y={y:.0} ({unit}).")
             });
+            if cfg!(windows) {
+                return Ok(ToolOutput::ok(format!(
+                    "Main display: {w:.0}x{h:.0} {unit}.{cursor} Windows needs no permission for screen or input; windows of programs running as administrator cannot be controlled."
+                )));
+            }
             let yes = |b: bool| if b { "yes" } else { "no" };
             Ok(ToolOutput::ok(format!(
-                "Main display: {w:.0}x{h:.0} points.{cursor} Permission to control the mac (Accessibility): {}. Permission to see the screen: {}.",
+                "Main display: {w:.0}x{h:.0} {unit}.{cursor} Permission to control the mac (Accessibility): {}. Permission to see the screen: {}.",
                 yes(sys::accessibility_allowed()),
                 yes(sys::screen_recording_allowed()),
             )))
@@ -847,13 +989,13 @@ fn run_computer(action: &str, args: &ComputerArgs, ws: &Workspace) -> Result<Too
             )))
         }
         "click" | "double_click" | "right_click" | "move" | "drag" | "scroll" => {
-            require_mac()?;
+            require_supported()?;
             ensure_accessibility()?;
             focus_app(args.app.as_deref())?;
             mouse_action(action, args)
         }
         "type" => {
-            require_mac()?;
+            require_supported()?;
             ensure_accessibility()?;
             let text = args
                 .text
@@ -868,11 +1010,18 @@ fn run_computer(action: &str, args: &ComputerArgs, ws: &Workspace) -> Result<Too
             )))
         }
         "key" => {
-            require_mac()?;
+            require_supported()?;
             ensure_accessibility()?;
-            let key = parse_key(args.text.as_deref().unwrap_or(""))?;
-            focus_app(args.app.as_deref())?;
-            press(&key)?;
+            let spec = args.text.as_deref().unwrap_or("");
+            if cfg!(windows) {
+                let chord = parse_chord(spec)?;
+                focus_app(args.app.as_deref())?;
+                sys::press(&chord)?;
+            } else {
+                let key = parse_key(spec)?;
+                focus_app(args.app.as_deref())?;
+                press(&key)?;
+            }
             Ok(ToolOutput::ok(format!(
                 "Pressed '{}'.",
                 args.text.as_deref().unwrap_or("").trim()
@@ -990,10 +1139,19 @@ pub struct Shot {
 /// `png` as captured (usually twice the points on a Retina screen), scaled to
 /// `points_w` x `points_h`, at most [`MAX_SHOT_SIDE`] on the long side.
 pub fn scale_screenshot(png: &[u8], points_w: f64, points_h: f64) -> Result<Shot, String> {
-    use image::imageops::{FilterType, resize};
     let picture = image::load_from_memory(png)
         .map_err(|e| format!("the screenshot could not be read: {e}"))?
         .to_rgb8();
+    scale_picture(picture, points_w, points_h)
+}
+
+/// [`scale_screenshot`] for a picture that is already decoded.
+pub fn scale_picture(
+    picture: image::RgbImage,
+    points_w: f64,
+    points_h: f64,
+) -> Result<Shot, String> {
+    use image::imageops::{FilterType, resize};
     if points_w < 1.0 || points_h < 1.0 {
         return Err("the screen size is unknown".into());
     }
@@ -1033,21 +1191,9 @@ fn private_dir() -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-fn screenshot(args: &ComputerArgs, ws: &Workspace) -> Result<ToolOutput, String> {
+/// The Mac's `screencapture`, scaled for the model.
+fn capture_with_screencapture(copy_to: Option<&Path>) -> Result<Shot, String> {
     require_mac()?;
-    if !sys::screen_recording_allowed() {
-        // Shows the system's own question the first time.
-        sys::request_screen_recording();
-        open_privacy_pane("Privacy_ScreenCapture");
-        return Err(SCREEN_RECORDING_HELP.to_owned());
-    }
-    // Where a copy for the user goes is checked first: only inside the working folder.
-    let copy_to = args
-        .path
-        .as_deref()
-        .filter(|p| !p.trim().is_empty())
-        .map(|p| ws.resolve(p))
-        .transpose()?;
     let file = private_dir()?.join(format!(
         "bildschirm-{}.png",
         std::time::SystemTime::now()
@@ -1071,12 +1217,46 @@ fn screenshot(args: &ComputerArgs, ws: &Workspace) -> Result<ToolOutput, String>
             ));
         }
     };
-    if let Some(dest) = &copy_to {
+    if let Some(dest) = copy_to {
         std::fs::write(dest, &png)
             .map_err(|e| format!("could not save the screenshot to {}: {e}", dest.display()))?;
     }
     let (points_w, points_h) = sys::display_size();
-    let shot = scale_screenshot(&png, points_w, points_h)?;
+    scale_screenshot(&png, points_w, points_h)
+}
+
+/// The Windows screen, scaled for the model.
+fn capture_with_win32(copy_to: Option<&Path>) -> Result<Shot, String> {
+    let picture = sys::capture_screen()?;
+    if let Some(dest) = copy_to {
+        picture
+            .save_with_format(dest, image::ImageFormat::Png)
+            .map_err(|e| format!("could not save the screenshot to {}: {e}", dest.display()))?;
+    }
+    let (width, height) = sys::display_size();
+    scale_picture(picture, width, height)
+}
+
+fn screenshot(args: &ComputerArgs, ws: &Workspace) -> Result<ToolOutput, String> {
+    require_supported()?;
+    if !sys::screen_recording_allowed() {
+        // Shows the system's own question the first time.
+        sys::request_screen_recording();
+        open_privacy_pane("Privacy_ScreenCapture");
+        return Err(SCREEN_RECORDING_HELP.to_owned());
+    }
+    // Where a copy for the user goes is checked first: only inside the working folder.
+    let copy_to = args
+        .path
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| ws.resolve(p))
+        .transpose()?;
+    let shot = if cfg!(windows) {
+        capture_with_win32(copy_to.as_deref())?
+    } else {
+        capture_with_screencapture(copy_to.as_deref())?
+    };
     SHOT_SCALE.store(shot.points_per_pixel.to_bits(), Ordering::Relaxed);
     let cursor = sys::mouse_position().map_or(String::new(), |(x, y)| {
         format!(
@@ -1110,6 +1290,9 @@ mod sys {
     use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
     use core_graphics::geometry::CGPoint;
     use std::time::Duration;
+
+    // Not needed on the Mac: it has its own ways (osascript, pbcopy, `open`).
+    pub use super::unsupported::*;
 
     #[link(name = "ApplicationServices", kind = "framework")]
     unsafe extern "C" {
@@ -1250,9 +1433,51 @@ mod sys {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+/// The Win32 calls, under the names the code above uses.
+#[cfg(windows)]
+mod sys {
+    pub use crate::winsys::{
+        capture_screen, click, clipboard_text, display_size, drag, glide_to, mouse_position,
+        open_app, press, scroll, set_clipboard_text, type_text,
+    };
+
+    pub fn accessibility_allowed() -> bool {
+        true
+    }
+    pub fn screen_recording_allowed() -> bool {
+        true
+    }
+    pub fn request_screen_recording() {}
+}
+
+#[cfg(not(windows))]
+mod unsupported {
+    use super::{Chord, NOT_ON_THIS_SYSTEM};
+
+    pub fn capture_screen() -> Result<image::RgbImage, String> {
+        Err(NOT_ON_THIS_SYSTEM.to_owned())
+    }
+    pub fn clipboard_text() -> Result<String, String> {
+        Err(NOT_ON_THIS_SYSTEM.to_owned())
+    }
+    pub fn set_clipboard_text(_: &str) -> Result<(), String> {
+        Err(NOT_ON_THIS_SYSTEM.to_owned())
+    }
+    pub fn type_text(_: &str) -> Result<(), String> {
+        Err(NOT_ON_THIS_SYSTEM.to_owned())
+    }
+    pub fn press(_: &Chord) -> Result<(), String> {
+        Err(NOT_ON_THIS_SYSTEM.to_owned())
+    }
+    pub fn open_app(_: &str) -> Result<(), String> {
+        Err(NOT_ON_THIS_SYSTEM.to_owned())
+    }
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
 mod sys {
     use super::NOT_ON_THIS_SYSTEM;
+    pub use super::unsupported::*;
 
     pub fn accessibility_allowed() -> bool {
         false
@@ -1480,7 +1705,47 @@ mod tests {
         assert_eq!(describe("read_file", &json!({"path": "a"})), None);
     }
 
-    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn windows_shortcuts_are_known_keys_and_understand_mac_habits() {
+        let chord = |spec: &str| parse_chord(spec).unwrap();
+        let vk = |code, extended| Key::Virtual { code, extended };
+        assert_eq!(
+            chord("ctrl+shift+t"),
+            Chord {
+                modifiers: vec![Modifier::Ctrl, Modifier::Shift],
+                key: Key::Character('t')
+            }
+        );
+        // cmd is what a Mac user means; here it is ctrl, and twice is once.
+        assert_eq!(chord("cmd+c").modifiers, vec![Modifier::Ctrl]);
+        assert_eq!(chord("cmd+ctrl+c").modifiers, vec![Modifier::Ctrl]);
+        assert_eq!(chord("win+d").modifiers, vec![Modifier::Win]);
+        assert_eq!(chord("Enter").key, vk(0x0D, false));
+        assert_eq!(chord("alt+F4").key, vk(0x73, false));
+        assert_eq!(chord("f1").key, vk(0x70, false));
+        assert_eq!(chord("f12").key, vk(0x7B, false));
+        assert_eq!(chord("delete").key, vk(0x2E, true));
+        assert_eq!(chord("backspace").key, vk(0x08, false));
+        assert_eq!(chord("ctrl+Right").key, vk(0x27, true));
+        assert_eq!(chord("ctrl++").key, Key::Character('+'));
+        assert_eq!(chord("+").key, Key::Character('+'));
+        assert_eq!(Modifier::Ctrl.virtual_key(), 0x11);
+        assert_eq!(Modifier::Win.virtual_key(), 0x5B);
+        for bad in [
+            "",
+            "ctrl+",
+            "ctrl+nope",
+            "hyper+x",
+            "f13",
+            "f0",
+            "ab",
+            r#"ctrl+"; calc; ""#,
+        ] {
+            assert!(parse_chord(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
     #[test]
     fn mac_only_actions_say_so_elsewhere() {
         let dir = std::env::temp_dir();

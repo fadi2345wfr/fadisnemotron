@@ -11,9 +11,14 @@ mod computer;
 mod config;
 mod history;
 mod markers;
+mod platform;
+mod powershell;
 mod remote;
+mod selftest;
 mod tools;
 mod widgets;
+#[cfg(windows)]
+mod winsys;
 
 use eframe::egui;
 
@@ -24,6 +29,22 @@ fn main() -> eframe::Result {
         tools::print_environment();
         return Ok(());
     }
+    if std::env::args().nth(1).as_deref() == Some(selftest::ARG) {
+        std::process::exit(if selftest::run_all() { 0 } else { 1 });
+    }
+    let renderer = renderer_from_env();
+    match run_window(renderer) {
+        // No usable graphics adapter (a virtual machine, an old driver):
+        // OpenGL often still works.
+        Err(eframe::Error::Wgpu(e)) if std::env::var_os("FADIS_RENDERER").is_none() => {
+            eprintln!("wgpu geht nicht ({e}); versuche OpenGL");
+            run_window(eframe::Renderer::Glow)
+        }
+        other => other,
+    }
+}
+
+fn run_window(renderer: eframe::Renderer) -> eframe::Result {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png"))
         .expect("Icon ist ein gültiges PNG");
     let options = eframe::NativeOptions {
@@ -34,7 +55,7 @@ fn main() -> eframe::Result {
             .with_min_inner_size([560.0, 420.0])
             .with_icon(icon)
             .with_drag_and_drop(true),
-        renderer: renderer_from_env(),
+        renderer,
         ..Default::default()
     };
     eframe::run_native(
@@ -44,8 +65,10 @@ fn main() -> eframe::Result {
     )
 }
 
-/// wgpu (Metal on macOS) is the default. `FADIS_RENDERER=glow` switches to
-/// OpenGL, e.g. for old Macs or virtual machines without Metal.
+/// wgpu (Metal on macOS, Direct3D on Windows) is the default.
+/// `FADIS_RENDERER=glow` switches to OpenGL, e.g. for old Macs or virtual
+/// machines without a graphics adapter; the program also falls back to it
+/// when wgpu finds no adapter.
 fn renderer_from_env() -> eframe::Renderer {
     match std::env::var("FADIS_RENDERER").as_deref() {
         Ok("glow" | "opengl" | "gl") => eframe::Renderer::Glow,

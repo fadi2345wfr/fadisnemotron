@@ -4,24 +4,24 @@
     <string name="nemotron">Nemotron</string>
 
     <!-- Pairing -->
-    <string name="pair_title">Mit dem Mac verbinden</string>
-    <string name="pair_step_remote">Am Mac in Fadis Nemotron oben auf das Handy-Symbol klicken und „Fernzugriff“ einschalten.</string>
-    <string name="pair_step_scan">Den QR-Code scannen, den der Mac dann zeigt.</string>
-    <string name="pair_step_tailscale">Für unterwegs: Tailscale auf Mac und Handy installieren und mit demselben Konto anmelden. Im WLAN zu Hause geht es auch ohne.</string>
+    <string name="pair_title">Mit dem PC verbinden</string>
+    <string name="pair_step_remote">Am PC in Fadis Nemotron oben auf das Handy-Symbol klicken und „Fernzugriff“ einschalten.</string>
+    <string name="pair_step_scan">Den QR-Code scannen, den der PC dann zeigt.</string>
+    <string name="pair_step_tailscale">Für unterwegs: Tailscale auf PC und Handy installieren und mit demselben Konto anmelden. Im WLAN zu Hause geht es auch ohne.</string>
     <string name="scan_qr">QR-Code scannen</string>
     <string name="scanner_failed">Der QR-Scanner ist nicht verfügbar. Er kommt über die Google-Play-Dienste und wird beim ersten Mal geladen – gleich noch einmal versuchen oder unten von Hand verbinden.</string>
     <string name="connecting">Verbinde …</string>
     <string name="pair_manual_title">Oder von Hand verbinden</string>
-    <string name="pair_address">Adresse des Macs</string>
+    <string name="pair_address">Adresse des PCs</string>
     <string name="pair_token">Schlüssel</string>
     <string name="connect">Verbinden</string>
 
     <!-- Chat -->
     <string name="connecting_to">Verbinde mit %1$s …</string>
-    <string name="connection_lost">Verbindung zum Mac unterbrochen – versuche erneut …</string>
+    <string name="connection_lost">Verbindung zum PC unterbrochen – versuche erneut …</string>
     <string name="check_again">Erneut prüfen</string>
     <string name="home_folder">Benutzerordner</string>
-    <string name="empty_home">Nemotron arbeitet auf deinem Mac. Schreib, was es tun soll – zum Beispiel „Leg auf dem Schreibtisch einen Ordner Rechnungen an“.</string>
+    <string name="empty_home">Nemotron arbeitet auf deinem PC. Schreib, was es tun soll – zum Beispiel „Leg auf dem Schreibtisch einen Ordner Rechnungen an“.</string>
     <string name="empty_project">Schreib, was Nemotron im Projekt tun soll – zum Beispiel „Bau das Projekt und behebe die Fehler“.</string>
     <string name="menu">Menü</string>
 
@@ -30,7 +30,7 @@
     <string name="new_chat">Neuer Chat</string>
     <string name="delete_chat">%1$s löschen</string>
     <string name="delete_chat_title">Chat löschen?</string>
-    <string name="delete_chat_text">„%1$s“ wird auf dem Mac endgültig gelöscht.</string>
+    <string name="delete_chat_text">„%1$s“ wird auf dem PC endgültig gelöscht.</string>
     <string name="delete">Löschen</string>
     <string name="retry">Neu generieren</string>
     <string name="changes_menu">Änderungen (%1$d)</string>
@@ -99,8 +99,8 @@
     <string name="activity_writing">schreibt …</string>
     <string name="failed">Fehlgeschlagen.</string>
     <string name="stopped">Gestoppt.</string>
-    <string name="cut_off">Die Antwort wurde bei „Max. Tokens“ abgeschnitten. Erhöhe den Wert in den Einstellungen am Mac.</string>
-    <string name="empty_answer">Keine Antwort erhalten. Erhöhe am Mac „Max. Tokens“ oder schalte den Denkmodus aus.</string>
+    <string name="cut_off">Die Antwort wurde bei „Max. Tokens“ abgeschnitten. Erhöhe den Wert in den Einstellungen am PC.</string>
+    <string name="empty_answer">Keine Antwort erhalten. Erhöhe am PC „Max. Tokens“ oder schalte den Denkmodus aus.</string>
     <string name="answer">Antwort</string>
     <string name="copy">Kopieren</string>
     <string name="jump_to_end">Zum Ende</string>

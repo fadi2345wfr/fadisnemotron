@@ -369,7 +369,7 @@ pub fn describe_http_error(status: u16, body: &str) -> String {
             || lower.contains("too long")
             || lower.contains("maximum model length") =>
         {
-            "Der Chat ist zu lang für das Kontextfenster. Starte einen neuen Chat (⌘N) oder senke „Max. Tokens“."
+            "Der Chat ist zu lang für das Kontextfenster. Starte einen neuen Chat oder senke „Max. Tokens“."
         }
         400 if needs_tool_parser(&detail) => {
             "Der Server kann keine Werkzeuge aufrufen. Starte vLLM mit --enable-auto-tool-choice --tool-call-parser qwen3_coder."

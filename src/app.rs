@@ -452,7 +452,7 @@ pub struct NemotronApp {
     remote_qr: Option<(String, egui::TextureHandle)>,
     /// QR code of the page the phone opens to load the app.
     install_qr: Option<(String, egui::TextureHandle)>,
-    /// The Android app came with this Mac app and is offered to phones.
+    /// The Android app came with this program and is offered to phones.
     apk_offered: bool,
     remote_show_token: bool,
     keep_awake: awake::KeepAwake,
@@ -783,12 +783,7 @@ impl NemotronApp {
     }
 
     fn reveal_in_file_manager(path: &Path) {
-        let opener = if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        };
-        let _ = std::process::Command::new(opener).arg(path).spawn();
+        crate::platform::open_folder(path);
     }
 
     /// Starts an empty chat. If the open one cannot be saved it stays open.
@@ -1722,7 +1717,10 @@ impl NemotronApp {
                 if self.needs_api_key() {
                     return Err((
                         400,
-                        "Am Mac ist noch kein NVIDIA-API-Schlüssel eingetragen.".into(),
+                        format!(
+                            "Am {} ist noch kein NVIDIA-API-Schlüssel eingetragen.",
+                            crate::platform::computer()
+                        ),
                     ));
                 }
                 self.prune_uploads();
@@ -1820,7 +1818,8 @@ impl NemotronApp {
                     return Err((
                         409,
                         format!(
-                            "{path} wurde inzwischen anders verändert. Bitte am Mac zurücksetzen und bestätigen."
+                            "{path} wurde inzwischen anders verändert. Bitte am {} zurücksetzen und bestätigen.",
+                            crate::platform::computer()
                         ),
                     ));
                 }
@@ -2043,7 +2042,7 @@ impl NemotronApp {
                     }
                     ui.vertical(|ui| {
                         if has_apk {
-                            ui.label("Scanne diesen Code mit der Kamera deines Android-Handys (gleiches WLAN wie der Mac).");
+                            ui.label(format!("Scanne diesen Code mit der Kamera deines Android-Handys (gleiches WLAN wie der {}).", crate::platform::computer()));
                             ui.label("Die Seite öffnet sich: „Fadis Nemotron laden“ tippen, die Datei öffnen und installieren. Android fragt einmal, ob es Installationen aus dieser Quelle erlauben soll – erlauben.");
                             if let Some(url) = &install_url {
                                 ui.label(RichText::new(format!("Oder im Handy-Browser öffnen: {url}")).monospace().small());
@@ -2054,7 +2053,7 @@ impl NemotronApp {
                                 ui.label(RichText::new("Noch nicht geladen. App schon installiert? Dann gleich weiter mit Schritt 2.").weak());
                             }
                         } else {
-                            ui.colored_label(ui.visuals().warn_fg_color, "Die Android-App steckt nur in der fertigen Mac-App (DMG), nicht in diesem Programm.");
+                            ui.colored_label(ui.visuals().warn_fg_color, "Die Android-App steckt nur in der fertigen Version (Windows-Exe oder Mac-DMG), nicht in diesem Programm.");
                             ui.hyperlink_to("FadisNemotron.apk von GitHub laden", APK_RELEASE_URL);
                             ui.label(RichText::new("Auf dem Handy öffnen und installieren, danach weiter mit Schritt 2.").weak());
                         }
@@ -2082,7 +2081,7 @@ impl NemotronApp {
                         }
                         ui.add_space(4.0);
                         ui.label(RichText::new("Unterwegs").strong());
-                        ui.label("Tailscale auf Mac und Handy installieren und bei beiden mit demselben Konto anmelden: dann klappt es überall, verschlüsselt, ohne Router-Einstellungen.");
+                        ui.label(format!("Tailscale auf {} und Handy installieren und bei beiden mit demselben Konto anmelden: dann klappt es überall, verschlüsselt, ohne Router-Einstellungen.", if cfg!(target_os = "macos") { "dem Mac" } else { "dem PC" }));
                         ui.hyperlink_to("tailscale.com/download", "https://tailscale.com/download");
                     });
                 });
@@ -2090,10 +2089,17 @@ impl NemotronApp {
                 ui.add_space(10.0);
                 ui.label(RichText::new("Im Hintergrund weiterlaufen").strong().size(16.0));
                 awake_changed = ui
-                    .checkbox(&mut self.settings.keep_awake, "Mac wach halten, solange der Fernzugriff an ist")
-                    .on_hover_text("Der Mac schläft nicht von selbst ein. Bildschirm aus und App im Hintergrund ist in Ordnung; wenn Nemotron arbeitet, bleibt auch der Bildschirm an, damit er ihn sehen kann.")
+                    .checkbox(&mut self.settings.keep_awake, format!("{} wach halten, solange der Fernzugriff an ist", crate::platform::computer()))
+                    .on_hover_text(format!("Der {} schläft nicht von selbst ein. Bildschirm aus und App im Hintergrund ist in Ordnung; wenn Nemotron arbeitet, bleibt auch der Bildschirm an, damit er ihn sehen kann.", crate::platform::computer()))
                     .changed();
-                if let Some(task) = &self.lid_task {
+                if cfg!(windows) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(RichText::new("Zugeklappter Laptop? In den Energieoptionen „Beim Zuklappen: Nichts unternehmen“ einstellen.").small().weak());
+                        if ui.small_button("Energieoptionen öffnen").clicked() {
+                            crate::platform::open_power_settings();
+                        }
+                    });
+                } else if let Some(task) = &self.lid_task {
                     let _ = task;
                     ui.label(RichText::new("Warte auf das Passwort …").weak());
                 } else {
@@ -2118,15 +2124,17 @@ impl NemotronApp {
                 if let Some(message) = &self.lid_message {
                     ui.colored_label(ui.visuals().error_fg_color, format!("⚠ {message}"));
                 }
-                ui.label(
-                    RichText::new(
-                        "Ein zugeklapptes MacBook schläft sonst immer ein – das kann keine App verhindern. \
-                         Mit dem Schalter wird es warm, wenn es im Rucksack steckt: danach wieder normal schlafen lassen. \
-                         Ohne Passwort geht es mit Netzteil, externem Bildschirm und Tastatur.",
-                    )
-                    .small()
-                    .weak(),
-                );
+                if !cfg!(windows) {
+                    ui.label(
+                        RichText::new(
+                            "Ein zugeklapptes MacBook schläft sonst immer ein – das kann keine App verhindern. \
+                             Mit dem Schalter wird es warm, wenn es im Rucksack steckt: danach wieder normal schlafen lassen. \
+                             Ohne Passwort geht es mit Netzteil, externem Bildschirm und Tastatur.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
 
                 ui.add_space(6.0);
                 egui::CollapsingHeader::new("Technik: Adressen, Schlüssel, Port").show(ui, |ui| {
@@ -2172,8 +2180,13 @@ impl NemotronApp {
                 ui.add_space(4.0);
                 ui.label(
                     RichText::new(
-                        "macOS fragt beim ersten Mal, ob eingehende Verbindungen erlaubt sind – „Erlauben“ wählen. \
-                         Nicht über eine Portfreigabe im Router ins Internet stellen; dafür ist Tailscale da.",
+                        if cfg!(windows) {
+                            "Windows fragt beim ersten Mal, ob die Firewall eingehende Verbindungen zulassen soll – „Zugriff zulassen“ für private Netzwerke wählen. \
+                             Nicht über eine Portfreigabe im Router ins Internet stellen; dafür ist Tailscale da."
+                        } else {
+                            "macOS fragt beim ersten Mal, ob eingehende Verbindungen erlaubt sind – „Erlauben“ wählen. \
+                             Nicht über eine Portfreigabe im Router ins Internet stellen; dafür ist Tailscale da."
+                        },
                     )
                     .small()
                     .weak(),
@@ -2231,7 +2244,7 @@ impl NemotronApp {
                 ui.hyperlink_to(RichText::new(&self.settings.model).small().weak(), widgets::MODEL_URL)
                     .on_hover_text("Modellseite auf build.nvidia.com öffnen");
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    if ui.button("⚙").on_hover_text("Einstellungen (⌘ ,)").clicked() {
+                    if ui.button("⚙").on_hover_text(format!("Einstellungen ({},)", crate::platform::command_key())).clicked() {
                         self.open_settings();
                     }
                     let phone = if self.remote.is_some() {
@@ -2254,11 +2267,11 @@ impl NemotronApp {
                     {
                         self.export_markdown();
                     }
-                    if ui.button("➕ Neuer Chat").on_hover_text("⌘ N").clicked() {
+                    if ui.button("➕ Neuer Chat").on_hover_text(format!("{}N", crate::platform::command_key())).clicked() {
                         let _ = self.new_chat(ctx);
                     }
                     if self.workspace.is_home()
-                        && ui.button("📁 Projekt öffnen").on_hover_text("Ordner wählen, in dem Nemotron arbeiten soll (⌘ O)").clicked()
+                        && ui.button("📁 Projekt öffnen").on_hover_text(format!("Ordner wählen, in dem Nemotron arbeiten soll ({}O)", crate::platform::command_key())).clicked()
                     {
                         self.pick_workspace(ctx);
                     }
@@ -2297,7 +2310,7 @@ impl NemotronApp {
                         [ui.available_width(), 28.0],
                         egui::Button::new("➕ Neuer Chat"),
                     )
-                    .on_hover_text("⌘ N")
+                    .on_hover_text(format!("{}N", crate::platform::command_key()))
                     .clicked();
                 ui.add_space(6.0);
                 egui::ScrollArea::vertical()
@@ -2438,7 +2451,7 @@ impl NemotronApp {
                     switch = ui
                         .add_enabled(!busy, egui::Button::new(if home { "Projekt öffnen" } else { "Wechseln" }))
                         .clicked();
-                    if ui.button("Im Finder").on_hover_text("Ordner im Dateimanager zeigen").clicked() {
+                    if ui.button(format!("Im {}", crate::platform::file_manager())).on_hover_text("Ordner im Dateimanager zeigen").clicked() {
                         Self::reveal_in_file_manager(&root);
                     }
                     if !home {

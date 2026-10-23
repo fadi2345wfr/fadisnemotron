@@ -1,6 +1,6 @@
 # Fernzugriff-Protokoll (Version 2)
 
-Die Mac-App bietet, wenn **Fernzugriff** eingeschaltet ist, eine kleine HTTP/JSON-Schnittstelle an. Die Android-App ist darüber eine zweite Oberfläche derselben App: Sie zeigt dieselben Chats, denselben Agenten und dieselben Freigaben wie der Mac. Standard-Port: `7878`.
+Das Programm (Windows-Exe oder Mac-App; im Folgenden „der Rechner“ und „die Mac-App“ für beide) bietet, wenn **Fernzugriff** eingeschaltet ist, eine kleine HTTP/JSON-Schnittstelle an. Die Android-App ist darüber eine zweite Oberfläche derselben App: Sie zeigt dieselben Chats, denselben Agenten und dieselben Freigaben wie der Rechner. Standard-Port: `7878`.
 
 Version 2 ergänzt gegenüber Version 1: gespeicherte Chats (`chat`, `chats`, `open_chat`, `delete_chat`), Uploads für Fotos und Videos (`upload`, `send.uploads`) und `workspace.home`.
 
@@ -25,7 +25,7 @@ Die Mac-App zeigt einen QR-Code mit diesem JSON:
 Ein Handy ohne App kennt den Schlüssel noch nicht. Deshalb liefert der Server zwei Adressen ohne Schlüssel aus, nur mit `GET`:
 
 - `GET /` (auch `/installieren`): eine kleine HTML-Seite mit dem Knopf „Fadis Nemotron laden“.
-- `GET /FadisNemotron.apk`: die Android-App aus dem Bundle der Mac-App (`Contents/Resources/FadisNemotron.apk`), als `application/vnd.android.package-archive`, Datei für Datei von der Platte gelesen. Fehlt sie, antwortet der Server `404`.
+- `GET /FadisNemotron.apk`: die Android-App, die im Programm steckt (Mac: im Bundle, `Contents/Resources/FadisNemotron.apk`; Windows: in der Exe eingebaut und beim Start nach `%LOCALAPPDATA%\fadi\FadisNemotron\FadisNemotron.apk` geschrieben), als `application/vnd.android.package-archive`, Datei für Datei von der Platte gelesen. Fehlt sie, antwortet der Server `404`.
 
 Alles andere, auch jedes `POST`, verlangt weiter den Schlüssel. Die Mac-App zeigt für `/` einen QR-Code (Schritt 1 im Fernzugriff-Fenster) und merkt sich, ob das Handy die Datei vollständig geladen hat.
 

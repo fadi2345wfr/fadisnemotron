@@ -17,7 +17,7 @@ class Prefs(context: Context) {
         get() {
             val url = prefs.getString(MAC_URL, null) ?: return null
             val token = prefs.getString(MAC_TOKEN, null) ?: return null
-            return Pairing(url, token, prefs.getString(MAC_NAME, null) ?: "Mac")
+            return Pairing(url, token, prefs.getString(MAC_NAME, null) ?: "PC")
         }
         set(value) = prefs.edit {
             if (value == null) {

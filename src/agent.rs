@@ -56,7 +56,7 @@ const SHORTENED_OUTPUT_CHARS: usize = 1_500;
 /// A step that comes out as unreadable text is asked again this many times.
 const MAX_GARBLED_RETRIES: usize = 2;
 const GARBLED_FAILURE: &str = "Nemotron liefert immer wieder unlesbaren Text. Das passiert vor allem, wenn sehr \
-     viel gelesen wurde oder der Chat sehr lang ist. Starte einen neuen Chat (⌘N) und teile die Aufgabe in \
+     viel gelesen wurde oder der Chat sehr lang ist. Starte einen neuen Chat und teile die Aufgabe in \
      kleinere Schritte, z. B. erst die Ordner auflisten und dann einzeln auswerten.";
 /// The text of the message that carries a screenshot to the model: tool results
 /// hold text only, so the picture follows them as a message of the "user".
@@ -149,7 +149,8 @@ pub fn system_prompt(user_instructions: &str, ws: &Workspace) -> String {
         "windows" => "Windows",
         other => other,
     };
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let shell = crate::tools::shell_label();
+    let machine = crate::platform::computer();
     let place = if ws.is_home() {
         format!(
             "You work directly on the user's computer, in their home folder {root} ({os}, shell {shell}, \
@@ -167,10 +168,18 @@ today is {today}). This includes their Downloads (~/Downloads), Desktop (~/Deskt
             today = today(),
         )
     };
+    let windows_rules = if cfg!(windows) {
+        "\n\n13. This is a Windows PC. run_command runs Windows PowerShell 5.1, not sh: use PowerShell commands \
+(Get-ChildItem, Select-String, Remove-Item, Copy-Item, Move-Item), chain them with \";\" (there is no \"&&\" or \"||\"), \
+and write paths in the Windows way or with \"/\". Shortcuts for computer_action use ctrl, not cmd (\"ctrl+c\", \
+\"alt+f4\", \"win+d\"). Windows of programs that run as administrator cannot be controlled."
+    } else {
+        ""
+    };
     let mut prompt = format!(
         "You are an agent inside the desktop app \"Fadis Nemotron\" on the user's computer. {place} With your \
     tools you can list, find, read and search files, create and change files, run commands, search the web and \
-    read web pages with browser_action, and use the whole Mac like a person with computer_action: you see the \
+    read web pages with browser_action, and use the whole {machine} like a person with computer_action: you see the \
     screen in screenshots and work it with mouse and keyboard (paths may be relative to that folder, absolute, or \
     start with ~/). What you do with the tools really happens on the user's \
     disk. Code that only appears in your reply is NOT saved anywhere and changes nothing. Never claim you have no \
@@ -207,17 +216,17 @@ unless the user asked for exactly that.
 folders, never touch anything else, also not with run_command.
 10. Web: use browser_action search to find things online and browser_action open to read a page (it also \
 opens in the user's browser). Read several results before you answer, and name the addresses.
-11. Operating the Mac like a person: use computer_action. First open_app for the app you need, then take a \
+11. Operating the {machine} like a person: use computer_action. First open_app for the app you need, then take a \
     screenshot and look at it. Click, type and press keys only where the picture shows them, with coordinates in \
     pixels of the last screenshot. After each step that changes the screen take a new screenshot and check that it \
     worked before the next step. Prefer the file tools and run_command for files and commands; use the screen for \
     what only the screen can do (apps, websites with logins, settings). Never type passwords or payment data on \
     your own, and never confirm purchases, deletions or messages to other people unless the user asked for it. If \
-the Mac says a permission is missing, tell the user which one and where to switch it on.
+the {machine} says a permission is missing, tell the user which one and where to switch it on.
 
 12. Lines that start with a comment sign and contain \"FADIS-FEHLER:\" were written by the app, not by the user: \
     they mark the place where an error (for example a server that could not be reached) stopped you earlier. When \
-you go on in that file, remove such a line with edit_file, and never copy it into other files.
+you go on in that file, remove such a line with edit_file, and never copy it into other files.{windows_rules}
 
 Your reply:
 - Always answer in the language the user writes in (German if the user writes German).

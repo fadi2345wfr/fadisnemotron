@@ -156,12 +156,12 @@ class RemoteApi(baseUrl: String, private val token: String, http: OkHttpClient) 
         const val LONG_POLL_SECONDS = 25
         const val BUSY = "Nemotron arbeitet noch."
         const val CHAT_NOT_FOUND = "Chat nicht gefunden."
-        const val MAC_TOO_OLD = "Die Mac-App ist zu alt – bitte auf Version 0.4 aktualisieren."
+        const val MAC_TOO_OLD = "Das Programm am PC ist zu alt – bitte auf Version 0.4 oder neuer aktualisieren."
         const val UNREACHABLE =
-            "Mac nicht erreichbar. Gleiches WLAN oder Tailscale prüfen – ist der Fernzugriff am Mac an?"
+            "PC nicht erreichbar. Gleiches WLAN oder Tailscale prüfen – ist der Fernzugriff am PC an?"
         const val UPLOAD_TOO_SLOW =
             "Das Hochladen dauert zu lange – die Verbindung ist zu langsam. Bitte ein kürzeres Video senden."
-        private const val UNREADABLE = "Die Antwort des Macs ist unverständlich. Sind beide Apps aktuell?"
+        private const val UNREADABLE = "Die Antwort des PCs ist unverständlich. Sind beide Apps aktuell?"
         private val JSON = "application/json; charset=utf-8".toMediaType()
     }
 }
@@ -186,12 +186,12 @@ private fun uploadFailure(name: String, e: IOException): String = when {
 /** Turns an HTTP error into a message; the Mac's own `{"error": …}` text wins where it makes sense. */
 private fun remoteError(status: Int, body: String): RemoteException {
     val message = when (status) {
-        401 -> "Falscher Schlüssel. Koppel das Handy neu: QR-Code in der Mac-App scannen."
+        401 -> "Falscher Schlüssel. Koppel das Handy neu: QR-Code im Programm am PC scannen."
         else -> errorText(body) ?: when (status) {
             409 -> RemoteApi.BUSY
-            413 -> "Zu groß für den Mac (Videos höchstens 100 MB)."
-            503 -> "Die Mac-App antwortet nicht. Ist sie geöffnet?"
-            else -> "Der Mac meldet Fehler $status."
+            413 -> "Zu groß für den PC (Videos höchstens 100 MB)."
+            503 -> "Fadis Nemotron am PC antwortet nicht. Ist das Programm geöffnet?"
+            else -> "Der PC meldet Fehler $status."
         }
     }
     return RemoteException(status, message)

@@ -318,7 +318,7 @@ class RemoteApiTest {
         assertEquals("README.md wurde inzwischen geändert. Bitte am Mac bestätigen.", undo.message)
         val stop = assertThrows(RemoteException::class.java) { runBlocking { api.stop() } }
         assertEquals(503, stop.status)
-        assertEquals("Die Mac-App antwortet nicht. Ist sie geöffnet?", stop.message)
+        assertEquals("Fadis Nemotron am PC antwortet nicht. Ist das Programm geöffnet?", stop.message)
     }
 
     @Test

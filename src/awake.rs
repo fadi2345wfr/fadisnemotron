@@ -1,8 +1,12 @@
-//! Keeps the Mac from falling asleep while the phone or an agent run needs it.
+//! Keeps the computer from falling asleep while the phone or an agent run
+//! needs it.
 //!
-//! macOS gives a program no way to stay awake with the lid shut except for
-//! `pmset disablesleep`, which needs the administrator password; that is a
-//! button the user presses on purpose, never something done silently.
+//! On the Mac that is `caffeinate`. macOS gives a program no way to stay awake
+//! with the lid shut except for `pmset disablesleep`, which needs the
+//! administrator password; that is a button the user presses on purpose,
+//! never something done silently. Windows has `SetThreadExecutionState`; what
+//! closing the lid does is a setting of the power plan, which the user
+//! changes in the system's settings.
 
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -54,6 +58,18 @@ impl KeepAwake {
         self.stop();
         self.level = level;
         self.gave_up = false;
+        self.start(level);
+    }
+
+    #[cfg(windows)]
+    fn start(&mut self, level: Awake) {
+        crate::winsys::keep_awake(level != Awake::No, level == Awake::Screen);
+        // Windows keeps the setting itself; there is nothing to watch.
+        self.gave_up = true;
+    }
+
+    #[cfg(not(windows))]
+    fn start(&mut self, level: Awake) {
         if level != Awake::No && cfg!(target_os = "macos") {
             self.child = Command::new("caffeinate")
                 .args(caffeinate_args(level, std::process::id()))
@@ -73,6 +89,10 @@ impl KeepAwake {
             let _ = child.kill();
             let _ = child.wait();
         }
+        #[cfg(windows)]
+        if self.level != Awake::No {
+            crate::winsys::keep_awake(false, false);
+        }
     }
 }
 
@@ -83,6 +103,7 @@ impl Drop for KeepAwake {
 }
 
 /// `-w` ties it to this program: if the app crashes, the Mac may sleep again.
+#[cfg(not(windows))]
 fn caffeinate_args(level: Awake, pid: u32) -> Vec<String> {
     let mut args = match level {
         Awake::Screen => vec!["-d", "-i", "-s"],
@@ -171,6 +192,7 @@ fn run_pmset(disabled: bool) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    #[cfg(not(windows))]
     #[test]
     fn caffeinate_is_tied_to_the_app_and_the_screen_only_when_needed() {
         assert_eq!(caffeinate_args(Awake::System, 42), ["-i", "-s", "-w", "42"]);

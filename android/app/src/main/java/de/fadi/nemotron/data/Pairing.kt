@@ -66,7 +66,7 @@ suspend fun connect(code: PairingCode, http: OkHttpClient): Pairing {
             continue
         }
         if (!ping.supported) throw RemoteException(null, RemoteApi.MAC_TOO_OLD)
-        return Pairing(url, code.token, ping.name.ifBlank { code.name.ifBlank { "Mac" } })
+        return Pairing(url, code.token, ping.name.ifBlank { code.name.ifBlank { "PC" } })
     }
     throw lastError ?: RemoteException(null, "Der QR-Code enthält keine gültige Adresse.")
 }

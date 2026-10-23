@@ -1,7 +1,8 @@
-name: Android APK (wird von macos-dmg.yml aufgerufen)
+name: Android APK (wird von build.yml aufgerufen)
 
-# Called by "Mac-App + Android-App" (macos-dmg.yml) before the DMG is built, so
-# that the DMG carries exactly this APK. Can also be started by hand.
+# Called by "Windows-Exe + Mac-App + Android-App" (build.yml) before the exe and
+# the DMG are built, so that they carry exactly this APK. Can also be started
+# by hand.
 on:
   workflow_call:
   workflow_dispatch:

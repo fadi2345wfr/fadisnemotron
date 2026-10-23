@@ -127,7 +127,7 @@ pub fn welcome(
                 }
             }
             None => {
-                ui.label(RichText::new("Nemotron arbeitet direkt auf deinem Mac").size(18.0).strong());
+                ui.label(RichText::new(format!("Nemotron arbeitet direkt auf deinem {}", crate::platform::computer())).size(18.0).strong());
                 ui.label("Er sieht deinen Benutzerordner – Downloads, Schreibtisch, Dokumente – legt Ordner und Dateien an, räumt auf und führt Befehle aus.");
                 ui.add_space(8.0);
                 for prompt in [
@@ -385,8 +385,8 @@ pub fn tool_title(tool: &ToolView) -> String {
             match (web, pending) {
                 (true, true) => format!("Möchte im Netz: {what}"),
                 (true, false) => format!("Netz: {what}"),
-                (false, true) => format!("Möchte am Mac: {what}"),
-                (false, false) => format!("Am Mac: {what}"),
+                (false, true) => format!("Möchte am {}: {what}", crate::platform::computer()),
+                (false, false) => format!("Am {}: {what}", crate::platform::computer()),
             }
         }
         other => format!("Werkzeug „{other}“"),
@@ -779,11 +779,14 @@ mod tests {
                 r#"{"action":"click","x":450,"y":720}"#,
                 ToolState::AwaitingApproval
             )),
-            "Möchte am Mac: click (450, 720)"
+            format!(
+                "Möchte am {}: click (450, 720)",
+                crate::platform::computer()
+            )
         );
         assert_eq!(
             tool_title(&view("screenshot", "{}", ToolState::Done)),
-            "Am Mac: screenshot"
+            format!("Am {}: screenshot", crate::platform::computer())
         );
         assert_eq!(
             tool_title(&view(
