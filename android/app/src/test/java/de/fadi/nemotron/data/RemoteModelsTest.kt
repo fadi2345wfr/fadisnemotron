@@ -1,0 +1,264 @@
+package de.fadi.nemotron.data
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+class RemoteModelsTest {
+
+    private fun parse(json: String): RemoteState = remoteJson.decodeFromString(json)
+
+    @Test
+    fun `knows a hanging server and the chat a long one went on in`() {
+        val state = parse(
+            """
+            {"busy": true, "stalled": true, "approval": "AskAll",
+             "messages": [
+               {"role": "assistant", "status": "done", "continued_in": "c-20261023-101500-aa11", "steps": []},
+               {"role": "assistant", "status": "done", "steps": []}
+             ]}
+            """,
+        )
+
+        assertTrue(state.stalled)
+        assertEquals(emptyList<String>(), state.errorMarks)
+        assertEquals(listOf("src/lib.rs"), parse("""{"error_marks": ["src/lib.rs"]}""").errorMarks)
+        assertEquals(ApprovalMode.AskAll, state.approval)
+        assertEquals("c-20261023-101500-aa11", state.messages[0].continuedIn)
+        assertNull(state.messages[1].continuedIn)
+        // Older Macs know neither field.
+        assertFalse(parse("""{"busy": true}""").stalled)
+    }
+
+    @Test
+    fun `parses the full example from the protocol description`() {
+        val state = parse(DOC_EXAMPLE)
+
+        assertEquals(42L, state.version)
+        assertTrue(state.busy)
+        assertTrue(state.thinking)
+        assertEquals(ApprovalMode.AutoEdits, state.approval)
+        assertEquals(Workspace("proj", "/Users/fadi/proj", home = false), state.workspace)
+        assertEquals(Notice("README.md wiederhergestellt.", error = false), state.notice)
+        assertEquals(OpenChat("c-20261022-104512-3f9a", "Ändere die README"), state.chat)
+        assertEquals(
+            listOf(
+                ChatSummary("c-20261022-104512-3f9a", "Ändere die README", updated = 1792658712, messages = 2),
+                ChatSummary("c-20261021-180301-b7c1", "Ordner auf dem Schreibtisch anlegen", updated = 1792605781, messages = 6),
+            ),
+            state.chats,
+        )
+        assertEquals(listOf(Change("README.md", added = 1, removed = 1, created = false)), state.changes)
+
+        val (user, assistant) = state.messages
+        assertTrue(user.isUser)
+        assertEquals("Ändere die README", user.text)
+        assertEquals(listOf("foto.jpg", "clip.mp4"), user.attachments)
+
+        assertFalse(assistant.isUser)
+        assertEquals(MessageStatus.Streaming, assistant.status)
+        assertNull(assistant.error)
+        assertNull(assistant.finishReason)
+        val step = assistant.steps.single()
+        assertEquals("Ich lese zuerst …", step.reasoning)
+        assertEquals("Markdown-Text", step.content)
+        val tool = step.tools.single()
+        assertEquals("chatcmpl-tool-1", tool.id)
+        assertEquals("edit_file", tool.name)
+        assertEquals("Bearbeitet: README.md", tool.title)
+        assertEquals(ToolState.Done, tool.state)
+        assertTrue(tool.ok)
+        assertEquals("Updated README.md (+1 -1 lines, 2 lines total).", tool.output)
+        assertTrue(tool.diff.startsWith("--- a/README.md\n+++ b/README.md"))
+        assertEquals(1, tool.added)
+        assertEquals(1, tool.removed)
+        assertNull(tool.warning)
+    }
+
+    @Test
+    fun `without a project Nemotron works in the home folder`() {
+        val state = parse(
+            """
+            {"version": 3, "busy": false, "approval": "AskAll", "messages": [],
+             "workspace": {"name": "fadi", "path": "/Users/fadi", "home": true},
+             "chat": {"id": "c-1", "title": "Neuer Chat"}, "chats": [{"id": "c-1", "title": "Neuer Chat", "updated": 1792658712, "messages": 0}]}
+            """,
+        )
+        assertEquals(Workspace("fadi", "/Users/fadi", home = true), state.workspace)
+        assertEquals(ApprovalMode.AskAll, state.approval)
+        assertEquals("c-1", state.chat?.id)
+        assertEquals(listOf("c-1"), state.chats.map { it.id })
+        assertTrue(state.messages.isEmpty())
+    }
+
+    @Test
+    fun `an older Mac app without chats still parses`() {
+        val state = parse("""{"version": 3, "workspace": {"name": "proj", "path": "/Users/fadi/proj"}, "messages": []}""")
+        assertNull(state.chat)
+        assertTrue(state.chats.isEmpty())
+        assertFalse(state.workspace!!.home)
+    }
+
+    @Test
+    fun `chat entries fall back to defaults`() {
+        val state = parse(
+            """{"chat": null, "chats": [{"id": "c-2", "title": null, "updated": null, "pinned": true}, {"title": "ohne Zeit"}]}""",
+        )
+        assertNull(state.chat)
+        assertEquals(ChatSummary("c-2", "", updated = 0, messages = 0), state.chats[0])
+        assertEquals("ohne Zeit", state.chats[1].title)
+    }
+
+    @Test
+    fun `skips unknown fields and unknown enum values`() {
+        val state = parse(
+            """
+            {"version": 7, "approval": "SomethingNew", "theme": "dark", "workspace": {"name": "x", "path": "/x", "git": true},
+             "messages": [{"role": "assistant", "status": "paused", "mood": 1,
+               "steps": [{"content": "Hallo", "tools": [{"id": "t1", "name": "browse", "state": "teleporting", "eta": 3}]}]}]}
+            """,
+        )
+        assertEquals(7L, state.version)
+        assertEquals(ApprovalMode.AutoEdits, state.approval)
+        assertEquals("x", state.workspace?.name)
+        val message = state.messages.single()
+        assertEquals(MessageStatus.Done, message.status)
+        val tool = message.steps.single().tools.single()
+        assertEquals(ToolState.Planned, tool.state)
+        assertEquals("browse", tool.name)
+    }
+
+    @Test
+    fun `missing and null values fall back to defaults`() {
+        // The Mac publishes an empty object until its window has drawn once.
+        val empty = parse("""{"version": 1}""")
+        assertEquals(1L, empty.version)
+        assertFalse(empty.busy)
+        assertNull(empty.notice)
+        assertTrue(empty.changes.isEmpty())
+
+        val state = parse(
+            """
+            {"messages": [{"role": "assistant", "status": "failed", "error": "HTTP 401", "notices": null,
+               "steps": [{"reasoning": null, "content": null, "tools": [{"id": "c", "state": "running", "ok": null,
+               "output": null, "diff": null, "added": null, "warning": "löscht Dateien"}]}]}]}
+            """,
+        )
+        val message = state.messages.single()
+        assertEquals(MessageStatus.Failed, message.status)
+        assertEquals("HTTP 401", message.error)
+        assertTrue(message.notices.isEmpty())
+        val step = message.steps.single()
+        assertEquals("", step.reasoning)
+        assertEquals("", step.content)
+        val tool = step.tools.single()
+        assertEquals(ToolState.Running, tool.state)
+        assertTrue(tool.ok)
+        assertEquals("", tool.output)
+        assertEquals(0, tool.added)
+        assertEquals("löscht Dateien", tool.warning)
+    }
+
+    @Test
+    fun `tool states and decisions use the protocol names`() {
+        val names = listOf("planned", "awaiting_approval", "running", "done", "declined", "not_run", "interrupted")
+        val states = names.map { remoteJson.decodeFromString<Tool>("""{"state": "$it"}""").state }
+        assertEquals(ToolState.entries.toList(), states)
+        assertEquals("\"allow_for_run\"", remoteJson.encodeToString(Decision.AllowForRun))
+    }
+
+    @Test
+    fun `thinking is split from the answer`() {
+        assertEquals("Plan" to "Antwort", thinkingAndAnswer("  Plan ", "Antwort"))
+        assertEquals("Plan" to "Antwort", thinkingAndAnswer("", "<think>\nPlan\n</think>\n\nAntwort"))
+        assertEquals("Plan" to "Antwort", thinkingAndAnswer("", "Plan</think>Antwort"))
+        assertEquals("noch am Denken" to "", thinkingAndAnswer("", "<think>noch am Denken"))
+        assertEquals("" to "Nur Antwort", thinkingAndAnswer("", "Nur Antwort"))
+    }
+
+    private companion object {
+        // Verbatim from docs/remote-api.md.
+        const val DOC_EXAMPLE = """
+{
+  "version": 42,
+  "busy": true,
+  "model": "nvidia/nemotron-3.5-super-vl-120b-a12b",
+  "thinking": true,
+  "approval": "AutoEdits",
+  "workspace": {"name": "proj", "path": "/Users/fadi/proj", "home": false},
+  "notice": {"text": "README.md wiederhergestellt.", "error": false},
+  "chat": {"id": "c-20261022-104512-3f9a", "title": "Ändere die README"},
+  "chats": [
+    {"id": "c-20261022-104512-3f9a", "title": "Ändere die README", "updated": 1792658712, "messages": 2},
+    {"id": "c-20261021-180301-b7c1", "title": "Ordner auf dem Schreibtisch anlegen", "updated": 1792605781, "messages": 6}
+  ],
+  "changes": [{"path": "README.md", "added": 1, "removed": 1, "created": false}],
+  "messages": [
+    {"role": "user", "text": "Ändere die README", "attachments": ["foto.jpg", "clip.mp4"]},
+    {
+      "role": "assistant",
+      "status": "streaming",
+      "error": null,
+      "finish_reason": null,
+      "notices": [],
+      "steps": [
+        {
+          "reasoning": "Ich lese zuerst …",
+          "content": "Markdown-Text",
+          "tools": [
+            {
+              "id": "chatcmpl-tool-1",
+              "name": "edit_file",
+              "title": "Bearbeitet: README.md",
+              "state": "done",
+              "ok": true,
+              "output": "Updated README.md (+1 -1 lines, 2 lines total).",
+              "diff": "--- a/README.md\n+++ b/README.md\n…",
+              "added": 1,
+              "removed": 1,
+              "warning": null
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
+"""
+    }
+}
+
+class InterruptedByTest {
+    private fun parse(json: String): RemoteState = remoteJson.decodeFromString(json)
+
+    @Test
+    fun `offers to go on only when an error ended the last answer and nothing runs`() {
+        val failed = """
+            {"busy": false, "messages": [
+              {"role": "user", "text": "Lies alles"},
+              {"role": "assistant", "status": "failed",
+               "error": "Verbindung zu https://integrate.api.nvidia.com/v1/chat/completions fehlgeschlagen: timeout: receive response\nweitere Zeile",
+               "steps": []}
+            ]}
+        """
+        assertEquals(
+            "Verbindung zu https://integrate.api.nvidia.com/v1/chat/completions fehlgeschlagen: timeout: receive response",
+            parse(failed).interruptedBy,
+        )
+        // Working again (the hint is gone), or the answer is fine, or cancelled.
+        assertNull(parse(failed.replace("\"busy\": false", "\"busy\": true")).interruptedBy)
+        assertNull(parse(failed.replace("\"failed\"", "\"done\"")).interruptedBy)
+        assertNull(parse(failed.replace("\"failed\"", "\"cancelled\"")).interruptedBy)
+        assertNull(parse("""{"messages": []}""").interruptedBy)
+        // A new message of the user ends the offer.
+        val answered = """
+            {"busy": false, "messages": [
+              {"role": "assistant", "status": "failed", "error": "Fehler", "steps": []},
+              {"role": "user", "text": "Nimm nur die erste"}
+            ]}
+        """
+        assertNull(parse(answered).interruptedBy)
+    }
+}

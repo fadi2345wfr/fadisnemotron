@@ -1,0 +1,36 @@
+FADIS NEMOTRON AUF DEM MAC ÖFFNEN
+=================================
+
+1. Das Programm "Fadis Nemotron" in den Ordner "Programme" ziehen
+   (nicht von diesem Fenster aus starten).
+
+2. Zum ersten Mal öffnen. macOS meldet dann:
+   "... kann nicht geöffnet werden, da Apple darin nicht nach Schadsoftware
+   suchen kann. Diese Software muss aktualisiert werden ..."
+   Das ist die normale Sperre für Programme ohne Apple-Beglaubigung (die
+   kostet 99 $ im Jahr). Das Programm ist nicht beschädigt. Mit "Fertig"
+   schließen.
+
+3. Systemeinstellungen -> Datenschutz & Sicherheit -> ganz nach unten
+   scrollen -> bei "Fadis Nemotron wurde blockiert" auf "Dennoch öffnen"
+   klicken -> mit Passwort oder Touch ID bestätigen.
+
+   Schneller im Terminal (eine Zeile):
+   xattr -dr com.apple.quarantine "/Applications/Fadis Nemotron.app"
+
+Das muss nach jedem Update noch einmal sein.
+
+
+BILDSCHIRMAUFNAHME / BEDIENUNGSHILFEN
+=====================================
+
+Soll Nemotron den Bildschirm sehen und Maus und Tastatur bedienen, fragt
+macOS beim ersten Mal nach Erlaubnis. Das Programm sagt, welche fehlt.
+
+Steht der Schalter schon auf "an" und es klappt trotzdem, kennt macOS die
+Programmversion nicht mehr: in den Systemeinstellungen den Eintrag
+"Fadis Nemotron" mit "-" entfernen, das Programm neu öffnen und neu erlauben.
+Oder im Terminal:
+   tccutil reset ScreenCapture de.fadi.FadisNemotron
+   tccutil reset Accessibility de.fadi.FadisNemotron
+Danach das Programm beenden und neu öffnen.

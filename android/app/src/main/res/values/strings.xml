@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Fadis Nemotron</string>
+    <string name="nemotron">Nemotron</string>
+
+    <!-- Pairing -->
+    <string name="pair_title">Mit dem PC verbinden</string>
+    <string name="pair_step_remote">Am PC in Fadis Nemotron oben auf das Handy-Symbol klicken und „Fernzugriff“ einschalten.</string>
+    <string name="pair_step_scan">Den QR-Code scannen, den der PC dann zeigt.</string>
+    <string name="pair_step_tailscale">Für unterwegs: Tailscale auf PC und Handy installieren und mit demselben Konto anmelden. Im WLAN zu Hause geht es auch ohne.</string>
+    <string name="scan_qr">QR-Code scannen</string>
+    <string name="scanner_failed">Der QR-Scanner ist nicht verfügbar. Er kommt über die Google-Play-Dienste und wird beim ersten Mal geladen – gleich noch einmal versuchen oder unten von Hand verbinden.</string>
+    <string name="connecting">Verbinde …</string>
+    <string name="pair_manual_title">Oder von Hand verbinden</string>
+    <string name="pair_address">Adresse des PCs</string>
+    <string name="pair_token">Schlüssel</string>
+    <string name="connect">Verbinden</string>
+
+    <!-- Chat -->
+    <string name="connecting_to">Verbinde mit %1$s …</string>
+    <string name="connection_lost">Verbindung zum PC unterbrochen – versuche erneut …</string>
+    <string name="check_again">Erneut prüfen</string>
+    <string name="home_folder">Benutzerordner</string>
+    <string name="empty_home">Nemotron arbeitet auf deinem PC. Schreib, was es tun soll – zum Beispiel „Leg auf dem Schreibtisch einen Ordner Rechnungen an“.</string>
+    <string name="empty_project">Schreib, was Nemotron im Projekt tun soll – zum Beispiel „Bau das Projekt und behebe die Fehler“.</string>
+    <string name="menu">Menü</string>
+
+    <!-- Chats -->
+    <string name="chats">Chats</string>
+    <string name="new_chat">Neuer Chat</string>
+    <string name="delete_chat">%1$s löschen</string>
+    <string name="delete_chat_title">Chat löschen?</string>
+    <string name="delete_chat_text">„%1$s“ wird auf dem PC endgültig gelöscht.</string>
+    <string name="delete">Löschen</string>
+    <string name="retry">Neu generieren</string>
+    <string name="changes_menu">Änderungen (%1$d)</string>
+    <string name="approval_title">Nemotron darf</string>
+    <string name="approval_ask_all">Vor jeder Änderung fragen</string>
+    <string name="approval_auto_edits">Dateien selbst ändern, vor Befehlen fragen</string>
+    <string name="approval_auto_all">Alles selbst machen</string>
+    <!-- The switch above the input field -->
+    <string name="mode_review">Prüfen</string>
+    <string name="mode_files">Dateien</string>
+    <string name="mode_auto">Autonom</string>
+    <string name="mode_review_hint">Request Review: Nemotron zeigt jede Änderung und jeden Befehl als Vorschlag, du entscheidest mit ✓ oder ✗.</string>
+    <string name="mode_files_hint">Dateien ändert Nemotron selbst, vor Befehlen fragt er.</string>
+    <string name="mode_auto_hint">Autonomous: Nemotron macht alles selbst. Riskante Befehle fragen trotzdem.</string>
+    <string name="history">Frühere Anweisungen</string>
+    <string name="history_empty">Noch nichts gesendet.</string>
+    <string name="stalled_hint">Keine Antwort von NVIDIA – der Server hängt oder ist überlastet. Stoppen, oder einfach weitertippen und senden: dann geht es sofort mit deiner neuen Nachricht weiter.</string>
+    <string name="send_now">Jetzt senden, Nemotron unterbrechen</string>
+    <string name="continue_in_new_chat">Weiter im neuen Chat</string>
+    <string name="interrupted_by">⚠ Unterbrochen: %1$s</string>
+    <string name="continue_work">▶ Weitermachen</string>
+    <string name="continue_work_and_clean">▶ Weitermachen und Markierung entfernen</string>
+    <string name="error_mark_in_code">Der Fehler steht als Markierung im Code: %1$s</string>
+    <string name="try_again">↻ Erneut versuchen</string>
+    <string name="undone_result">✓ Rückgängig gemacht – die Datei ist wieder auf dem Stand vor Nemotron.</string>
+    <string name="diff_legend">Rot: was entfernt wurde · Grün: was stattdessen eingefügt wird</string>
+    <string name="diff_legend_undone">Rot: was jetzt wieder weg ist · Grün: was jetzt wieder da ist</string>
+    <string name="thinking_mode">Denkmodus</string>
+    <string name="unpair">Kopplung aufheben</string>
+
+    <!-- Changes -->
+    <string name="changes_title">Änderungen</string>
+    <string name="changes_empty">Noch keine Änderungen.</string>
+    <string name="change_new">neu</string>
+    <string name="diff">Diff</string>
+    <string name="diff_empty">Kein Unterschied (mehr).</string>
+    <string name="undo">Rückgängig</string>
+    <string name="undo_title">Rückgängig machen?</string>
+    <string name="undo_text">%1$s wird auf den Stand vor Nemotron zurückgesetzt.</string>
+    <string name="undo_text_created">%1$s hat Nemotron neu angelegt; die Datei wird gelöscht.</string>
+
+    <!-- Tools -->
+    <string name="details">Details</string>
+    <string name="tool_ok">erledigt</string>
+    <string name="tool_failed">mit Fehler beendet</string>
+    <string name="tool_waiting">wartet auf Freigabe</string>
+    <string name="tool_declined">abgelehnt</string>
+    <string name="tool_not_run">nicht ausgeführt</string>
+    <string name="tool_interrupted">beim Stopp abgebrochen – kann teilweise gelaufen sein</string>
+    <string name="tool_planned">geplant</string>
+    <string name="approve_question">Nemotron möchte das tun. Erlauben?</string>
+    <string name="approve_warning">⚠ Achtung: Dieser Befehl %1$s. Er wird deshalb immer erst nachgefragt.</string>
+    <string name="allow">Erlauben</string>
+    <string name="allow_for_run">Für diesen Auftrag alles erlauben</string>
+    <string name="deny">Ablehnen</string>
+
+    <!-- Messages -->
+    <string name="attachment">📎 %1$s</string>
+    <plurals name="thinking_header">
+        <item quantity="one">💭 Denkprozess (%1$d Zeichen)</item>
+        <item quantity="other">💭 Denkprozess (%1$d Zeichen)</item>
+    </plurals>
+    <string name="activity_thinking">denkt nach …</string>
+    <string name="activity_working">arbeitet …</string>
+    <string name="activity_waiting">wartet auf deine Freigabe</string>
+    <string name="activity_writing">schreibt …</string>
+    <string name="failed">Fehlgeschlagen.</string>
+    <string name="stopped">Gestoppt.</string>
+    <string name="cut_off">Die Antwort wurde bei „Max. Tokens“ abgeschnitten. Erhöhe den Wert in den Einstellungen am PC.</string>
+    <string name="empty_answer">Keine Antwort erhalten. Erhöhe am PC „Max. Tokens“ oder schalte den Denkmodus aus.</string>
+    <string name="answer">Antwort</string>
+    <string name="copy">Kopieren</string>
+    <string name="jump_to_end">Zum Ende</string>
+    <string name="close">Schließen</string>
+    <string name="cancel">Abbrechen</string>
+
+    <!-- Composer -->
+    <string name="composer_hint">Nachricht an Nemotron …</string>
+    <string name="add_media">Fotos oder Videos anhängen</string>
+    <string name="remove_attachment">%1$s entfernen</string>
+    <string name="video_shrinking">Video wird verkleinert … %1$d\u00A0%%</string>
+    <string name="uploading">Lädt hoch … %1$s</string>
+    <string name="send">Senden</string>
+    <string name="stop">Stopp</string>
+</resources>

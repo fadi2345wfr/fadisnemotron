@@ -1,0 +1,267 @@
+name: Windows-Exe + Mac-App + Android-App
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  apk:
+    # Builds, tests and publishes the Android app (android-apk.yml); the exe
+    # and the DMG below take this very APK into the program.
+    name: Android-App
+    uses: ./.github/workflows/android-apk.yml
+    permissions:
+      contents: write # publishes the build as "neueste" and on v* tags
+
+  exe:
+    name: Tests + Windows-Exe
+    needs: apk
+    runs-on: windows-latest
+    permissions:
+      contents: write # publishes the build as "neueste" and on v* tags
+      actions: read # fetches the APK of this run
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: APK dieses Laufs holen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name FadisNemotron-android-apk --dir build/apk
+          ls -la build/apk
+          test -n "$(ls build/apk/*.apk)"
+
+      - name: Rust installieren
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy rustfmt
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatierung
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        run: cargo test --locked
+
+      - name: Exe mit eingebauter Android-App bauen
+        env:
+          REQUIRE_APK: "1"
+        run: |
+          APK="$(ls "$PWD"/build/apk/FadisNemotron-*.apk | head -n1)" ./scripts/build-exe.sh
+
+      - name: Selbsttest der Exe (Shell, Ordnerschutz, Bildschirm, Notepad)
+        shell: pwsh
+        env:
+          FADIS_SELFTEST_FILE: ${{ github.workspace }}\selftest.txt
+          FADIS_SELFTEST_EXPECT_APK: "1"
+          FADIS_SELFTEST_NOTEPAD: "1"
+        run: |
+          $exe = (Get-ChildItem dist\*.exe | Select-Object -First 1).FullName
+          # Only the test itself is waited for (not what it started, like Notepad), and not forever.
+          $p = Start-Process -FilePath $exe -ArgumentList '--selftest' -PassThru
+          $finished = $p.WaitForExit(180000)
+          if (-not $finished) { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue }
+          Get-Process notepad -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+          if (Test-Path selftest.txt) { Get-Content selftest.txt } else { Write-Host 'Keine Ausgabe vom Selbsttest' }
+          if (-not $finished) { throw 'Der Selbsttest hat nach 3 Minuten nicht geendet' }
+          if ($p.ExitCode -ne 0) { throw "Selbsttest fehlgeschlagen (Exit-Code $($p.ExitCode))" }
+          # The app written by the program is the very file the Android build made.
+          $apk = (Get-ChildItem build\apk\FadisNemotron-*.apk | Select-Object -First 1).FullName
+          $written = Get-ChildItem -Path "$env:LOCALAPPDATA\fadi\FadisNemotron" -Recurse -Filter FadisNemotron.apk | Select-Object -First 1
+          if (-not $written) { throw 'Die Exe hat die Android-App nicht geschrieben' }
+          $a = (Get-FileHash $apk -Algorithm SHA256).Hash
+          $b = (Get-FileHash $written.FullName -Algorithm SHA256).Hash
+          Write-Host "APK im Build:   $a"
+          Write-Host "APK aus der Exe: $b"
+          if ($a -ne $b) { throw 'Die eingebaute Android-App ist nicht die gebaute' }
+
+      - name: Fenster starten und die Android-App vom Fernzugriff laden
+        # The real program with its window: remote access on, then what the
+        # phone does — open the install page and load the app. A build server
+        # may have no usable graphics, so a failure here is reported but does
+        # not stop the exe from being published; the self-test above does.
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $exe = (Get-ChildItem dist\*.exe | Select-Object -First 1).FullName
+          $config = "$env:APPDATA\fadi\FadisNemotron\config"
+          New-Item -ItemType Directory -Force -Path $config | Out-Null
+          $token = 'ci-' + [guid]::NewGuid().ToString('N')
+          $settings = @{ remote_enabled = $true; remote_port = 17878; remote_token = $token; phone_setup_seen = $true; keep_awake = $true } | ConvertTo-Json
+          Set-Content -Path "$config\settings.json" -Value $settings -Encoding utf8
+          $app = Start-Process -FilePath $exe -PassThru
+          try {
+            $page = $null
+            for ($i = 0; $i -lt 40 -and -not $page; $i++) {
+              Start-Sleep -Milliseconds 750
+              try { $page = Invoke-WebRequest -Uri 'http://127.0.0.1:17878/installieren' -UseBasicParsing -TimeoutSec 3 } catch { }
+            }
+            if (-not $page) { throw 'Der Fernzugriff antwortet nicht' }
+            if ($page.Content -notmatch 'Fadis Nemotron laden') { throw 'Die Installationsseite zeigt keinen Lade-Knopf' }
+            Invoke-WebRequest -Uri 'http://127.0.0.1:17878/FadisNemotron.apk' -OutFile got.apk -UseBasicParsing
+            $apk = (Get-ChildItem build\apk\FadisNemotron-*.apk | Select-Object -First 1).FullName
+            if ((Get-FileHash got.apk).Hash -ne (Get-FileHash $apk).Hash) { throw 'Das Handy bekäme eine andere APK' }
+            $ping = Invoke-RestMethod -Uri 'http://127.0.0.1:17878/api/v1/ping' -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 5
+            Write-Host "Ping: $($ping | ConvertTo-Json -Compress)"
+            Write-Host "Die Exe liefert die Android-App aus ($((Get-Item got.apk).Length) Bytes)."
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+          }
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: FadisNemotron-windows-exe
+          path: |
+            dist/*.exe
+            dist/*.exe.sha256
+          if-no-files-found: error
+
+      - name: Als „Neueste Version“ veröffentlichen
+        # Pushes, manual runs and pull requests from this repository (not forks, not tags).
+        if: >-
+          !startsWith(github.ref, 'refs/tags/') &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./scripts/publish-latest.sh dist/FadisNemotron-*-windows.exe FadisNemotron-Windows.exe
+
+      - name: Release anhängen
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.exe
+            dist/*.exe.sha256
+
+  dmg:
+    name: Tests + ${{ matrix.label }}
+    needs: apk
+    # Apple Silicon runner; Rust cross-compiles to x86_64 with the same SDK.
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: Intel-DMG
+            target: x86_64-apple-darwin
+            arch: intel
+            lipo: x86_64
+            published: FadisNemotron-Intel.dmg
+          - label: Apple-Silicon-DMG
+            target: aarch64-apple-darwin
+            arch: apple-silicon
+            lipo: arm64
+            published: FadisNemotron-AppleSilicon.dmg
+    permissions:
+      contents: write # publishes the build as "neueste" and on v* tags
+      actions: read # fetches the APK of this run
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: APK dieses Laufs holen
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --name FadisNemotron-android-apk --dir build/apk
+          ls -la build/apk
+          test -n "$(ls build/apk/*.apk)"
+
+      - name: Rust installieren
+        run: |
+          rustup update stable --no-self-update
+          rustup default stable
+          rustup component add clippy rustfmt
+          rustup target add ${{ matrix.target }}
+          rustc --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Checks and tests run once; both DMGs are built from the same code.
+      - name: Formatierung
+        if: matrix.arch == 'intel'
+        run: cargo fmt --check
+
+      - name: Clippy
+        if: matrix.arch == 'intel'
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: Tests
+        if: matrix.arch == 'intel'
+        run: cargo test --locked
+
+      - name: App und DMG bauen
+        env:
+          REQUIRE_APK: "1"
+          TARGET: ${{ matrix.target }}
+        run: |
+          APK="$(ls "$PWD"/build/apk/FadisNemotron-*.apk | head -n1)" ./scripts/build-dmg.sh
+
+      - name: DMG prüfen
+        run: |
+          set -euo pipefail
+          dmg="$(ls dist/*.dmg)"
+          mnt="$(mktemp -d)"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mnt"
+          ls -la "$mnt"
+          app="$mnt/Fadis Nemotron.app"
+          test -L "$mnt/Applications"
+          test -f "$app/Contents/Resources/AppIcon.icns"
+          test -f "$mnt/So öffnest du die App.txt"
+          requirement="$(codesign -d -r- "$app" 2>&1)"
+          echo "$requirement"
+          grep -q 'designated => identifier "de.fadi.FadisNemotron"' <<< "$requirement"
+          if grep -q cdhash <<< "$requirement"; then echo "Signatur hängt noch am Hash" >&2; exit 1; fi
+          test "$(wc -c < "$app/Contents/Resources/FadisNemotron.apk")" -gt 1000000
+          cmp "$app/Contents/Resources/FadisNemotron.apk" build/apk/FadisNemotron-*.apk
+          plutil -p "$app/Contents/Info.plist"
+          file "$app/Contents/MacOS/fadis-nemotron"
+          lipo -archs "$app/Contents/MacOS/fadis-nemotron" | grep -qx ${{ matrix.lipo }}
+          codesign --verify --strict "$app"
+          hdiutil detach "$mnt"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: FadisNemotron-${{ matrix.arch }}-dmg
+          path: |
+            dist/*.dmg
+            dist/*.dmg.sha256
+          if-no-files-found: error
+
+      - name: Als „Neueste Version“ veröffentlichen
+        # Pushes, manual runs and pull requests from this repository (not forks, not tags).
+        if: >-
+          !startsWith(github.ref, 'refs/tags/') &&
+          (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: ./scripts/publish-latest.sh dist/FadisNemotron-*-${{ matrix.arch }}.dmg ${{ matrix.published }}
+
+      - name: Release anhängen
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.dmg
+            dist/*.dmg.sha256
