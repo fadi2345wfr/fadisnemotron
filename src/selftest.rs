@@ -263,14 +263,19 @@ fn notepad_round_trip(ws: &Workspace, r: &mut Report) {
     ));
     let out = run(ws, "computer_action", json!({"action": "screenshot"}));
     r.info(format!("Screenshot mit Notepad: {}", first_line(&out.text)));
-    // Close it without a question about saving.
-    let _ = run(
-        ws,
-        "computer_action",
-        json!({"action": "key", "text": "alt+f4"}),
-    );
-    std::thread::sleep(Duration::from_millis(500));
-    let _ = run(ws, "computer_action", json!({"action": "key", "text": "n"}));
+    // Close it for sure, without a question about saving: a Notepad that stays
+    // open would keep whoever started the test waiting.
+    #[cfg(windows)]
+    {
+        use std::process::{Command, Stdio};
+        let mut kill = Command::new(crate::winsys::system_dir().join("taskkill.exe"));
+        crate::platform::quiet(&mut kill)
+            .args(["/IM", "notepad.exe", "/T", "/F"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = kill.status();
+    }
 }
 
 fn finish(mut r: Report) -> bool {

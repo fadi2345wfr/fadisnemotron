@@ -1,6 +1,6 @@
 # Fadis Nemotron
 
-Desktop-Agent und Chat für **NVIDIA Nemotron 3.5 Super VL**, geschrieben in Rust. Läuft unter **Windows** als **eine einzige Exe-Datei** (nichts zu installieren) und als Mac-App (DMG für Intel-Macs).
+Desktop-Agent und Chat für **NVIDIA Nemotron 3.5 Super VL**, geschrieben in Rust. Läuft unter **Windows** als **eine einzige Exe-Datei** (nichts zu installieren) und als Mac-App (DMG für Macs mit Apple-Chip und für Intel-Macs).
 
 Nemotron arbeitet direkt auf deinem PC, wie Google Antigravity oder Claude Code: Er sieht deinen Benutzerordner (Downloads, Schreibtisch, Dokumente …), liest und durchsucht Dateien selbst, legt Ordner und Dateien an, ändert sie und führt Befehle aus. Für Programmierprojekte öffnest du den Projektordner, dann arbeitet er dort (Build, Tests, Fehler beheben).
 
@@ -13,7 +13,8 @@ Dazu gibt es eine **Android-App**: QR-Code scannen, und alle Chats vom PC sind a
 | | Datei |
 |---|---|
 | **Windows** | [FadisNemotron-Windows.exe](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-Windows.exe) – eine Datei, doppelklicken, fertig. **Enthält die Android-App.** |
-| Mac (Intel) | [FadisNemotron-Intel.dmg](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-Intel.dmg) – öffnen und in „Programme“ ziehen. **Enthält die Android-App.** |
+| Mac mit Apple-Chip (M1 und neuer) | [FadisNemotron-AppleSilicon.dmg](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-AppleSilicon.dmg) – öffnen und in „Programme“ ziehen. **Enthält die Android-App.** |
+| Mac mit Intel-Prozessor | [FadisNemotron-Intel.dmg](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-Intel.dmg) – genauso. Welcher Mac es ist, steht unter  → **Über diesen Mac** → „Chip“ oder „Prozessor“. |
 | Android einzeln | [FadisNemotron.apk](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron.apk) – nur nötig, wenn du das Programm am PC nicht zur Hand hast |
 
 Die Links zeigen immer auf den neuesten Build (Release [„Neueste Version“](https://github.com/fadi2345wfr/fadisnemotron/releases/tag/neueste), auf der Startseite rechts unter **Releases**). Die Android-App in der Exe und in der DMG ist genau die APK desselben Builds.
@@ -138,16 +139,16 @@ Voraussetzung: Windows 10 oder 11 (64 Bit), eine Grafikkarte bzw. ein Treiber mi
 
 Lässt sich etwas nicht starten, zeigt `FadisNemotron-Windows.exe --selftest` (in `cmd` oder PowerShell, mit `FADIS_SELFTEST_FILE=bericht.txt` als Umgebungsvariable schreibt es den Bericht in eine Datei) in wenigen Sekunden, was auf diesem PC geht: Android-App enthalten, PowerShell, Zeitlimit für Befehle, Ordnerschutz, Bildschirm, Maus, Zwischenablage.
 
-## Installation auf dem Mac (Intel)
+## Installation auf dem Mac
 
-1. [FadisNemotron-Intel.dmg](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-Intel.dmg) laden (immer die neueste Version).
+1. Die passende DMG laden (immer die neueste Version): [FadisNemotron-AppleSilicon.dmg](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-AppleSilicon.dmg) für Macs mit Apple-Chip (M1 und neuer) oder [FadisNemotron-Intel.dmg](https://github.com/fadi2345wfr/fadisnemotron/releases/download/neueste/FadisNemotron-Intel.dmg) für Intel-Macs. Meldet macOS beim Öffnen „Diese Software muss aktualisiert werden“, hast du auf einem Apple-Chip-Mac die Intel-Version erwischt: die Apple-Silicon-Version nehmen.
 2. DMG öffnen und **Fadis Nemotron** in den Ordner **Programme** ziehen.
 3. Erster Start: Die App ist nicht von Apple notariell beglaubigt, deshalb blockiert macOS sie beim ersten Öffnen.
    - macOS 15 und neuer: App einmal öffnen, dann **Systemeinstellungen → Datenschutz & Sicherheit → „Dennoch öffnen“**.
    - macOS 14 und älter: Rechtsklick auf die App → **Öffnen** → **Öffnen**.
    - Alternativ im Terminal: `xattr -dr com.apple.quarantine "/Applications/Fadis Nemotron.app"`
 
-Voraussetzung: macOS 10.15 (Catalina) oder neuer.
+Voraussetzung: macOS 10.15 (Catalina) oder neuer bei der Intel-Version, macOS 11 (Big Sur) oder neuer bei der Apple-Silicon-Version.
 
 ## API-Schlüssel
 
@@ -215,7 +216,7 @@ Unter Linux braucht egui zur Laufzeit `libxkbcommon-x11`.
 
 1. `apk` ruft `.github/workflows/android-apk.yml` auf: Unit-Tests der Android-App, Release-APK bauen, Signatur prüfen.
 2. `exe` (Windows-Runner) holt genau diese APK, prüft Formatierung, Clippy und Tests, baut die Exe **mit der APK darin** (`scripts/build-exe.sh`, in CI Pflicht) und prüft sie *in echt*: `--selftest` (Android-App enthalten und identisch mit der gebauten, PowerShell mit UTF-8 und Exit-Code, Zeitlimit beendet Befehle, Ordnerschutz, Bildschirm, Maus, Zwischenablage, Tippen und Kopieren in Notepad) und danach das Fenster selbst: Fernzugriff an, Installationsseite öffnen, die APK laden und mit der gebauten vergleichen.
-3. `dmg` holt genau diese APK, prüft Formatierung, Clippy und Tests der Mac-App, baut die Intel-DMG **mit der APK im App-Bundle** (`Contents/Resources/FadisNemotron.apk`, Skript `scripts/build-dmg.sh`, in CI Pflicht) und prüft sie: Architektur x86_64, Signatur, Icon, APK enthalten und identisch.
+3. `dmg` holt genau diese APK, prüft Formatierung, Clippy und Tests der Mac-App, baut zwei DMGs, eine für Intel (x86_64) und eine für Apple-Chips (arm64), **mit der APK im App-Bundle** (`Contents/Resources/FadisNemotron.apk`, Skript `scripts/build-dmg.sh`, in CI Pflicht) und prüft sie: Architektur, Signatur, Icon, APK enthalten und identisch.
 
 Alle drei Dateien landen als Artefakte am Lauf und, nach jedem erfolgreichen Build, unter festen Namen im Release „Neueste Version“ (Tag `neueste`, Skript `scripts/publish-latest.sh`), daher die festen Download-Links oben. Ein Tag wie `v0.4.0` hängt Exe, DMG und APK zusätzlich an ein eigenes Release.
 

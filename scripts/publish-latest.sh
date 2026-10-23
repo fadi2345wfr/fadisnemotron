@@ -21,7 +21,8 @@ notes="Immer die neueste Version (Commit ${sha:0:7}).
 
 - **Windows:** [FadisNemotron-Windows.exe](https://github.com/$repo/releases/download/$tag/FadisNemotron-Windows.exe) – eine einzige Datei, einfach doppelklicken (nichts zu installieren). Windows warnt beim ersten Start vor einem unbekannten Programm: „Weitere Informationen“ → „Trotzdem ausführen“. Die Android-App steckt schon drin: Das Programm zeigt beim ersten Start einen QR-Code, mit dem das Handy sie direkt vom PC lädt.
 - **Android einzeln:** [FadisNemotron.apk](https://github.com/$repo/releases/download/$tag/FadisNemotron.apk) – auf dem Handy öffnen und installieren (einmal „Installieren aus unbekannten Quellen“ erlauben). Neue Versionen installieren sich über die alte.
-- **Mac (Intel):** [FadisNemotron-Intel.dmg](https://github.com/$repo/releases/download/$tag/FadisNemotron-Intel.dmg) – öffnen und die App in „Programme“ ziehen; die Android-App steckt auch hier schon drin.
+- **Mac mit Apple-Chip (M1 und neuer):** [FadisNemotron-AppleSilicon.dmg](https://github.com/$repo/releases/download/$tag/FadisNemotron-AppleSilicon.dmg) – öffnen und die App in „Programme“ ziehen; die Android-App steckt auch hier schon drin.
+- **Mac mit Intel-Prozessor:** [FadisNemotron-Intel.dmg](https://github.com/$repo/releases/download/$tag/FadisNemotron-Intel.dmg) – genauso. Welcher es ist, steht unter  → „Über diesen Mac“ → „Chip“ oder „Prozessor“.
 
 Die Android-App in der Exe und in der DMG ist genau diese APK."
 

@@ -2,7 +2,7 @@
 # Builds "Fadis Nemotron.app" and packs it into a DMG. Runs on macOS.
 #
 #   ./scripts/build-dmg.sh                         # Intel (x86_64), the default
-#   TARGET=aarch64-apple-darwin ./scripts/build-dmg.sh   # Apple Silicon
+#   TARGET=aarch64-apple-darwin ./scripts/build-dmg.sh   # Apple Silicon (M1 and later)
 #   APK=path/to/FadisNemotron.apk ./scripts/build-dmg.sh  # with the Android app inside
 #
 # With APK the Android app goes into the app bundle (Contents/Resources), and
@@ -15,17 +15,18 @@ set -euo pipefail
 TARGET="${TARGET:-x86_64-apple-darwin}"
 APP_NAME="Fadis Nemotron"
 BIN="fadis-nemotron"
-# Catalina covers every Intel Mac that still gets security updates.
-export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-10.15}"
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
 case "$TARGET" in
-  x86_64-*) ARCH_LABEL="intel"; LIPO_ARCH="x86_64" ;;
-  aarch64-*) ARCH_LABEL="apple-silicon"; LIPO_ARCH="arm64" ;;
+  # Catalina covers every Intel Mac that still gets security updates.
+  x86_64-*) ARCH_LABEL="intel"; LIPO_ARCH="x86_64"; DEFAULT_MIN_MACOS="10.15" ;;
+  # The first Apple Silicon Macs came with Big Sur.
+  aarch64-*) ARCH_LABEL="apple-silicon"; LIPO_ARCH="arm64"; DEFAULT_MIN_MACOS="11.0" ;;
   *) echo "Unbekanntes Ziel: $TARGET" >&2; exit 1 ;;
 esac
+export MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-$DEFAULT_MIN_MACOS}"
 
 echo "==> Baue $APP_NAME $VERSION für $TARGET (ab macOS $MACOSX_DEPLOYMENT_TARGET)"
 rustup target add "$TARGET" >/dev/null
