@@ -1,8 +1,16 @@
 package de.fadi.nemotron.ui.mac
 
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.key
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.unit.dp
 import de.fadi.nemotron.R
 import de.fadi.nemotron.data.Decision
 import de.fadi.nemotron.data.MessageStatus
@@ -23,6 +31,7 @@ fun RemoteAssistantMessage(
     message: RemoteMessage,
     deciding: Set<String>,
     onDecide: (callId: String, Decision) -> Unit,
+    onOpenChat: (String) -> Unit,
 ) {
     val streaming = message.status == MessageStatus.Streaming
     val parts = message.steps.map { thinkingAndAnswer(it.reasoning, it.content) }
@@ -45,6 +54,13 @@ fun RemoteAssistantMessage(
             }
         }
         for (notice in message.notices) NoticeText(notice)
+        // The chat got too long: Nemotron went on in a new one, one tap away.
+        message.continuedIn?.let { next ->
+            Button(onClick = { onOpenChat(next) }) {
+                Icon(painterResource(R.drawable.ic_arrow_forward), contentDescription = null, modifier = Modifier.size(18.dp))
+                Text(stringResource(R.string.continue_in_new_chat), modifier = Modifier.padding(start = 8.dp))
+            }
+        }
         MessageOutcome(message.status, message.error, message.finishReason, empty = answer.isEmpty() && !hasTools)
         if (!streaming && answer.isNotEmpty()) CopyButton(answer)
     }

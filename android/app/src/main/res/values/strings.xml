@@ -38,6 +38,18 @@
     <string name="approval_ask_all">Vor jeder Änderung fragen</string>
     <string name="approval_auto_edits">Dateien selbst ändern, vor Befehlen fragen</string>
     <string name="approval_auto_all">Alles selbst machen</string>
+    <!-- The switch above the input field -->
+    <string name="mode_review">Prüfen</string>
+    <string name="mode_files">Dateien</string>
+    <string name="mode_auto">Autonom</string>
+    <string name="mode_review_hint">Request Review: Nemotron zeigt jede Änderung und jeden Befehl als Vorschlag, du entscheidest mit ✓ oder ✗.</string>
+    <string name="mode_files_hint">Dateien ändert Nemotron selbst, vor Befehlen fragt er.</string>
+    <string name="mode_auto_hint">Autonomous: Nemotron macht alles selbst. Riskante Befehle fragen trotzdem.</string>
+    <string name="history">Frühere Anweisungen</string>
+    <string name="history_empty">Noch nichts gesendet.</string>
+    <string name="stalled_hint">Keine Antwort von NVIDIA – der Server hängt oder ist überlastet. Stoppen, oder einfach weitertippen und senden: dann geht es sofort mit deiner neuen Nachricht weiter.</string>
+    <string name="send_now">Jetzt senden, Nemotron unterbrechen</string>
+    <string name="continue_in_new_chat">Weiter im neuen Chat</string>
     <string name="thinking_mode">Denkmodus</string>
     <string name="unpair">Kopplung aufheben</string>
 

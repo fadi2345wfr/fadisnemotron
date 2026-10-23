@@ -71,9 +71,12 @@ class RemoteApi(baseUrl: String, private val token: String, http: OkHttpClient) 
         return result
     }
 
-    /** Sends a message in the open chat, with the ids of earlier [upload]s. */
-    suspend fun send(text: String, uploads: List<String> = emptyList()) =
-        postWhenIdle("send", remoteJson.encodeToString(SendRequest(text, uploads)))
+    /**
+     * Sends a message in the open chat, with the ids of earlier [upload]s. With
+     * [interrupt] the Mac stops a running answer and answers this message at once.
+     */
+    suspend fun send(text: String, uploads: List<String> = emptyList(), interrupt: Boolean = false) =
+        postWhenIdle("send", remoteJson.encodeToString(SendRequest(text, uploads, interrupt)))
 
     suspend fun stop() = post("stop")
 
@@ -204,7 +207,7 @@ data class Ping(val name: String = "", val protocol: Int = 0) {
 private class DiffResponse(val diff: String = "")
 
 @Serializable
-private class SendRequest(val text: String, val uploads: List<String>)
+private class SendRequest(val text: String, val uploads: List<String>, val interrupt: Boolean)
 
 @Serializable
 private class ChatRequest(val id: String)

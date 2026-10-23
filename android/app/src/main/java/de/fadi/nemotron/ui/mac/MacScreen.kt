@@ -48,6 +48,7 @@ import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning
 import de.fadi.nemotron.R
+import de.fadi.nemotron.data.ApprovalMode
 import de.fadi.nemotron.data.RemoteApi
 import de.fadi.nemotron.data.RemoteState
 import de.fadi.nemotron.ui.common.ChatList
@@ -261,7 +262,7 @@ private fun Conversation(viewModel: MacViewModel, state: MacUiState, macName: St
                     if (message.isUser) {
                         UserBubble(message.text, message.attachments)
                     } else {
-                        RemoteAssistantMessage(message, state.deciding, viewModel::decide)
+                        RemoteAssistantMessage(message, state.deciding, viewModel::decide, viewModel::openChat)
                     }
                 }
             }
@@ -275,6 +276,7 @@ private fun Conversation(viewModel: MacViewModel, state: MacUiState, macName: St
         onAddMedia = viewModel.attachments::add,
         onRemoveAttachment = { viewModel.attachments.remove(it.key) },
         busy = remote?.busy == true,
+        stalled = remote?.stalled == true,
         sending = state.sending,
         upload = state.upload,
         onSend = {
@@ -282,6 +284,12 @@ private fun Conversation(viewModel: MacViewModel, state: MacUiState, macName: St
             viewModel.send()
         },
         onStop = viewModel::stop,
+        approval = remote?.approval ?: ApprovalMode.AutoEdits,
+        onApproval = viewModel::setApproval,
+        history = viewModel.recentPrompts,
+        onPickHistory = viewModel::pickPrompt,
+        onHistoryOlder = viewModel::historyOlder,
+        onHistoryNewer = viewModel::historyNewer,
     )
 }
 

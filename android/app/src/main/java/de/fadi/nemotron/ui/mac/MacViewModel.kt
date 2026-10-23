@@ -15,6 +15,7 @@ import de.fadi.nemotron.data.Pairing
 import de.fadi.nemotron.data.PairingCode
 import de.fadi.nemotron.data.PhotoEncoder
 import de.fadi.nemotron.data.Prefs
+import de.fadi.nemotron.data.PromptHistory
 import de.fadi.nemotron.data.RemoteApi
 import de.fadi.nemotron.data.RemoteException
 import de.fadi.nemotron.data.RemoteState
@@ -67,6 +68,32 @@ class MacViewModel(
     var draft by mutableStateOf("")
 
     val attachments = Attachments(viewModelScope, photos, videos, ::showMessage)
+
+    /** What was sent from this phone, for the history button and a keyboard's arrow keys. */
+    private val history = PromptHistory(load = { prefs.history }, save = { prefs.history = it })
+
+    /** Newest first. Read when the menu is built, so it is current after every send. */
+    val recentPrompts: List<String> get() = history.recent
+
+    /** Arrow up: an earlier message, if the field is empty or shows one. True if the key was used. */
+    fun historyOlder(): Boolean {
+        if (draft.isNotEmpty() && !history.isBrowsing(draft)) return false
+        val older = history.older(draft) ?: return history.isBrowsing(draft)
+        draft = older
+        return true
+    }
+
+    /** Arrow down while an earlier message shows: the next one, or what was typed before. */
+    fun historyNewer(): Boolean {
+        if (!history.isBrowsing(draft)) return false
+        draft = history.newer() ?: return false
+        return true
+    }
+
+    fun pickPrompt(text: String) {
+        history.stopBrowsing()
+        draft = text
+    }
 
     private var api: RemoteApi? = prefs.pairing?.let { RemoteApi(it.url, it.token, http) }
     private var visible = false
@@ -182,10 +209,13 @@ class MacViewModel(
         val items = attachments.items.value
         if (text.isEmpty() && items.isEmpty() || _state.value.sending || attachments.preparing.value > 0) return
         val uploads = items.map { it.upload ?: return }
+        // While Nemotron works, a new message ends that answer and is answered at once.
+        val interrupt = _state.value.remote?.busy == true
         _state.update { it.copy(sending = true) }
         viewModelScope.launch {
             try {
-                api.send(text, upload(api, uploads))
+                api.send(text, upload(api, uploads), interrupt)
+                history.add(text)
                 // The field stays editable during a long upload; whatever was typed meanwhile stays.
                 draft = draftAfterSending(draft, typed)
                 items.forEach { attachments.remove(it.key) }

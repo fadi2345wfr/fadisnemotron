@@ -186,9 +186,21 @@ class RemoteApiTest {
         assertEquals("/api/v1/send", request.url.encodedPath)
         assertTrue(request.headers["Content-Type"]!!.startsWith("application/json"))
         val body = request.json()
-        assertEquals(setOf("text", "uploads"), body.keys)
+        assertEquals(setOf("text", "uploads", "interrupt"), body.keys)
+        assertEquals("false", body["interrupt"]!!.jsonPrimitive.content)
         assertEquals("Was passiert in dem Video?", body["text"]!!.jsonPrimitive.content)
         assertEquals(listOf("up-7f3a9c", "up-0b1d2e"), body["uploads"]!!.jsonArray.map { it.jsonPrimitive.content })
+    }
+
+    @Test
+    fun `a message typed while the server hangs asks the Mac to interrupt`() = runBlocking {
+        answer()
+
+        api.send("Nimm nur die erste Datei", interrupt = true)
+
+        val body = mac.takeRequest().json()
+        assertEquals("true", body["interrupt"]!!.jsonPrimitive.content)
+        assertEquals("Nimm nur die erste Datei", body["text"]!!.jsonPrimitive.content)
     }
 
     @Test

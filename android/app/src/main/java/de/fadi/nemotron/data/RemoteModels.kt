@@ -21,6 +21,8 @@ internal val remoteJson = Json {
 data class RemoteState(
     val version: Long = 0,
     val busy: Boolean = false,
+    /** Nemotron is working but has said nothing for a while: the server probably hangs. */
+    val stalled: Boolean = false,
     val thinking: Boolean = true,
     val approval: ApprovalMode = ApprovalMode.AutoEdits,
     val workspace: Workspace? = null,
@@ -69,6 +71,8 @@ data class RemoteMessage(
     val error: String? = null,
     @SerialName("finish_reason") val finishReason: String? = null,
     val notices: List<String> = emptyList(),
+    /** The chat got too long and the work went on in the chat with this id. */
+    @SerialName("continued_in") val continuedIn: String? = null,
     val steps: List<Step> = emptyList(),
 ) {
     val isUser: Boolean get() = role == "user"

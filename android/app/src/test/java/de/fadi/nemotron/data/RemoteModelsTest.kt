@@ -11,6 +11,26 @@ class RemoteModelsTest {
     private fun parse(json: String): RemoteState = remoteJson.decodeFromString(json)
 
     @Test
+    fun `knows a hanging server and the chat a long one went on in`() {
+        val state = parse(
+            """
+            {"busy": true, "stalled": true, "approval": "AskAll",
+             "messages": [
+               {"role": "assistant", "status": "done", "continued_in": "c-20261023-101500-aa11", "steps": []},
+               {"role": "assistant", "status": "done", "steps": []}
+             ]}
+            """,
+        )
+
+        assertTrue(state.stalled)
+        assertEquals(ApprovalMode.AskAll, state.approval)
+        assertEquals("c-20261023-101500-aa11", state.messages[0].continuedIn)
+        assertNull(state.messages[1].continuedIn)
+        // Older Macs know neither field.
+        assertFalse(parse("""{"busy": true}""").stalled)
+    }
+
+    @Test
     fun `parses the full example from the protocol description`() {
         val state = parse(DOC_EXAMPLE)
 

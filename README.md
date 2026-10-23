@@ -35,13 +35,15 @@ Nemotron 3.5 Super VL ist NVIDIAs offenes Multimodal-Modell (veröffentlicht am 
    - 🌐 im Netz suchen und Webseiten lesen, 🖱️ den Bildschirm ansehen und den Mac mit Maus und Tastatur bedienen – das fragt im Standard-Modus jedes Mal nach
 4. Rechts in **Änderungen** steht jede geänderte Datei mit **Diff** und **↶ Rückgängig** (setzt die Datei auf den Stand vor Nemotron zurück; neu angelegte Dateien werden gelöscht).
 
-Was Nemotron ohne Nachfrage darf, stellst du rechts ein:
+**Modus direkt über dem Eingabefeld** (auf dem Mac und in der Android-App, kein Umweg über die Einstellungen):
 
-| Einstellung | Dateien ändern | Befehle |
+| Schalter | Dateien ändern | Befehle |
 |---|---|---|
-| Vor jeder Änderung fragen | fragt, mit Diff-Vorschau | fragt |
-| Dateien selbst ändern, vor Befehlen fragen (Standard) | sofort | fragt |
-| Alles selbst machen | sofort | sofort |
+| 🔍 **Prüfen** (Request Review) | Vorschlag mit Diff, du entscheidest mit **✓ Übernehmen** oder **✗ Ablehnen** | Vorschlag, ✓ oder ✗ |
+| ✏ **Dateien frei** (Standard) | sofort | fragt |
+| 🤖 **Autonom** | sofort | sofort |
+
+Der Schalter gilt **sofort, auch für den Auftrag, der gerade läuft**: Wartet ein Vorschlag auf dein ✓, und du stellst auf Autonom, geht es ohne weitere Nachfrage weiter. „🤖 Ab jetzt autonom“ auf einer Vorschlagskarte macht dasselbe.
 
 Unabhängig davon gilt:
 - Nur lesende Befehle (`git status`, `git diff`, `git log`, `ls`, `cat` …) laufen immer ohne Nachfrage.
@@ -49,6 +51,10 @@ Unabhängig davon gilt:
 - Nemotron arbeitet im Arbeitsordner: ohne Projekt dein ganzer Benutzerordner, mit Projekt dieser Ordner. Was außerhalb liegt (z. B. `/Applications`), erreicht er, wenn du einen Ordner darüber öffnest.
 - Ein Platzhalter wie `// ... rest of the code ...` beim Überschreiben einer Datei wird abgelehnt, damit nichts verloren geht.
 - Befehle laufen im Arbeitsordner mit der Umgebung deiner Shell (inklusive `~/.zshrc`, damit `cargo`, `npm` über nvm, `python` über pyenv usw. gefunden werden), mit Zeitlimit. **⏹ Stop**, Esc oder das Beenden der App beendet sie samt Unterprozessen. Sehr lange Ausgaben werden gekürzt (Anfang und Ende bleiben).
+
+**Eingabe:**
+- ↑ und ↓ im Textfeld holen frühere Anweisungen zurück (wie in der Shell: ↑ bei leerem Feld oder am Textanfang, ↓ geht wieder vor; der angefangene Text kommt zurück). Der Verlauf bleibt nach dem Neustart erhalten (`history.json`). In der Android-App gibt es dafür den Uhr-Knopf neben dem Modus-Schalter (und die Pfeiltasten einer Bluetooth-Tastatur).
+- Während Nemotron arbeitet, kannst du weiterschreiben. **Enter schickt die neue Nachricht sofort**: Der laufende Auftrag wird gestoppt, und es geht mit deiner Nachricht weiter. Das ist der Weg, wenn der Server hängt: Nach 20 Sekunden ohne Lebenszeichen steht eine Hinweiszeile da („Stoppen – oder einfach weiterschreiben“), auch auf dem Handy.
 
 **Lange Aufgaben:** Je länger ein Gespräch wird (viele gelesene Dateien), desto langsamer und schlechter antwortet der NVIDIA-Server – bis hin zu „timeout: receive response“. Deshalb schneidet die App nichts ab, sondern wechselt selbst den Chat: Ab etwa 60 000 Token (oder wenn NVIDIA bei einem längeren Gespräch nicht antwortet) schreibt Nemotron eine Übergabe-Notiz (Aufgabe, Erledigtes, Gefundenes, nächste Schritte), die App legt einen neuen Chat an – darin dein Auftrag samt Anhängen und die Notiz – und Nemotron macht dort von allein weiter. Der alte Chat bleibt unverändert in der Liste. Antwortet der Server auch für die Notiz nicht, schreibt die App ein Protokoll der letzten Schritte. Höchstens dreimal pro Auftrag; danach werden alte Werkzeugausgaben gekürzt. Kurze Aussetzer (Timeout, 429, 5xx) werden bis zu zweimal erneut versucht.
 
