@@ -196,7 +196,7 @@ pub fn capture_screen() -> Result<image::RgbImage, String> {
         return Err(LOCKED.into());
     }
     let mut rgb = Vec::with_capacity(w as usize * h as usize * 3);
-    for bgra in pixels.chunks_exact(4) {
+    for bgra in pixels.as_chunks::<4>().0 {
         rgb.extend_from_slice(&[bgra[2], bgra[1], bgra[0]]);
     }
     image::RgbImage::from_raw(w as u32, h as u32, rgb)
