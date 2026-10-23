@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -26,6 +27,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -67,6 +69,9 @@ fun Composer(
     onAddMedia: (List<Uri>) -> Unit,
     onRemoveAttachment: (Attachment) -> Unit,
     busy: Boolean,
+    interruptedBy: String?,
+    onContinue: () -> Unit,
+    onRetry: () -> Unit,
     stalled: Boolean,
     sending: Boolean,
     upload: UploadProgress?,
@@ -100,6 +105,9 @@ fun Composer(
                     }
                     if (preparing) PendingChip()
                 }
+            }
+            if (interruptedBy != null && !busy) {
+                InterruptedHint(interruptedBy, onContinue, onRetry)
             }
             if (busy && stalled) {
                 Text(
@@ -165,6 +173,24 @@ fun Composer(
                     }
                 }
             }
+        }
+    }
+}
+
+/** An error ended the last answer: one tap goes on where it stopped. */
+@Composable
+private fun InterruptedHint(error: String, onContinue: () -> Unit, onRetry: () -> Unit) {
+    Column(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
+        Text(
+            stringResource(R.string.interrupted_by, error),
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.error,
+            maxLines = 3,
+            overflow = TextOverflow.Ellipsis,
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.padding(top = 4.dp)) {
+            Button(onClick = onContinue) { Text(stringResource(R.string.continue_work)) }
+            OutlinedButton(onClick = onRetry) { Text(stringResource(R.string.try_again)) }
         }
     }
 }

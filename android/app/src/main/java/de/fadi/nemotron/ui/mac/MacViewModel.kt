@@ -22,6 +22,7 @@ import de.fadi.nemotron.data.RemoteState
 import de.fadi.nemotron.data.Upload
 import de.fadi.nemotron.data.VideoEncoder
 import de.fadi.nemotron.data.connect
+import de.fadi.nemotron.data.invertDiff
 import de.fadi.nemotron.data.normalizeAddress
 import de.fadi.nemotron.data.parsePairingCode
 import de.fadi.nemotron.ui.common.Attachments
@@ -52,7 +53,8 @@ data class MacUiState(
     val message: String? = null,
 )
 
-data class DiffView(val path: String, val diff: String)
+/** A file's diff on screen. After an undo [undone] is set and [diff] shows the undo itself. */
+data class DiffView(val path: String, val diff: String, val undone: Boolean = false)
 
 /** The Mac app on the phone: pairing, the long-poll loop and the actions. */
 class MacViewModel(
@@ -264,6 +266,26 @@ class MacViewModel(
 
     fun closeDiff() = _state.update { it.copy(diff = null) }
 
+    /** Undo from the diff itself; the dialog then shows what the undo did. */
+    fun undoFromDiff() {
+        val view = _state.value.diff ?: return
+        if (view.undone) return
+        if (_state.value.remote?.busy == true) {
+            showMessage(RemoteApi.BUSY)
+            return
+        }
+        act { api ->
+            api.undo(view.path)
+            // Still the same dialog? Then it turns into the result.
+            _state.update {
+                if (it.diff?.path == view.path) it.copy(diff = DiffView(view.path, invertDiff(view.diff), undone = true)) else it
+            }
+        }
+    }
+
+    /** After an error stopped the answer: Nemotron goes on where it stopped. */
+    fun continueAfterError() = act { it.send(CONTINUE_TEXT) }
+
     fun decide(callId: String, decision: Decision) {
         if (callId in _state.value.deciding) return
         _state.update { it.copy(deciding = it.deciding + callId) }
@@ -313,6 +335,9 @@ class MacViewModel(
         private const val MIN_BACKOFF_MS = 2_000L
         private const val MAX_BACKOFF_MS = 10_000L
         private const val STILL_SENDING = "Die Nachricht wird noch gesendet."
+        private const val CONTINUE_TEXT =
+            "Weiter: Mach genau dort weiter, wo du wegen des Fehlers aufgehört hast. " +
+                "Schau kurz nach, was schon erledigt ist, und mach nichts doppelt."
 
         val Factory = viewModelFactory {
             initializer {

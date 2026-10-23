@@ -33,7 +33,7 @@ Nemotron 3.5 Super VL ist NVIDIAs offenes Multimodal-Modell (veröffentlicht am 
    - ✏ Datei bearbeiten, 📝 Datei schreiben – mit Diff (+/− Zeilen)
    - ▶ Befehl ausführen – mit Exit-Code und Ausgabe
    - 🌐 im Netz suchen und Webseiten lesen, 🖱️ den Bildschirm ansehen und den Mac mit Maus und Tastatur bedienen – das fragt im Standard-Modus jedes Mal nach
-4. Rechts in **Änderungen** steht jede geänderte Datei mit **Diff** und **↶ Rückgängig** (setzt die Datei auf den Stand vor Nemotron zurück; neu angelegte Dateien werden gelöscht).
+4. Rechts in **Änderungen** steht jede geänderte Datei mit **Diff** und **↶ Rückgängig** (setzt die Datei auf den Stand vor Nemotron zurück; neu angelegte Dateien werden gelöscht). **Diff** öffnet ein Fenster, das immer vorn liegt: Zeile für Zeile, **rot** was entfernt wurde, **grün** was stattdessen eingefügt wird. Der Knopf **↶ Rückgängig** sitzt im selben Fenster; danach bleibt es offen und zeigt sofort, was passiert ist (rot: was wieder weg ist, grün: was wieder da ist). **↷ Wieder anwenden** nimmt es zurück. Wurde die Datei inzwischen von Hand geändert, fragt das Fenster selbst nach, bevor es sie zurücksetzt. Auch ↶ in der Liste öffnet dieses Fenster mit dem Ergebnis. In der Android-App geht das genauso im Diff-Dialog.
 
 **Modus direkt über dem Eingabefeld** (auf dem Mac und in der Android-App, kein Umweg über die Einstellungen):
 
@@ -51,6 +51,8 @@ Unabhängig davon gilt:
 - Nemotron arbeitet im Arbeitsordner: ohne Projekt dein ganzer Benutzerordner, mit Projekt dieser Ordner. Was außerhalb liegt (z. B. `/Applications`), erreicht er, wenn du einen Ordner darüber öffnest.
 - Ein Platzhalter wie `// ... rest of the code ...` beim Überschreiben einer Datei wird abgelehnt, damit nichts verloren geht.
 - Befehle laufen im Arbeitsordner mit der Umgebung deiner Shell (inklusive `~/.zshrc`, damit `cargo`, `npm` über nvm, `python` über pyenv usw. gefunden werden), mit Zeitlimit. **⏹ Stop**, Esc oder das Beenden der App beendet sie samt Unterprozessen. Sehr lange Ausgaben werden gekürzt (Anfang und Ende bleiben).
+
+**Fehler:** Endet ein Auftrag mit einem Fehler (rote Meldung, z. B. „Server nicht erreichbar“), steht über dem Eingabefeld ein Hinweis mit **▶ Weitermachen** (Nemotron macht mit einem Klick genau dort weiter, wo der Fehler ihn gestoppt hat) und **↻ Erneut versuchen**. Das gibt es auch in der Android-App.
 
 **Eingabe:**
 - ↑ und ↓ im Textfeld holen frühere Anweisungen zurück (wie in der Shell: ↑ bei leerem Feld oder am Textanfang, ↓ geht wieder vor; der angefangene Text kommt zurück). Der Verlauf bleibt nach dem Neustart erhalten (`history.json`). In der Android-App gibt es dafür den Uhr-Knopf neben dem Modus-Schalter (und die Pfeiltasten einer Bluetooth-Tastatur).

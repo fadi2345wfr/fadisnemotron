@@ -51,6 +51,7 @@ import de.fadi.nemotron.R
 import de.fadi.nemotron.data.ApprovalMode
 import de.fadi.nemotron.data.RemoteApi
 import de.fadi.nemotron.data.RemoteState
+import de.fadi.nemotron.data.interruptedBy
 import de.fadi.nemotron.ui.common.ChatList
 import de.fadi.nemotron.ui.common.Composer
 import de.fadi.nemotron.ui.common.UserBubble
@@ -192,7 +193,14 @@ private fun ChatScaffold(viewModel: MacViewModel, state: MacUiState, macName: St
             onDismiss = { showChanges = false },
         )
     }
-    state.diff?.let { DiffDialog(it.path, it.diff, viewModel::closeDiff) }
+    state.diff?.let {
+        DiffDialog(
+            view = it,
+            canUndo = !busy,
+            onUndo = viewModel::undoFromDiff,
+            onDismiss = viewModel::closeDiff,
+        )
+    }
 }
 
 /** The open chat's title, and below it where Nemotron works and on which Mac. */
@@ -276,6 +284,9 @@ private fun Conversation(viewModel: MacViewModel, state: MacUiState, macName: St
         onAddMedia = viewModel.attachments::add,
         onRemoveAttachment = { viewModel.attachments.remove(it.key) },
         busy = remote?.busy == true,
+        interruptedBy = remote?.interruptedBy,
+        onContinue = viewModel::continueAfterError,
+        onRetry = viewModel::retry,
         stalled = remote?.stalled == true,
         sending = state.sending,
         upload = state.upload,

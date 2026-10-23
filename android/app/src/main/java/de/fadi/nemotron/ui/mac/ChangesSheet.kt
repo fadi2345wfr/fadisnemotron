@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -111,15 +112,18 @@ fun ChangesSheet(
     }
 }
 
-/** A whole diff on its own screen; it scrolls both ways. */
+/**
+ * A whole diff on its own screen (red: gone, green: new). It can undo the
+ * change from here; the screen then shows what the undo did.
+ */
 @Composable
-fun DiffDialog(path: String, diff: String, onDismiss: () -> Unit) {
+fun DiffDialog(view: DiffView, canUndo: Boolean, onUndo: () -> Unit, onDismiss: () -> Unit) {
     Dialog(onDismissRequest = onDismiss, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(Modifier.fillMaxSize()) {
             Column(Modifier.safeDrawingPadding()) {
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.padding(start = 16.dp, end = 4.dp)) {
                     Text(
-                        path,
+                        view.path,
                         style = MaterialTheme.typography.titleMedium,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
@@ -129,12 +133,30 @@ fun DiffDialog(path: String, diff: String, onDismiss: () -> Unit) {
                         Icon(painterResource(R.drawable.ic_close), contentDescription = stringResource(R.string.close))
                     }
                 }
+                if (view.undone) {
+                    Text(
+                        stringResource(R.string.undone_result),
+                        color = FadisTheme.status.added,
+                        style = MaterialTheme.typography.titleSmall,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                    )
+                } else {
+                    Row(Modifier.padding(horizontal = 16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Button(onClick = onUndo, enabled = canUndo) { Text(stringResource(R.string.undo)) }
+                    }
+                }
+                Text(
+                    stringResource(if (view.undone) R.string.diff_legend_undone else R.string.diff_legend),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+                )
                 HorizontalDivider()
                 Box(Modifier.verticalScroll(rememberScrollState()).padding(12.dp)) {
-                    if (diff.isBlank()) {
+                    if (view.diff.isBlank()) {
                         Text(stringResource(R.string.diff_empty), color = MaterialTheme.colorScheme.onSurfaceVariant)
                     } else {
-                        DiffBox(diff)
+                        DiffBox(view.diff)
                     }
                 }
             }

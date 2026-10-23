@@ -227,3 +227,36 @@ class RemoteModelsTest {
 """
     }
 }
+
+class InterruptedByTest {
+    private fun parse(json: String): RemoteState = remoteJson.decodeFromString(json)
+
+    @Test
+    fun `offers to go on only when an error ended the last answer and nothing runs`() {
+        val failed = """
+            {"busy": false, "messages": [
+              {"role": "user", "text": "Lies alles"},
+              {"role": "assistant", "status": "failed",
+               "error": "Verbindung zu https://integrate.api.nvidia.com/v1/chat/completions fehlgeschlagen: timeout: receive response\nweitere Zeile",
+               "steps": []}
+            ]}
+        """
+        assertEquals(
+            "Verbindung zu https://integrate.api.nvidia.com/v1/chat/completions fehlgeschlagen: timeout: receive response",
+            parse(failed).interruptedBy,
+        )
+        // Working again (the hint is gone), or the answer is fine, or cancelled.
+        assertNull(parse(failed.replace("\"busy\": false", "\"busy\": true")).interruptedBy)
+        assertNull(parse(failed.replace("\"failed\"", "\"done\"")).interruptedBy)
+        assertNull(parse(failed.replace("\"failed\"", "\"cancelled\"")).interruptedBy)
+        assertNull(parse("""{"messages": []}""").interruptedBy)
+        // A new message of the user ends the offer.
+        val answered = """
+            {"busy": false, "messages": [
+              {"role": "assistant", "status": "failed", "error": "Fehler", "steps": []},
+              {"role": "user", "text": "Nimm nur die erste"}
+            ]}
+        """
+        assertNull(parse(answered).interruptedBy)
+    }
+}

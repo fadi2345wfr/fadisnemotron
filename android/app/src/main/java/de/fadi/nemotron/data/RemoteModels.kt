@@ -124,3 +124,18 @@ enum class Decision {
 
 @Serializable
 data class UploadResult(val id: String = "", val kind: String = "", val size: Long = 0)
+
+/**
+ * The error that ended the last answer, when the chat stands there and
+ * nothing runs: the screen then offers to go on with one tap.
+ */
+val RemoteState.interruptedBy: String?
+    get() {
+        if (busy) return null
+        val last = messages.lastOrNull() ?: return null
+        if (last.isUser || last.status != MessageStatus.Failed) return null
+        val error = last.error?.lineSequence()?.firstOrNull { it.isNotBlank() }?.trim() ?: return null
+        return error.take(MAX_ERROR_CHARS)
+    }
+
+private const val MAX_ERROR_CHARS = 110

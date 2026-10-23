@@ -50,6 +50,12 @@
     <string name="stalled_hint">Keine Antwort von NVIDIA – der Server hängt oder ist überlastet. Stoppen, oder einfach weitertippen und senden: dann geht es sofort mit deiner neuen Nachricht weiter.</string>
     <string name="send_now">Jetzt senden, Nemotron unterbrechen</string>
     <string name="continue_in_new_chat">Weiter im neuen Chat</string>
+    <string name="interrupted_by">⚠ Unterbrochen: %1$s</string>
+    <string name="continue_work">▶ Weitermachen</string>
+    <string name="try_again">↻ Erneut versuchen</string>
+    <string name="undone_result">✓ Rückgängig gemacht – die Datei ist wieder auf dem Stand vor Nemotron.</string>
+    <string name="diff_legend">Rot: was entfernt wurde · Grün: was stattdessen eingefügt wird</string>
+    <string name="diff_legend_undone">Rot: was jetzt wieder weg ist · Grün: was jetzt wieder da ist</string>
     <string name="thinking_mode">Denkmodus</string>
     <string name="unpair">Kopplung aufheben</string>
 

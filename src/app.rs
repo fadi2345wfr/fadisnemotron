@@ -23,6 +23,8 @@ use crate::remote::{self, Command, RemoteServer, Reply};
 use crate::tools::{ApprovalMode, FileChange, SharedApproval, Workspace};
 use crate::widgets::{self, UiAction};
 
+/// What "Weitermachen" sends after an error stopped a run.
+const CONTINUE_TEXT: &str = "Weiter: Mach genau dort weiter, wo du wegen des Fehlers aufgehört hast. Schau kurz nach, was schon erledigt ist, und mach nichts doppelt.";
 /// After this long without any sign of life from the server the window says
 /// that one can stop, or type on to go on at once.
 const STALLED_AFTER: Duration = Duration::from_secs(20);
@@ -297,9 +299,93 @@ struct Notice {
     error: bool,
 }
 
-/// An undo whose file was changed again outside the agent; needs a yes.
-struct UndoConfirm {
-    abs: PathBuf,
+/// The window that shows one file's change line by line (red: what went
+/// away, green: what came in) and undoes it from the same place, so that the
+/// result is seen right there.
+struct DiffWindow {
+    title: String,
+    /// The tracked change it belongs to; `None` for the diff of one tool call.
+    abs: Option<PathBuf>,
+    diff: String,
+    /// The file as Nemotron left it, to notice when the change moves on.
+    current: Option<String>,
+    state: DiffState,
+    error: Option<String>,
+}
+
+enum DiffState {
+    Showing,
+    /// Undo was asked for, but the file was changed again outside Nemotron:
+    /// the window asks before it throws that away.
+    Confirming,
+    /// Undone: `diff` now shows what the undo did. `change` lets one take it back.
+    Undone {
+        change: Option<TrackedChange>,
+        deleted: bool,
+    },
+}
+
+/// A button in the change window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiffAction {
+    Undo,
+    /// "Trotzdem zurücksetzen" after the file was changed outside Nemotron.
+    ForceUndo,
+    Cancel,
+    Redo,
+}
+
+/// What an attempt to undo a change came to.
+enum UndoResult {
+    Done(TrackedChange),
+    NeedsConfirm,
+    Failed(String),
+}
+
+impl DiffWindow {
+    fn for_change(tracked: &TrackedChange, state: DiffState) -> Self {
+        Self {
+            title: tracked.path.clone(),
+            abs: Some(tracked.abs.clone()),
+            diff: tracked.diff(),
+            current: Some(tracked.current.clone()),
+            state,
+            error: None,
+        }
+    }
+
+    /// The window after an undo: it shows what the undo changed, from
+    /// Nemotron's version back to the original.
+    fn undone(tracked: TrackedChange) -> Self {
+        let original = tracked.original.clone().unwrap_or_default();
+        let diff = crate::tools::unified_diff(&tracked.current, &original, &tracked.path);
+        Self {
+            title: tracked.path.clone(),
+            abs: Some(tracked.abs.clone()),
+            diff,
+            current: None,
+            state: DiffState::Undone {
+                deleted: tracked.original.is_none(),
+                change: Some(tracked),
+            },
+            error: None,
+        }
+    }
+}
+
+/// Added and removed lines of a unified diff.
+fn diff_stats(diff: &str) -> (usize, usize) {
+    diff.lines().fold((0, 0), |(added, removed), line| {
+        if line.starts_with("+++") || line.starts_with("---") {
+            (added, removed)
+        } else if line.starts_with('+') {
+            (added + 1, removed)
+        } else if line.starts_with('-') {
+            (added, removed + 1)
+        } else {
+            (added, removed)
+        }
+    })
 }
 
 pub struct NemotronApp {
@@ -331,7 +417,7 @@ pub struct NemotronApp {
     /// With the id of the message they belong to.
     stopped: Vec<(u64, Receiver<AgentEvent>)>,
     notice: Option<Notice>,
-    diff_view: Option<(String, String)>,
+    diff_window: Option<DiffWindow>,
     remote: Option<RemoteServer>,
     remote_error: Option<String>,
     remote_window: bool,
@@ -359,7 +445,6 @@ pub struct NemotronApp {
     lid_message: Option<String>,
     remote_published: Option<Instant>,
     device_name: String,
-    undo_confirm: Option<UndoConfirm>,
     markdown: CommonMarkCache,
     http: ureq::Agent,
     focus_input: bool,
@@ -443,7 +528,7 @@ impl NemotronApp {
             active: None,
             stopped: Vec::new(),
             notice: None,
-            diff_view: None,
+            diff_window: None,
             remote: None,
             remote_error: None,
             remote_window: false,
@@ -462,7 +547,6 @@ impl NemotronApp {
             lid_message: None,
             remote_published: None,
             device_name: remote::device_name(),
-            undo_confirm: None,
             markdown: CommonMarkCache::default(),
             http: api::agent(),
             focus_input: true,
@@ -544,7 +628,7 @@ impl NemotronApp {
                 self.settings.workspace = (!ws.is_home()).then(|| ws.root().to_path_buf());
                 self.workspace = ws;
                 self.changes.clear();
-                self.undo_confirm = None;
+                self.diff_window = None;
                 self.save_settings();
                 self.update_title(ctx);
                 self.focus_input = true;
@@ -564,7 +648,7 @@ impl NemotronApp {
         }
         self.workspace = Workspace::home();
         self.changes.clear();
-        self.undo_confirm = None;
+        self.diff_window = None;
         self.settings.workspace = None;
         self.save_settings();
         self.update_title(ctx);
@@ -590,15 +674,14 @@ impl NemotronApp {
     }
 
     /// Restores a file to how it was before the agent first touched it.
-    fn undo_change(&mut self, index: usize, force: bool) {
+    /// Puts the file back as it was before Nemotron first touched it. Without
+    /// `force` a file that was changed again outside Nemotron is left alone.
+    fn try_undo(&mut self, index: usize, force: bool) -> UndoResult {
         let Some(tracked) = self.changes.get(index) else {
-            return;
+            return UndoResult::Failed("Diese Änderung gibt es nicht mehr.".into());
         };
         if !force && self.needs_undo_confirm(tracked) {
-            self.undo_confirm = Some(UndoConfirm {
-                abs: tracked.abs.clone(),
-            });
-            return;
+            return UndoResult::NeedsConfirm;
         }
         let tracked = self.changes.remove(index);
         let result = match &tracked.original {
@@ -608,21 +691,55 @@ impl NemotronApp {
                 other => other,
             },
         };
-        self.notice = Some(match result {
-            Ok(()) if tracked.original.is_some() => Notice {
-                text: format!("{} wiederhergestellt.", tracked.path),
-                error: false,
-            },
-            Ok(()) => Notice {
-                text: format!("{} gelöscht (war neu).", tracked.path),
-                error: false,
-            },
+        match result {
+            Ok(()) => UndoResult::Done(tracked),
             Err(e) => {
                 let text = format!("{} konnte nicht zurückgesetzt werden: {e}", tracked.path);
                 self.changes.insert(index.min(self.changes.len()), tracked);
-                Notice { text, error: true }
+                UndoResult::Failed(text)
             }
-        });
+        }
+    }
+
+    /// Undoes a change. With `show` the diff window opens with what the undo
+    /// did (or asks first, inside itself, if the file was changed since).
+    fn undo_change(&mut self, index: usize, force: bool, show: bool) {
+        match self.try_undo(index, force) {
+            UndoResult::Done(tracked) => {
+                let deleted = tracked.original.is_none();
+                self.notice = Some(Notice {
+                    text: if deleted {
+                        format!("{} gelöscht (war neu).", tracked.path)
+                    } else {
+                        format!("{} wiederhergestellt.", tracked.path)
+                    },
+                    error: false,
+                });
+                if show {
+                    self.diff_window = Some(DiffWindow::undone(tracked));
+                }
+            }
+            UndoResult::NeedsConfirm => {
+                if let Some(tracked) = self.changes.get(index) {
+                    self.diff_window = Some(DiffWindow::for_change(tracked, DiffState::Confirming));
+                }
+            }
+            UndoResult::Failed(text) => {
+                self.notice = Some(Notice { text, error: true });
+            }
+        }
+    }
+
+    /// Takes an undo back: the file gets Nemotron's version again.
+    fn redo_change(&mut self, tracked: TrackedChange) -> Result<(), String> {
+        std::fs::write(&tracked.abs, &tracked.current).map_err(|e| {
+            format!(
+                "{} konnte nicht wiederhergestellt werden: {e}",
+                tracked.path
+            )
+        })?;
+        self.changes.push(tracked);
+        Ok(())
     }
 
     /// True if undo would also discard changes not made by the agent.
@@ -861,6 +978,40 @@ impl NemotronApp {
             }
             self.save_settings();
         }
+    }
+
+    /// The error that ended the last answer, if the chat stands there: the
+    /// window then offers to go on with one click.
+    fn interrupted_by(&self) -> Option<&str> {
+        if self.active.is_some() {
+            return None;
+        }
+        match self.messages.last() {
+            Some(Message {
+                role: Role::Assistant,
+                status: Status::Failed(e),
+                ..
+            }) => Some(e.as_str()),
+            _ => None,
+        }
+    }
+
+    /// "Weitermachen": a short message asks Nemotron to go on where the error
+    /// stopped it. Typed text and attachments stay in the input field.
+    fn continue_after_error(&mut self, ctx: &egui::Context) {
+        if self.interrupted_by().is_none() {
+            return;
+        }
+        if self.needs_api_key() {
+            self.open_settings();
+            return;
+        }
+        self.messages
+            .push(Message::user(CONTINUE_TEXT.to_owned(), Vec::new()));
+        self.notice = None;
+        self.save_chat();
+        self.handoff_chain = 0;
+        self.start_request(ctx);
     }
 
     /// Sending is possible while Nemotron works too: that run is stopped and
@@ -1307,7 +1458,7 @@ impl NemotronApp {
             self.pick_workspace(ctx);
         }
         let dialog_open =
-            self.settings_draft.is_some() || self.url_draft.is_some() || self.diff_view.is_some();
+            self.settings_draft.is_some() || self.url_draft.is_some() || self.diff_window.is_some();
         if escape && self.active.is_some() && !dialog_open {
             self.stop();
         }
@@ -1541,7 +1692,7 @@ impl NemotronApp {
                         ),
                     ));
                 }
-                self.undo_change(index, true);
+                self.undo_change(index, true, false);
                 match &self.notice {
                     Some(n) if n.error => Err((500, n.text.clone())),
                     _ => ok,
@@ -2200,7 +2351,7 @@ impl NemotronApp {
                             ui.label(RichText::new(format!("+{added}")).color(widgets::ADDED).small());
                             ui.label(RichText::new(format!("−{removed}")).color(widgets::REMOVED).small());
                             if ui.small_button("Diff").clicked() {
-                                action = Some(UiAction::ShowDiff { title: change.path.clone(), diff: change.diff() });
+                                action = Some(UiAction::ShowChange(i));
                             }
                             if ui
                                 .add_enabled(!busy, egui::Button::new("↶ Rückgängig").small())
@@ -2283,6 +2434,30 @@ impl NemotronApp {
             let mut stop = false;
             let mut pick = false;
             let mut add_url = false;
+            let mut after_error = None;
+            // An error ended the last answer: one click goes on from there.
+            if let Some(error) = self.interrupted_by() {
+                let first_line = error.lines().next().unwrap_or(error);
+                let short: String = first_line.chars().take(110).collect();
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("⚠ Unterbrochen: {short}"));
+                    if ui
+                        .add(egui::Button::new(RichText::new("▶ Weitermachen").strong().color(Color32::BLACK)).fill(widgets::ACCENT))
+                        .on_hover_text("Nemotron macht genau dort weiter, wo der Fehler ihn gestoppt hat.")
+                        .clicked()
+                    {
+                        after_error = Some(UiAction::ContinueAfterError);
+                    }
+                    if ui
+                        .button("↻ Erneut versuchen")
+                        .on_hover_text("Fragt noch einmal. Bereits geänderte Dateien bleiben so.")
+                        .clicked()
+                    {
+                        after_error = Some(UiAction::Retry);
+                    }
+                });
+                ui.add_space(4.0);
+            }
             // The mode is chosen here, where one types, not in the settings.
             if let Some(mode) = widgets::mode_switcher(ui, self.current_mode()) {
                 self.set_mode(mode);
@@ -2377,6 +2552,9 @@ impl NemotronApp {
             });
             ui.add_space(8.0);
 
+            if let Some(action) = after_error {
+                self.apply_ui_action(action, ctx);
+            }
             if send {
                 self.send(ctx);
                 self.focus_input = true;
@@ -2467,11 +2645,26 @@ impl NemotronApp {
             }
             UiAction::Retry => self.retry(ctx),
             UiAction::Decide { call_id, decision } => self.decide(&call_id, decision),
-            UiAction::ShowDiff { title, diff } => self.diff_view = Some((title, diff)),
-            UiAction::Undo(index) => self.undo_change(index, false),
+            UiAction::ShowDiff { title, diff } => {
+                self.diff_window = Some(DiffWindow {
+                    title,
+                    abs: None,
+                    diff,
+                    current: None,
+                    state: DiffState::Showing,
+                    error: None,
+                });
+            }
+            UiAction::ShowChange(index) => {
+                if let Some(tracked) = self.changes.get(index) {
+                    self.diff_window = Some(DiffWindow::for_change(tracked, DiffState::Showing));
+                }
+            }
+            UiAction::Undo(index) => self.undo_change(index, false, true),
             UiAction::OpenProject => self.pick_workspace(ctx),
             UiAction::OpenSettings => self.open_settings(),
             UiAction::OpenPhoneSetup => self.remote_window = true,
+            UiAction::ContinueAfterError => self.continue_after_error(ctx),
             UiAction::OpenChat(id) => {
                 if let Err((_, e)) = self.open_chat(&id, ctx) {
                     self.notice = Some(Notice {
@@ -2502,64 +2695,166 @@ impl NemotronApp {
         }
     }
 
+    /// What a click in the change window does; returns the window as it looks next.
+    fn apply_diff_action(
+        &mut self,
+        mut window: DiffWindow,
+        tracked: Option<usize>,
+        action: DiffAction,
+    ) -> DiffWindow {
+        match action {
+            DiffAction::Undo | DiffAction::ForceUndo => {
+                let Some(i) = tracked else {
+                    return window;
+                };
+                match self.try_undo(i, action == DiffAction::ForceUndo) {
+                    UndoResult::Done(done) => {
+                        self.notice = Some(Notice {
+                            text: if done.original.is_none() {
+                                format!("{} gelöscht (war neu).", done.path)
+                            } else {
+                                format!("{} wiederhergestellt.", done.path)
+                            },
+                            error: false,
+                        });
+                        window = DiffWindow::undone(done);
+                    }
+                    UndoResult::NeedsConfirm => window.state = DiffState::Confirming,
+                    UndoResult::Failed(text) => window.error = Some(text),
+                }
+            }
+            DiffAction::Cancel => window.state = DiffState::Showing,
+            DiffAction::Redo => {
+                if let DiffState::Undone { change, .. } = &mut window.state
+                    && let Some(done) = change.take()
+                {
+                    match self.redo_change(done) {
+                        Ok(()) => {
+                            let again = self.changes.last().expect("just added");
+                            window = DiffWindow::for_change(again, DiffState::Showing);
+                        }
+                        Err(e) => window.error = Some(e),
+                    }
+                }
+            }
+        }
+        window
+    }
+
+    /// The change window: the diff line by line, and undo (with its result)
+    /// right in it. It stays in front of everything else.
     fn diff_window(&mut self, ctx: &egui::Context, screen: egui::Rect) {
-        let Some((title, diff)) = &self.diff_view else {
+        let Some(mut window) = self.diff_window.take() else {
             return;
         };
+        let busy = self.active.is_some();
+        let tracked = window
+            .abs
+            .as_ref()
+            .and_then(|abs| self.changes.iter().position(|c| &c.abs == abs));
+        // Nemotron may still be editing this file: the diff follows.
+        if let (Some(i), DiffState::Showing) = (tracked, &window.state)
+            && window.current.as_deref() != Some(self.changes[i].current.as_str())
+        {
+            window.diff = self.changes[i].diff();
+            window.current = Some(self.changes[i].current.clone());
+        }
+        let (added, removed) = diff_stats(&window.diff);
         let mut open = true;
-        egui::Window::new(format!("Änderungen: {title}"))
+        let mut action = None;
+        egui::Window::new(format!("Änderungen: {}", window.title))
             .open(&mut open)
+            .order(egui::Order::Foreground)
             .pivot(egui::Align2::CENTER_CENTER)
             .default_pos(screen.center())
-            .default_size([720.0, 520.0])
+            .default_size([760.0, 560.0])
             .resizable(true)
             .collapsible(false)
             .show(ctx, |ui| {
-                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
-                    widgets::diff_label(ui, diff, usize::MAX);
-                });
-            });
-        if !open {
-            self.diff_view = None;
-        }
-    }
-
-    fn undo_confirm_window(&mut self, ctx: &egui::Context, screen: egui::Rect) {
-        let Some(confirm) = &self.undo_confirm else {
-            return;
-        };
-        let Some(index) = self.changes.iter().position(|c| c.abs == confirm.abs) else {
-            self.undo_confirm = None;
-            return;
-        };
-        let path = self.changes[index].path.clone();
-        let busy = self.active.is_some();
-        let mut yes = false;
-        let mut no = false;
-        egui::Window::new("Trotzdem rückgängig machen?")
-            .pivot(egui::Align2::CENTER_CENTER)
-            .default_pos(screen.center())
-            .collapsible(false)
-            .resizable(false)
-            .show(ctx, |ui| {
-                ui.label(format!(
-                    "{path} wurde nach Nemotrons Änderung noch einmal verändert. Rückgängig setzt die Datei auf den Stand vor Nemotron zurück; spätere Änderungen gehen verloren."
-                ));
-                if busy {
-                    ui.label(RichText::new("Erst wenn Nemotron fertig ist.").small().weak());
-                }
                 ui.horizontal(|ui| {
-                    yes = ui
-                        .add_enabled(!busy, egui::Button::new("Zurücksetzen"))
-                        .clicked();
-                    no = ui.button("Abbrechen").clicked();
+                    ui.label(RichText::new(&window.title).monospace().strong());
+                    ui.label(RichText::new(format!("+{added}")).color(widgets::ADDED));
+                    ui.label(RichText::new(format!("−{removed}")).color(widgets::REMOVED));
+                });
+                match &window.state {
+                    DiffState::Showing if tracked.is_some() => {
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("↶ Rückgängig"))
+                                .on_hover_text("Die Datei wieder auf den Stand vor Nemotrons Änderung setzen – das Ergebnis siehst du gleich hier.")
+                                .clicked()
+                            {
+                                action = Some(DiffAction::Undo);
+                            }
+                            if busy {
+                                ui.label(RichText::new("Erst wenn Nemotron fertig ist.").small().weak());
+                            }
+                        });
+                    }
+                    DiffState::Showing => {
+                        if window.abs.is_some() {
+                            ui.label(RichText::new("Diese Änderung steht nicht mehr in der Liste.").weak());
+                        }
+                    }
+                    DiffState::Confirming => {
+                        ui.colored_label(
+                            ui.visuals().warn_fg_color,
+                            "⚠ Die Datei wurde nach Nemotrons Änderung noch einmal verändert. Rückgängig setzt sie auf den Stand vor Nemotron zurück; spätere Änderungen gehen dabei verloren.",
+                        );
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(!busy, egui::Button::new("Trotzdem zurücksetzen"))
+                                .clicked()
+                            {
+                                action = Some(DiffAction::ForceUndo);
+                            }
+                            if ui.button("Abbrechen").clicked() {
+                                action = Some(DiffAction::Cancel);
+                            }
+                        });
+                    }
+                    DiffState::Undone { change, deleted } => {
+                        ui.colored_label(
+                            widgets::ADDED,
+                            if *deleted {
+                                "✓ Rückgängig gemacht: die Datei war neu und ist wieder gelöscht."
+                            } else {
+                                "✓ Rückgängig gemacht: die Datei ist wieder auf dem Stand vor Nemotron."
+                            },
+                        );
+                        if change.is_some()
+                            && ui
+                                .add_enabled(!busy, egui::Button::new("↷ Wieder anwenden"))
+                                .on_hover_text("Nemotrons Änderung noch einmal einsetzen")
+                                .clicked()
+                        {
+                            action = Some(DiffAction::Redo);
+                        }
+                    }
+                }
+                if let Some(error) = &window.error {
+                    ui.colored_label(ui.visuals().error_fg_color, format!("⚠ {error}"));
+                }
+                ui.label(
+                    RichText::new(if matches!(window.state, DiffState::Undone { .. }) {
+                        "Rot: was jetzt wieder weg ist · Grün: was jetzt wieder da ist"
+                    } else {
+                        "Rot: was entfernt wurde · Grün: was stattdessen eingefügt wird"
+                    })
+                    .small()
+                    .weak(),
+                );
+                ui.separator();
+                egui::ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+                    widgets::diff_label(ui, &window.diff, usize::MAX);
                 });
             });
-        if yes {
-            self.undo_confirm = None;
-            self.undo_change(index, true);
-        } else if no {
-            self.undo_confirm = None;
+
+        if let Some(action) = action {
+            window = self.apply_diff_action(window, tracked, action);
+        }
+        if open {
+            self.diff_window = Some(window);
         }
     }
 
@@ -2930,7 +3225,6 @@ impl eframe::App for NemotronApp {
         self.settings_window(&ctx, full_rect);
         self.url_window(&ctx, full_rect);
         self.diff_window(&ctx, full_rect);
-        self.undo_confirm_window(&ctx, full_rect);
         self.delete_chat_window(&ctx, full_rect);
         self.remote_window(&ctx, full_rect);
         widgets::drop_overlay(&ctx, full_rect);
@@ -3418,6 +3712,57 @@ mod tests {
         assert!(requests[0].contains("Lies alles"), "the chat goes on");
         assert_eq!(app.messages[3].steps[0].content, "Gleich da.");
         assert!(app.stalled_for().is_none(), "nothing runs any more");
+    }
+
+    #[test]
+    fn after_an_error_one_click_goes_on_where_it_stopped() {
+        use crate::api::tests::mock_server;
+        let answer = "data: {\"choices\":[{\"delta\":{\"content\":\"Weiter geht es.\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let (base_url, nvidia) =
+            mock_server(vec![("200 OK", "text/event-stream", answer.to_owned())]);
+        let settings = Settings {
+            base_url,
+            api_key: "k".into(),
+            ..Settings::default()
+        };
+        let mut app = NemotronApp::with_settings(settings, None);
+        let ctx = egui::Context::default();
+        // An answer that is fine offers nothing; the click does nothing then.
+        let mut fine = Message::assistant(true);
+        fine.status = Status::Done;
+        app.messages = vec![Message::user("Bau das Projekt".into(), vec![]), fine];
+        assert!(app.interrupted_by().is_none());
+        app.continue_after_error(&ctx);
+        assert!(app.active.is_none());
+        assert_eq!(app.messages.len(), 2);
+
+        // The server was not reachable: the hint shows the reason.
+        let mut failed = Message::assistant(true);
+        failed.status = Status::Failed(
+            "Verbindung zu https://integrate.api.nvidia.com/v1/chat/completions fehlgeschlagen: timeout: receive response".into(),
+        );
+        app.messages[1] = failed;
+        assert!(app.interrupted_by().is_some_and(|e| e.contains("timeout")));
+        app.input = "halb getippt".into();
+        app.continue_after_error(&ctx);
+        assert!(app.active.is_some());
+        assert_eq!(app.messages[2].text, CONTINUE_TEXT);
+        assert_eq!(app.input, "halb getippt", "what was typed stays");
+        assert!(
+            app.interrupted_by().is_none(),
+            "the hint is gone while it works"
+        );
+        let until = Instant::now() + Duration::from_secs(15);
+        while app.active.is_some() && Instant::now() < until {
+            app.poll_agent();
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let requests = nvidia.join().unwrap();
+        assert!(
+            requests[0].contains("Bau das Projekt") && requests[0].contains("wegen des Fehlers")
+        );
+        assert_eq!(app.messages[3].steps[0].content, "Weiter geht es.");
+        assert!(app.interrupted_by().is_none());
     }
 
     #[test]
@@ -4004,9 +4349,9 @@ mod tests {
         assert_eq!(app.changes.len(), 2);
         assert_eq!(app.changes[0].original.as_deref(), Some("vorher"));
 
-        app.undo_change(0, false);
+        app.undo_change(0, false, false);
         assert_eq!(std::fs::read_to_string(&edited).unwrap(), "vorher");
-        app.undo_change(0, false);
+        app.undo_change(0, false, false);
         assert!(!created.exists());
         assert!(app.changes.is_empty());
 
@@ -4018,10 +4363,13 @@ mod tests {
             before: Some("vorher".into()),
             after: "agent".into(),
         });
-        app.undo_change(0, false);
-        assert!(app.undo_confirm.is_some());
+        app.undo_change(0, false, false);
+        assert!(matches!(
+            app.diff_window.as_ref().map(|w| &w.state),
+            Some(DiffState::Confirming)
+        ));
         assert_eq!(std::fs::read_to_string(&edited).unwrap(), "von Hand");
-        app.undo_change(0, true);
+        app.undo_change(0, true, false);
         assert_eq!(std::fs::read_to_string(&edited).unwrap(), "vorher");
 
         // Changed by hand between two agent edits: undo would lose that.
@@ -4038,10 +4386,141 @@ mod tests {
             after: "agent 2".into(),
         });
         std::fs::write(&edited, "agent 2").unwrap();
-        app.undo_change(0, false);
-        assert!(app.undo_confirm.as_ref().is_some_and(|c| c.abs == edited));
+        app.undo_change(0, false, false);
+        assert!(app.diff_window.as_ref().is_some_and(
+            |w| w.abs.as_ref() == Some(&edited) && matches!(w.state, DiffState::Confirming)
+        ));
         assert_eq!(std::fs::read_to_string(&edited).unwrap(), "agent 2");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Draws the change window for one frame, as the real app does.
+    fn frame_with_diff_window(app: &mut NemotronApp, ctx: &egui::Context) {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let screen = ui.max_rect();
+            app.diff_window(&ui.ctx().clone(), screen);
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn undoing_in_the_change_window_shows_what_happened_right_there() {
+        let dir = std::env::temp_dir().join(format!("fadis-diffwin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "eins\nzwei\ndrei\n").unwrap();
+        let mut app = NemotronApp::with_settings(Settings::default(), None);
+        app.record_change(&FileChange {
+            path: "lib.rs".into(),
+            abs: file.clone(),
+            before: Some("eins\nalt\ndrei\n".into()),
+            after: "eins\nzwei\ndrei\n".into(),
+        });
+        let ctx = egui::Context::default();
+
+        // The panel's "Diff": red for what went away, green for what came in.
+        app.apply_ui_action(UiAction::ShowChange(0), &ctx);
+        frame_with_diff_window(&mut app, &ctx);
+        let window = app.diff_window.as_ref().unwrap();
+        assert!(
+            window.diff.contains("-alt") && window.diff.contains("+zwei"),
+            "{}",
+            window.diff
+        );
+        assert!(matches!(window.state, DiffState::Showing));
+
+        // "↶ Rückgängig" inside the window: the file is back, and the window
+        // shows the undo itself (what is gone again, what is back).
+        let window = app.diff_window.take().unwrap();
+        let window = app.apply_diff_action(window, Some(0), DiffAction::Undo);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "eins\nalt\ndrei\n");
+        assert!(app.changes.is_empty());
+        assert!(
+            window.diff.contains("-zwei") && window.diff.contains("+alt"),
+            "{}",
+            window.diff
+        );
+        assert!(matches!(
+            window.state,
+            DiffState::Undone { deleted: false, .. }
+        ));
+        assert!(
+            app.notice
+                .as_ref()
+                .is_some_and(|n| !n.error && n.text.contains("wiederhergestellt"))
+        );
+        app.diff_window = Some(window);
+        frame_with_diff_window(&mut app, &ctx);
+        assert!(
+            app.diff_window.is_some(),
+            "the window stays open for the result"
+        );
+
+        // "↷ Wieder anwenden" puts Nemotron's version back and the change on the list.
+        let window = app.diff_window.take().unwrap();
+        let window = app.apply_diff_action(window, None, DiffAction::Redo);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "eins\nzwei\ndrei\n"
+        );
+        assert_eq!(app.changes.len(), 1);
+        assert!(matches!(window.state, DiffState::Showing));
+        assert!(window.diff.contains("-alt") && window.diff.contains("+zwei"));
+
+        // Changed by hand meanwhile: the window asks first, in itself.
+        std::fs::write(&file, "von Hand\n").unwrap();
+        let window = app.apply_diff_action(window, Some(0), DiffAction::Undo);
+        assert!(matches!(window.state, DiffState::Confirming));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "von Hand\n");
+        let window = app.apply_diff_action(window, Some(0), DiffAction::Cancel);
+        assert!(matches!(window.state, DiffState::Showing));
+        assert_eq!(app.changes.len(), 1);
+        let window = app.apply_diff_action(window, Some(0), DiffAction::ForceUndo);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "eins\nalt\ndrei\n");
+        assert!(matches!(window.state, DiffState::Undone { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undoing_a_new_file_shows_it_going_away() {
+        let dir = std::env::temp_dir().join(format!("fadis-diffnew-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("neu.txt");
+        std::fs::write(&file, "a\nb\n").unwrap();
+        let mut app = NemotronApp::with_settings(Settings::default(), None);
+        app.record_change(&FileChange {
+            path: "neu.txt".into(),
+            abs: file.clone(),
+            before: None,
+            after: "a\nb\n".into(),
+        });
+        // From the panel's "↶ Rückgängig" button: the window opens with the result.
+        app.undo_change(0, false, true);
+        assert!(!file.exists());
+        let window = app.diff_window.as_ref().unwrap();
+        assert!(matches!(
+            window.state,
+            DiffState::Undone { deleted: true, .. }
+        ));
+        assert_eq!(
+            diff_stats(&window.diff),
+            (0, 2),
+            "both lines are gone again"
+        );
+        // The phone's undo does not pop up a window on the Mac.
+        app.diff_window = None;
+        app.record_change(&FileChange {
+            path: "neu.txt".into(),
+            abs: file.clone(),
+            before: None,
+            after: "a\n".into(),
+        });
+        std::fs::write(&file, "a\n").unwrap();
+        app.undo_change(0, true, false);
+        assert!(app.diff_window.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
